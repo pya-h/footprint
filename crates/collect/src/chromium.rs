@@ -1,5 +1,5 @@
 use crate::collector::{Collector, CollectCtx, Env, Sink};
-use crate::utils::copy_db_set;
+use crate::utils::{copy_db_set, in_window};
 use anyhow::{Context, Result};
 use fp_core::{Actor, Artifact, Confidence, Event, EventKind, Provenance, SourceInstance, SourceStatus, StateRecord, time::{self, TimeFormat}};
 use rusqlite::Connection;
@@ -494,11 +494,6 @@ fn extract_host(url: &str) -> Option<String> {
             let host = rest.split('/').next()?;
             Some(host.split(':').next().unwrap_or(host).to_lowercase())
         })
-}
-
-fn in_window(ctx: &CollectCtx, ts: i64) -> bool {
-    ctx.since.map(|lo| ts >= lo).unwrap_or(true)
-        && ctx.until.map(|hi| ts <= hi).unwrap_or(true)
 }
 
 fn human_size(bytes: i64) -> String {

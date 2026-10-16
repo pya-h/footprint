@@ -1,7 +1,15 @@
 use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
-use fp_collect::{chromium::ChromiumCollector, CollectCtx, Collector, Env};
+use fp_collect::{
+    auth::AuthCollector,
+    chromium::ChromiumCollector,
+    desktop::DesktopCollector,
+    pkg::PkgCollector,
+    shell::ShellCollector,
+    xdm::XdmCollector,
+    CollectCtx, Collector, Env,
+};
 use fp_store::{EventFilter, Store};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -156,15 +164,23 @@ fn collect(
         deny_list: fp_collect::secret_deny_list(),
     };
 
+    let all_collectors: Vec<Box<dyn Collector>> = vec![
+        Box::new(ChromiumCollector::new()),
+        Box::new(XdmCollector::new()),
+        Box::new(PkgCollector::new()),
+        Box::new(AuthCollector::new()),
+        Box::new(ShellCollector::new()),
+        Box::new(DesktopCollector::new()),
+    ];
+
     let collectors: Vec<Box<dyn Collector>> = if sources_arg == "all" {
-        vec![Box::new(ChromiumCollector::new())]
+        all_collectors
     } else {
         let wanted: std::collections::HashSet<&str> = sources_arg.split(',').collect();
-        let mut out: Vec<Box<dyn Collector>> = Vec::new();
-        if wanted.contains("chromium") {
-            out.push(Box::new(ChromiumCollector::new()));
-        }
-        out
+        all_collectors
+            .into_iter()
+            .filter(|c| wanted.contains(c.kind()))
+            .collect()
     };
 
     let mut all_sources = Vec::new();

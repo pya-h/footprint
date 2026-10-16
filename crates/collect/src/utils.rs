@@ -1,7 +1,13 @@
+use crate::collector::CollectCtx;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+pub fn in_window(ctx: &CollectCtx, ts: i64) -> bool {
+    ctx.since.map(|lo| ts >= lo).unwrap_or(true)
+        && ctx.until.map(|hi| ts <= hi).unwrap_or(true)
+}
 
 pub fn copy_and_hash(src: &Path, dst_dir: &Path) -> Result<(PathBuf, String)> {
     let dst = dst_dir.join(src.file_name().context("source has no file name")?);
