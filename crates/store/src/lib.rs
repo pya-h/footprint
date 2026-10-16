@@ -1,3 +1,5 @@
 pub mod schema;
 
-pub use schema::{EventFilter, EventRow, Store};
+pub use schema::{
+    Batch, EventDetail, EventFilter, EventRow, IngestStats, NewRun, SourceRow, Store, StoreError,
+};

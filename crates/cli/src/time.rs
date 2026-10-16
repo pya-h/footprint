@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Result};
-use chrono::{Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use anyhow::{Context, Result, anyhow};
+use chrono::{Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 
 pub fn parse(input: &str) -> Result<i64> {
     if let Some(ts) = parse_at(input) {
@@ -12,12 +12,11 @@ pub fn parse(input: &str) -> Result<i64> {
         let start = Local::now()
             .date_naive()
             .pred_opt()
-            .unwrap()
+            .context("no day before today")?
             .and_time(NaiveTime::MIN);
-        return Ok(local_to_utc_us(&start));
+        return local_to_utc_us(&start);
     }
-    let dt = parse_datetime(input)?;
-    Ok(local_to_utc_us(&dt))
+    local_to_utc_us(&parse_datetime(input)?)
 }
 
 fn parse_at(input: &str) -> Option<i64> {
@@ -60,6 +59,12 @@ fn parse_datetime(input: &str) -> Result<NaiveDateTime> {
     if let Ok(dt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%dT%H:%M:%S") {
         return Ok(dt);
     }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M") {
+        return Ok(dt);
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M:%S") {
+        return Ok(dt);
+    }
     if let Ok(t) = NaiveTime::parse_from_str(input, "%H:%M") {
         let today = Local::now().date_naive();
         return Ok(today.and_time(t));
@@ -74,12 +79,12 @@ fn parse_datetime(input: &str) -> Result<NaiveDateTime> {
     Err(anyhow!("unrecognized time: {input}"))
 }
 
-fn local_to_utc_us(naive: &NaiveDateTime) -> i64 {
+fn local_to_utc_us(naive: &NaiveDateTime) -> Result<i64> {
     Local
         .from_local_datetime(naive)
-        .single()
+        .earliest()
         .map(|dt| dt.timestamp_micros())
-        .unwrap_or_else(|| Utc::now().timestamp_micros())
+        .ok_or_else(|| anyhow!("{naive} does not exist in the local time zone"))
 }
 
 #[cfg(test)]
@@ -89,20 +94,30 @@ mod tests {
     #[test]
     fn at_epoch() {
         let got = parse("@1792172917").unwrap();
-        assert_eq!(got, 1792172917_000_000);
+        assert_eq!(got, 1_792_172_917_000_000);
     }
 
     #[test]
-    fn iso_minutes() {
+    fn iso_minutes_is_local_time() {
         let got = parse("2026-10-16T20:40").unwrap();
-        let expected = Utc.with_ymd_and_hms(2026, 10, 16, 17, 10, 0).unwrap().timestamp_micros();
+        let expected = Local
+            .with_ymd_and_hms(2026, 10, 16, 20, 40, 0)
+            .earliest()
+            .unwrap()
+            .timestamp_micros();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse("soon").is_err());
+        assert!(parse("-5x").is_err());
     }
 
     #[test]
     fn relative_hours() {
         let before = parse("-1h").unwrap();
-        let now = Utc::now().timestamp_micros();
+        let now = chrono::Utc::now().timestamp_micros();
         assert!(before < now);
         assert!(now - before < 4_000_000_000);
     }

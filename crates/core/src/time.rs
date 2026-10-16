@@ -123,15 +123,15 @@ pub fn normalize(
         TimeFormat::LocalNaive(fmt) => {
             let naive = NaiveDateTime::parse_from_str(raw, fmt)
                 .map_err(|_| TimeError::ParseLocal(raw.to_string()))?;
-            let tz = timezone_or_local(assume_tz)?;
-            let dt = tz
-                .from_local_datetime(&naive)
-                .single()
-                .ok_or_else(|| TimeError::ParseLocal(raw.to_string()))?;
+            let ts_utc = match assume_tz {
+                Some(tz) => resolve_local(&parse_offset(tz)?, &naive),
+                None => resolve_local(&Local, &naive),
+            }
+            .ok_or_else(|| TimeError::ParseLocal(raw.to_string()))?;
             Ok(NormalizedTime {
-                ts_utc: dt.timestamp_micros(),
+                ts_utc,
                 precision: TimePrecision::Second,
-                tz_assumed: assume_tz.map(String::from),
+                tz_assumed: Some(assume_tz.map_or_else(|| "local".to_string(), String::from)),
             })
         }
         TimeFormat::Rfc3339 => {
@@ -175,14 +175,18 @@ fn parse_i64(s: &str) -> Result<i64, TimeError> {
         .map_err(|_| TimeError::ParseInt(s.to_string()))
 }
 
-fn timezone_or_local(assume_tz: Option<&str>) -> Result<FixedOffset, TimeError> {
-    match assume_tz {
-        Some(tz) => parse_offset(tz),
-        None => Ok(*Local::now().offset()),
-    }
+/// The offset in effect at that date, not today's; a time skipped by a DST jump has none,
+/// and an ambiguous one (clocks set back) resolves to the earlier instant.
+fn resolve_local<Tz: TimeZone>(tz: &Tz, naive: &NaiveDateTime) -> Option<i64> {
+    tz.from_local_datetime(naive)
+        .earliest()
+        .map(|dt| dt.timestamp_micros())
 }
 
 fn parse_offset(tz: &str) -> Result<FixedOffset, TimeError> {
+    if tz.eq_ignore_ascii_case("utc") || tz == "Z" {
+        return FixedOffset::east_opt(0).ok_or(TimeError::Unsupported);
+    }
     tz.parse::<FixedOffset>()
         .map_err(|_| TimeError::ParseLocal(format!("bad tz offset: {tz}")))
 }
@@ -192,7 +196,7 @@ fn parse_zsh_extended(raw: &str) -> Result<NormalizedTime, TimeError> {
         .find(':')
         .map(|i| i + 1)
         .ok_or_else(|| TimeError::ParseLocal(raw.to_string()))?;
-    let rest = raw[start..].trim_start();
+    let rest = raw.get(start..).unwrap_or_default().trim_start();
     let (ts_part, _) = rest.split_once(':').unwrap_or((rest, ""));
     let s = parse_i64(ts_part)?;
     Ok(NormalizedTime {
@@ -202,8 +206,8 @@ fn parse_zsh_extended(raw: &str) -> Result<NormalizedTime, TimeError> {
     })
 }
 
-pub fn format_utc(ts_utc: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp_micros(ts_utc).unwrap_or_else(|| Utc::now())
+pub fn to_datetime(ts_utc: i64) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp_micros(ts_utc)
 }
 
 #[cfg(test)]
@@ -212,7 +216,7 @@ mod tests {
 
     fn assert_utc(raw: &str, format: TimeFormat, expected: &str) {
         let got = normalize(raw, &format, None).unwrap();
-        let dt = format_utc(got.ts_utc);
+        let dt = to_datetime(got.ts_utc).unwrap();
         assert_eq!(dt.to_rfc3339(), expected);
     }
 
@@ -243,18 +247,60 @@ mod tests {
         );
     }
 
+    fn dpkg_format() -> TimeFormat {
+        TimeFormat::LocalNaive("%Y-%m-%d %H:%M:%S".into())
+    }
+
     #[test]
-    fn local_naive_assumes_host_tz() {
-        let got = normalize("2026-10-16 21:08:00", &TimeFormat::LocalNaive("%Y-%m-%d %H:%M:%S".into()), Some("+03:30")).unwrap();
-        let dt = format_utc(got.ts_utc);
+    fn local_naive_with_assumed_offset() {
+        let got = normalize("2026-10-16 21:08:00", &dpkg_format(), Some("+03:30")).unwrap();
+        let dt = to_datetime(got.ts_utc).unwrap();
         assert_eq!(dt.to_rfc3339(), "2026-10-16T17:38:00+00:00");
         assert_eq!(got.precision, TimePrecision::Second);
+        assert_eq!(got.tz_assumed.as_deref(), Some("+03:30"));
+    }
+
+    #[test]
+    fn local_naive_utc_alias() {
+        let got = normalize("2026-10-16 21:08:00", &dpkg_format(), Some("UTC")).unwrap();
+        assert_eq!(
+            to_datetime(got.ts_utc).unwrap().to_rfc3339(),
+            "2026-10-16T21:08:00+00:00"
+        );
+    }
+
+    #[test]
+    fn local_naive_uses_offset_at_that_date() {
+        let naive =
+            NaiveDateTime::parse_from_str("2021-07-01 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let expected = Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .unwrap()
+            .timestamp_micros();
+        let got = normalize("2021-07-01 12:00:00", &dpkg_format(), None).unwrap();
+        assert_eq!(got.ts_utc, expected);
+        assert_eq!(got.tz_assumed.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn local_naive_rejects_garbage() {
+        assert!(normalize("2026-10-16  21:08", &dpkg_format(), Some("+00:00")).is_err());
+    }
+
+    #[test]
+    fn dotnet_binary_ignores_kind_bits() {
+        let local_kind =
+            normalize("-8584094347052926203", &TimeFormat::DotNetBinary, None).unwrap();
+        let ticks = (-8584094347052926203i64 & 0x3FFF_FFFF_FFFF_FFFF).to_string();
+        let plain = normalize(&ticks, &TimeFormat::DotNetBinary, None).unwrap();
+        assert_eq!(local_kind.ts_utc, plain.ts_utc);
     }
 
     #[test]
     fn zsh_extended() {
         let got = normalize(": 1792172917:0;ls", &TimeFormat::ZshExtended, None).unwrap();
-        let dt = format_utc(got.ts_utc);
+        let dt = to_datetime(got.ts_utc).unwrap();
         assert_eq!(dt.to_rfc3339(), "2026-10-16T17:48:37+00:00");
     }
 

@@ -1,30 +1,63 @@
-use crate::collector::{Collector, CollectCtx, Env, Sink};
-use crate::utils::in_window;
-use anyhow::Result;
-use fp_core::{Actor, Confidence, Event, EventKind, Provenance, SourceInstance, SourceStatus, time::TimeFormat};
+use crate::collector::{CollectCtx, Collector, Env, Sink};
+use crate::event::{Origin, Stamp, new_event};
+use crate::redact::redact_secrets;
+use crate::utils::{in_window, read_evidence};
+use anyhow::{Result, bail};
+use fp_core::time::TimeFormat;
+use fp_core::{Actor, EventKind, SourceInstance};
+use regex::Regex;
 use serde_json::json;
-use std::fs;
+use std::borrow::Cow;
+use std::sync::LazyLock;
 
-const HISTORIES: &[(&str, &str, ShellFormat)] = &[
-    ("bash", ".bash_history", ShellFormat::BashHashEpoch),
-    ("zsh", ".zsh_history", ShellFormat::ZshExtended),
-    ("fish", ".local/share/fish/fish_history", ShellFormat::FishYaml),
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Format {
+    Bash,
+    Zsh,
+    Fish,
+    /// one entry per line, oldest first (python, psql, sqlite3); libedit's `_HiStOrY_V2_` variant is detected
+    Lines,
+    /// one entry per line, newest first
+    LinesNewestFirst,
+}
+
+/// (app, path under `$HOME`, format)
+const HISTORIES: &[(&str, &str, Format)] = &[
+    ("bash", ".bash_history", Format::Bash),
+    ("zsh", ".zsh_history", Format::Zsh),
+    ("zsh", ".histfile", Format::Zsh),
+    ("fish", ".local/share/fish/fish_history", Format::Fish),
+    ("python", ".python_history", Format::Lines),
+    ("psql", ".psql_history", Format::Lines),
+    ("mysql", ".mysql_history", Format::Lines),
+    ("sqlite3", ".sqlite_history", Format::Lines),
+    ("node", ".node_repl_history", Format::LinesNewestFirst),
 ];
 
-#[derive(Clone, Copy)]
-enum ShellFormat {
-    BashHashEpoch,
-    ZshExtended,
-    FishYaml,
-}
+/// zsh writes bytes `0x83..=0x9f` and NUL as `0x83` followed by the byte XOR `0x20`.
+const ZSH_META: u8 = 0x83;
+const LIBEDIT_HEADER: &str = "_HiStOrY_V2_";
+
+static DANGEROUS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    [
+        (
+            r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b",
+            "pipe-to-shell",
+        ),
+        (r"\bbase64\s+(-d|--decode)\b", "base64-decode"),
+        (r"(^|[;&|\s])eval\s", "eval"),
+        (r"/dev/(tcp|udp)/", "dev-tcp"),
+        (r"\bnohup\b.*&\s*$", "nohup-background"),
+        (r"\bnpm\s+(i|install|ci)\b", "npm-install"),
+        (r"\bchmod\s+\+?[0-7]*x", "chmod-exec"),
+        (r"\b(python3?|node|perl)\s+-(c|e)\s", "inline-interpreter"),
+    ]
+    .into_iter()
+    .map(|(pattern, flag)| (Regex::new(pattern).expect("static pattern compiles"), flag))
+    .collect()
+});
 
 pub struct ShellCollector;
-
-impl ShellCollector {
-    pub fn new() -> Self {
-        Self
-    }
-}
 
 impl Collector for ShellCollector {
     fn kind(&self) -> &'static str {
@@ -32,205 +65,384 @@ impl Collector for ShellCollector {
     }
 
     fn discover(&self, env: &Env) -> Vec<SourceInstance> {
-        let mut id = 1u64;
-        let mut out = Vec::new();
-        for (shell, rel, _fmt) in HISTORIES {
-            let path = env.home.join(rel);
-            if path.exists() {
-                out.push(SourceInstance {
-                    id,
-                    kind: self.kind().to_string(),
-                    app: shell.to_string(),
-                    profile: None,
-                    path,
-                    status: SourceStatus::Ok,
-                    note: None,
-                });
-                id += 1;
-            }
-        }
-        out
+        HISTORIES
+            .iter()
+            .map(|(app, rel, _)| SourceInstance::new(self.kind(), app, None, env.home.join(rel)))
+            .filter(|inst| inst.path.is_file())
+            .collect()
     }
 
-    fn collect(
-        &self,
-        inst: &SourceInstance,
-        ctx: &CollectCtx,
-        sink: &Sink,
-    ) -> Result<fp_core::CollectStats> {
-        let text = fs::read_to_string(&inst.path)?;
-        let format = match inst.app.as_str() {
-            "bash" => ShellFormat::BashHashEpoch,
-            "zsh" => ShellFormat::ZshExtended,
-            "fish" => ShellFormat::FishYaml,
-            _ => return Ok(fp_core::CollectStats::empty()),
+    fn collect(&self, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut Sink) -> Result<()> {
+        let Some(format) = HISTORIES
+            .iter()
+            .find(|(app, rel, _)| *app == inst.app && inst.path.ends_with(rel))
+            .map(|(_, _, f)| *f)
+        else {
+            bail!(
+                "no history format known for {} at {}",
+                inst.app,
+                inst.path.display()
+            );
+        };
+        let file = read_evidence(&inst.path)?;
+        let entries = match format {
+            Format::Bash => parse_bash(&String::from_utf8_lossy(&file.bytes)),
+            Format::Zsh => parse_zsh(&String::from_utf8_lossy(&unmetafy(&file.bytes))),
+            Format::Fish => parse_fish(&String::from_utf8_lossy(&file.bytes)),
+            Format::Lines => parse_lines(&String::from_utf8_lossy(&file.bytes), false),
+            Format::LinesNewestFirst => parse_lines(&String::from_utf8_lossy(&file.bytes), true),
         };
 
-        match format {
-            ShellFormat::BashHashEpoch => collect_bash(&text, inst, ctx, sink),
-            ShellFormat::ZshExtended => collect_zsh(&text, inst, ctx, sink),
-            ShellFormat::FishYaml => collect_fish(&text, inst, ctx, sink),
+        let origin = Origin {
+            file: &inst.path,
+            sha256: Some(&file.sha256),
+        };
+        for entry in entries {
+            let stamp = match entry.when {
+                Some(epoch) => Stamp::parse(epoch.to_string(), entry.format, None)?,
+                None => Stamp::untimed(),
+            };
+            if stamp.is_timed() && !in_window(ctx, stamp.ts_utc) {
+                continue;
+            }
+            let command = redact_secrets(&entry.command);
+            let redacted = matches!(command, Cow::Owned(_));
+            let flags: Vec<&str> = DANGEROUS
+                .iter()
+                .filter(|(re, _)| re.is_match(&command))
+                .map(|(_, flag)| *flag)
+                .collect();
+            // timed entries are keyed by time; line numbers shift when the shell truncates its history
+            let locator = match entry.when {
+                Some(epoch) => format!("when={epoch}"),
+                None => format!("line {}", entry.line),
+            };
+            sink.event(fp_core::Event {
+                actor: Some(Actor::app(inst.app.as_str())),
+                attrs: json!({
+                    "line": entry.line,
+                    "order": entry.order,
+                    "flags": flags,
+                    "redacted": redacted,
+                    "paths": entry.paths,
+                }),
+                ..new_event(
+                    ctx,
+                    inst,
+                    stamp,
+                    EventKind::ShellCommand,
+                    command.to_string(),
+                    command.into_owned(),
+                    origin.at(locator),
+                )
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct Entry {
+    command: String,
+    when: Option<i64>,
+    format: TimeFormat,
+    /// 1-based line where the entry starts
+    line: usize,
+    /// position in chronological order, for entries without a time
+    order: usize,
+    paths: Vec<String>,
+}
+
+impl Entry {
+    fn new(command: String, when: Option<i64>, format: TimeFormat, line: usize) -> Self {
+        Self {
+            command,
+            when,
+            format,
+            line,
+            order: 0,
+            paths: Vec::new(),
         }
     }
 }
 
-fn collect_bash(
-    text: &str,
-    inst: &SourceInstance,
-    ctx: &CollectCtx,
-    sink: &Sink,
-) -> Result<fp_core::CollectStats> {
-    let format = TimeFormat::BashHashEpoch;
-    let mut pending_ts: Option<i64> = None;
-    let mut line_no = 0;
+fn numbered(mut entries: Vec<Entry>) -> Vec<Entry> {
+    entries.retain(|e| !e.command.trim().is_empty());
+    for (i, e) in entries.iter_mut().enumerate() {
+        e.order = i;
+    }
+    entries
+}
 
-    for line in text.lines() {
-        line_no += 1;
-        if let Some(ts_raw) = line.strip_prefix('#') {
-            if let Ok(norm) = fp_core::time::normalize(ts_raw, &format, None) {
-                pending_ts = Some(norm.ts_utc);
+/// `#1792172917` marks the time of the entry that follows; an entry may span lines until the next mark.
+fn parse_bash(text: &str) -> Vec<Entry> {
+    let epoch = |line: &str| {
+        line.strip_prefix('#')
+            .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|d| d.parse::<i64>().ok())
+    };
+    let timed = text.lines().any(|l| epoch(l).is_some());
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut pending: Option<i64> = None;
+    for (idx, line) in text.lines().enumerate() {
+        if let Some(ts) = epoch(line) {
+            pending = Some(ts);
+            continue;
+        }
+        match (timed, pending.take(), entries.last_mut()) {
+            (true, None, Some(last)) if last.when.is_some() => {
+                last.command.push('\n');
+                last.command.push_str(line);
             }
-            continue;
+            (_, when, _) => entries.push(Entry::new(
+                line.to_string(),
+                when,
+                TimeFormat::BashHashEpoch,
+                idx + 1,
+            )),
         }
-        if line.is_empty() {
-            continue;
+    }
+    numbered(entries)
+}
+
+fn unmetafy(bytes: &[u8]) -> Cow<'_, [u8]> {
+    if !bytes.contains(&ZSH_META) {
+        return Cow::Borrowed(bytes);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut iter = bytes.iter();
+    while let Some(&b) = iter.next() {
+        match (b, iter.as_slice().first()) {
+            (ZSH_META, Some(&next)) => {
+                out.push(next ^ 0x20);
+                iter.next();
+            }
+            _ => out.push(b),
         }
+    }
+    Cow::Owned(out)
+}
 
-        let (ts_utc, precision, ts_raw, ts_format, tz_assumed) = match pending_ts {
-            Some(ts) => (ts, fp_core::TimePrecision::Second, ts_raw_for(ts), TimeFormat::BashHashEpoch, None),
-            None => (0, fp_core::TimePrecision::OrderOnly, line.to_string(), TimeFormat::None, None),
-        };
-
-        if precision != fp_core::TimePrecision::OrderOnly && !in_window(ctx, ts_utc) {
-            continue;
-        }
-
-        let confidence = if precision == fp_core::TimePrecision::OrderOnly {
-            Confidence::Derived
+/// `: 1792172917:0;command`, a trailing `\` continues the command on the next line.
+fn parse_zsh(text: &str) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut continues = false;
+    for (idx, line) in text.lines().enumerate() {
+        if continues && let Some(last) = entries.last_mut() {
+            last.command.push('\n');
+            last.command.push_str(line);
         } else {
-            Confidence::Direct
-        };
-
-        push_shell_event(sink, ctx, inst, ts_utc, precision, ts_raw, ts_format, tz_assumed, line, line_no, confidence);
-        pending_ts = None;
+            entries.push(match zsh_extended(line) {
+                Some((when, cmd)) => Entry::new(
+                    cmd.to_string(),
+                    Some(when),
+                    TimeFormat::UnixSeconds,
+                    idx + 1,
+                ),
+                None => Entry::new(line.to_string(), None, TimeFormat::None, idx + 1),
+            });
+        }
+        continues = line.ends_with('\\');
     }
-    Ok(fp_core::CollectStats::empty())
+    numbered(entries)
 }
 
-fn collect_zsh(
-    text: &str,
-    inst: &SourceInstance,
-    ctx: &CollectCtx,
-    sink: &Sink,
-) -> Result<fp_core::CollectStats> {
-    let format = TimeFormat::ZshExtended;
-    for (line_no, line) in text.lines().enumerate() {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(norm) = fp_core::time::normalize(line, &format, None) else {
-            push_shell_event(sink, ctx, inst, 0, fp_core::TimePrecision::OrderOnly, line.to_string(), TimeFormat::None, None, line, line_no + 1, Confidence::Derived);
-            continue;
-        };
-        if !in_window(ctx, norm.ts_utc) {
-            continue;
-        }
-        let cmd = line.split_once(';').map(|(_, c)| c).unwrap_or(line);
-        push_shell_event(sink, ctx, inst, norm.ts_utc, norm.precision, line.to_string(), TimeFormat::ZshExtended, norm.tz_assumed, cmd, line_no + 1, Confidence::Direct);
-    }
-    Ok(fp_core::CollectStats::empty())
+fn zsh_extended(line: &str) -> Option<(i64, &str)> {
+    let rest = line.strip_prefix(": ")?;
+    let (stamp, cmd) = rest.split_once(';')?;
+    let (when, _duration) = stamp.split_once(':')?;
+    Some((when.parse().ok()?, cmd))
 }
 
-fn collect_fish(
-    text: &str,
-    inst: &SourceInstance,
-    ctx: &CollectCtx,
-    sink: &Sink,
-) -> Result<fp_core::CollectStats> {
-    let format = TimeFormat::UnixSeconds;
-    let mut cmd: Option<String> = None;
-    let mut when: Option<i64> = None;
-    let mut line_no = 0;
-
-    for line in text.lines() {
-        line_no += 1;
-        if line.starts_with("- cmd: ") {
-            cmd = Some(line.strip_prefix("- cmd: ").unwrap_or("").to_string());
-        } else if line.starts_with("  when: ") {
-            when = line.strip_prefix("  when: ").and_then(|s| s.parse().ok());
-        } else if line.trim().is_empty() {
-            if let (Some(c), Some(w)) = (cmd.take(), when.take()) {
-                let norm = fp_core::time::normalize(&w.to_string(), &format, None)?;
-                if !in_window(ctx, norm.ts_utc) {
-                    continue;
-                }
-                push_shell_event(sink, ctx, inst, norm.ts_utc, norm.precision, w.to_string(), TimeFormat::UnixSeconds, None, &c, line_no, Confidence::Direct);
+/// Entries start at `- cmd: `; `  when: ` and an optional `  paths:` list follow. No blank lines between entries.
+fn parse_fish(text: &str) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        if let Some(cmd) = line.strip_prefix("- cmd: ") {
+            entries.push(Entry::new(
+                fish_unescape(cmd),
+                None,
+                TimeFormat::UnixSeconds,
+                idx + 1,
+            ));
+        } else if let Some(last) = entries.last_mut() {
+            if let Some(when) = line.strip_prefix("  when: ") {
+                last.when = when.trim().parse().ok();
+            } else if let Some(path) = line.strip_prefix("    - ") {
+                last.paths.push(fish_unescape(path));
             }
         }
     }
-    Ok(fp_core::CollectStats::empty())
+    numbered(entries)
 }
 
-fn push_shell_event(
-    sink: &Sink,
-    ctx: &CollectCtx,
-    inst: &SourceInstance,
-    ts_utc: i64,
-    precision: fp_core::TimePrecision,
-    ts_raw: String,
-    ts_format: TimeFormat,
-    tz_assumed: Option<String>,
-    command: &str,
-    line_no: usize,
-    confidence: Confidence,
-) {
-    let flags = dangerous_flags(command);
-    sink.push_event(Event {
-        run_id: ctx.run_id,
-        ts_utc,
-        ts_precision: precision,
-        ts_raw,
-        ts_raw_format: ts_format,
-        ts_tz_assumed: tz_assumed,
-        source_kind: inst.kind.clone(),
-        source_inst: inst.id,
-        kind: EventKind::ShellCommand,
-        actor: Some(Actor {
-            uid: None,
-            user: None,
-            pid: None,
-            exe: None,
-            app: Some(inst.app.clone()),
-        }),
-        subject: command.to_string(),
-        subject_host: None,
-        summary: command.to_string(),
-        attrs: json!({
-            "line": line_no,
-            "dangerous": !flags.is_empty(),
-            "flags": flags,
-        }),
-        provenance: Provenance {
-            file: inst.path.clone(),
-            file_sha256: None,
-            locator: format!("{}:line {}", inst.path.display(), line_no),
-        },
-        confidence,
-    });
+/// fish stores a newline as `\n` and a backslash as `\\`.
+fn fish_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match (c, chars.clone().next()) {
+            ('\\', Some('n')) => {
+                out.push('\n');
+                chars.next();
+            }
+            ('\\', Some('\\')) => {
+                out.push('\\');
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
-fn dangerous_flags(cmd: &str) -> Vec<&'static str> {
-    let mut flags = Vec::new();
-    if cmd.contains("curl ") && cmd.contains("| sh") { flags.push("curl-pipe-sh"); }
-    if cmd.contains("wget ") && cmd.contains("| sh") { flags.push("wget-pipe-sh"); }
-    if cmd.contains("base64 -d") || cmd.contains("base64 --decode") { flags.push("base64-decode"); }
-    if cmd.contains("eval ") { flags.push("eval"); }
-    if cmd.contains("/dev/tcp/") { flags.push("dev-tcp"); }
-    if cmd.contains("nohup ") && cmd.contains("&") { flags.push("nohup-background"); }
-    if cmd.contains("npm install") { flags.push("npm-install"); }
-    flags
+fn parse_lines(text: &str, newest_first: bool) -> Vec<Entry> {
+    let libedit = text.lines().next() == Some(LIBEDIT_HEADER);
+    let mut entries: Vec<Entry> = text
+        .lines()
+        .enumerate()
+        .skip(usize::from(libedit))
+        .map(|(idx, line)| {
+            let command = if libedit {
+                libedit_unescape(line)
+            } else {
+                line.to_string()
+            };
+            Entry::new(command, None, TimeFormat::None, idx + 1)
+        })
+        .collect();
+    if newest_first {
+        entries.reverse();
+    }
+    numbered(entries)
 }
 
-fn ts_raw_for(ts: i64) -> String {
-    (ts / 1_000_000).to_string()
+/// libedit escapes bytes as three-digit octal: `\040` is a space.
+fn libedit_unescape(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|d| d.iter().all(|b| (b'0'..=b'7').contains(b)))
+            .and_then(|d| u8::from_str_radix(std::str::from_utf8(d).ok()?, 8).ok());
+        match (bytes[i], octal) {
+            (b'\\', Some(b)) => {
+                out.push(b);
+                i += 4;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn commands(entries: &[Entry]) -> Vec<(&str, Option<i64>)> {
+        entries
+            .iter()
+            .map(|e| (e.command.as_str(), e.when))
+            .collect()
+    }
+
+    #[test]
+    fn bash_timed_multiline_and_hash_commands() {
+        let got = parse_bash(
+            "#1792172870\ncd ~/Downloads\n#1792172876\nfor f in *.deb; do\n  echo $f\ndone\n#1792172880\n# just a comment\n",
+        );
+        assert_eq!(
+            commands(&got),
+            [
+                ("cd ~/Downloads", Some(1792172870)),
+                ("for f in *.deb; do\n  echo $f\ndone", Some(1792172876)),
+                ("# just a comment", Some(1792172880)),
+            ]
+        );
+        assert_eq!(got[1].line, 4);
+    }
+
+    #[test]
+    fn bash_untimed_is_one_line_per_entry() {
+        let got = parse_bash("ls\n\nsudo apt install ./zoom_amd64.deb\n#not-a-time\n");
+        assert_eq!(
+            commands(&got),
+            [
+                ("ls", None),
+                ("sudo apt install ./zoom_amd64.deb", None),
+                ("#not-a-time", None)
+            ]
+        );
+        assert_eq!(got.iter().map(|e| e.order).collect::<Vec<_>>(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn zsh_metafied_and_continued() {
+        let mut bytes = b": 1792172870:0;echo caf".to_vec();
+        // 'é' is c3 a9; zsh metafies neither, but a 0x83 byte would be written as 83 a3
+        bytes.extend([0xc3, 0xa9]);
+        bytes.extend(b"\n: 1792172871:2;printf '");
+        bytes.extend([ZSH_META, 0x83 ^ 0x20]);
+        bytes.extend(b"'\n: 1792172872:0;ls \\\n-la\nplain\n");
+        let got = parse_zsh(&String::from_utf8_lossy(&unmetafy(&bytes)));
+        assert_eq!(got[0].command, "echo café");
+        assert_eq!(got[1].command.as_bytes(), b"printf '\xef\xbf\xbd'");
+        assert_eq!(
+            commands(&got[2..]),
+            [("ls \\\n-la", Some(1792172872)), ("plain", None)]
+        );
+    }
+
+    #[test]
+    fn fish_without_blank_lines() {
+        let got = parse_fish(
+            "- cmd: cd ~/Downloads\n  when: 1792172870\n- cmd: sudo apt install ./zoom_amd64.deb\n  when: 1792172876\n  paths:\n    - ./zoom_amd64.deb\n- cmd: echo a\\\\b\\nc\n  when: 1792172880\n",
+        );
+        assert_eq!(
+            commands(&got),
+            [
+                ("cd ~/Downloads", Some(1792172870)),
+                ("sudo apt install ./zoom_amd64.deb", Some(1792172876)),
+                ("echo a\\b\nc", Some(1792172880)),
+            ]
+        );
+        assert_eq!(got[1].paths, ["./zoom_amd64.deb"]);
+    }
+
+    #[test]
+    fn repl_formats() {
+        let mysql = parse_lines("_HiStOrY_V2_\nSELECT\\040*\\040FROM\\040users;\n", false);
+        assert_eq!(commands(&mysql), [("SELECT * FROM users;", None)]);
+        assert_eq!(mysql[0].line, 2);
+        let node = parse_lines("newest\nolder\noldest\n", true);
+        assert_eq!(
+            node.iter().map(|e| e.command.as_str()).collect::<Vec<_>>(),
+            ["oldest", "older", "newest"]
+        );
+    }
+
+    #[test]
+    fn flags_dangerous_patterns() {
+        let flagged = |cmd: &str| -> Vec<&str> {
+            DANGEROUS
+                .iter()
+                .filter(|(re, _)| re.is_match(cmd))
+                .map(|(_, f)| *f)
+                .collect()
+        };
+        assert_eq!(flagged("wget -qO- https://x.sh | sh"), ["pipe-to-shell"]);
+        assert_eq!(
+            flagged("curl -fsSL https://x | sudo bash"),
+            ["pipe-to-shell"]
+        );
+        assert_eq!(flagged("echo aGk= | base64 -d"), ["base64-decode"]);
+        assert!(flagged("sudo apt install ./zoom_amd64.deb").is_empty());
+        assert!(flagged("evaluate --shell").is_empty());
+    }
 }

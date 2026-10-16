@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: check
+        run: cargo check --all-targets
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: no unwrap outside tests
+        run: |
+          found=$(find crates -path '*/src/*.rs' -exec awk '/#\[cfg\(test\)\]/{exit} /\.unwrap\(\)/{print FILENAME":"FNR": "$0}' {} \;)
+          if [ -n "$found" ]; then echo "$found"; exit 1; fi
+      - name: test
+        run: cargo test --all-targets

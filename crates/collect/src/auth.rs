@@ -1,171 +1,378 @@
-use crate::collector::{Collector, CollectCtx, Env, Sink};
+use crate::collector::{CollectCtx, Collector, Env, Sink};
+use crate::event::{Origin, Stamp, new_event};
+use crate::redact::redact_secrets;
 use crate::utils::in_window;
-use anyhow::Result;
-use fp_core::{Actor, Confidence, Event, EventKind, Provenance, SourceInstance, SourceStatus, time::TimeFormat};
+use anyhow::{Context, Result, bail};
+use fp_core::time::TimeFormat;
+use fp_core::{Actor, Event, EventKind, SourceInstance, SourceStatus};
 use serde::Deserialize;
 use serde_json::json;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-pub struct AuthCollector;
+const JOURNALCTL: &str = "/usr/bin/journalctl";
+const PERSISTENT_JOURNAL: &str = "/var/log/journal";
+const VOLATILE_JOURNAL: &str = "/run/log/journal";
+/// sudo, su and pkexec by process name, plus both names the ssh daemon unit has across distros.
+const MATCHES: &[&str] = &[
+    "_COMM=sudo",
+    "_COMM=su",
+    "_COMM=pkexec",
+    "+",
+    "_SYSTEMD_UNIT=ssh.service",
+    "+",
+    "_SYSTEMD_UNIT=sshd.service",
+];
+const SSH_KEPT_PREFIXES: &[&str] = &[
+    "Accepted ",
+    "Failed ",
+    "Invalid user ",
+    "Disconnected from user ",
+];
 
-impl AuthCollector {
-    pub fn new() -> Self {
-        Self
-    }
-}
+pub struct AuthCollector;
 
 impl Collector for AuthCollector {
     fn kind(&self) -> &'static str {
         "auth.journald"
     }
 
-    fn discover(&self, _env: &Env) -> Vec<SourceInstance> {
-        vec![SourceInstance {
-            id: 1,
-            kind: self.kind().to_string(),
-            app: "journald".to_string(),
-            profile: None,
-            path: PathBuf::from("/run/log/journal"),
-            status: SourceStatus::Ok,
-            note: None,
-        }]
+    fn discover(&self, env: &Env) -> Vec<SourceInstance> {
+        let persistent = env.system_path(PERSISTENT_JOURNAL);
+        let live = env.root == Path::new("/");
+        let path = if persistent.is_dir() || !live {
+            persistent
+        } else {
+            env.system_path(VOLATILE_JOURNAL)
+        };
+        let mut inst = SourceInstance::new(self.kind(), "journald", None, path);
+        if !Path::new(JOURNALCTL).exists() {
+            inst.status = SourceStatus::Unavailable;
+            inst.note = Some(format!("{JOURNALCTL} not found"));
+        } else if !inst.path.is_dir() {
+            inst.status = SourceStatus::Unavailable;
+            inst.note = Some("no journal directory".into());
+        }
+        vec![inst]
     }
 
-    fn collect(
-        &self,
-        inst: &SourceInstance,
-        ctx: &CollectCtx,
-        sink: &Sink,
-    ) -> Result<fp_core::CollectStats> {
-        let since_arg = ctx.since.map(|since| {
-            chrono::DateTime::from_timestamp_micros(since)
-                .map(|d| d.to_rfc3339())
-                .unwrap_or_default()
-        });
-        let until_arg = ctx.until.map(|until| {
-            chrono::DateTime::from_timestamp_micros(until)
-                .map(|d| d.to_rfc3339())
-                .unwrap_or_default()
-        });
-        let filters: &[&[&str]] = &[
-            &["_COMM=sudo", "_COMM=su", "_COMM=pkexec"],
-            &["_SYSTEMD_UNIT=ssh.service"],
-        ];
-
-        let mut lines = Vec::new();
-        for filter in filters {
-            let mut cmd = Command::new("/usr/bin/journalctl");
-            cmd.arg("-o").arg("json");
-            if let Some(ref dt) = since_arg {
-                cmd.arg("--since").arg(dt);
-            }
-            if let Some(ref dt) = until_arg {
-                cmd.arg("--until").arg(dt);
-            }
-            for f in *filter {
-                cmd.arg(f);
-            }
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-            let output = cmd.output()?;
-            if !output.status.success() {
-                sink.error(format!(
-                    "journalctl exited {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-                continue;
-            }
-            lines.extend(String::from_utf8_lossy(&output.stdout).lines().map(|s| s.to_string()));
+    fn collect(&self, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut Sink) -> Result<()> {
+        let mut cmd = Command::new(JOURNALCTL);
+        cmd.args(["--output=json", "--no-pager", "--quiet"]);
+        if !inst.path.starts_with(VOLATILE_JOURNAL) && !inst.path.starts_with(PERSISTENT_JOURNAL) {
+            cmd.arg("--directory").arg(&inst.path);
         }
-        lines.sort();
-        lines.dedup();
+        if let Some(since) = ctx.since {
+            cmd.arg(format!("--since=@{}", since.div_euclid(1_000_000)));
+        }
+        if let Some(until) = ctx.until {
+            cmd.arg(format!("--until=@{}", until.div_euclid(1_000_000) + 1));
+        }
+        cmd.args(MATCHES)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-        for line in lines {
-            let Ok(entry): Result<JournalEntry, _> = serde_json::from_str(&line) else { continue };
-            let Some(ts_us) = entry.realtime_us() else { continue };
-            if !in_window(ctx, ts_us) {
+        let mut child = cmd.spawn().with_context(|| format!("spawn {JOURNALCTL}"))?;
+        let stdout = child.stdout.take().context("journalctl stdout")?;
+        let mut stderr = child.stderr.take().context("journalctl stderr")?;
+        let stderr_reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        });
+
+        let origin = Origin {
+            file: &inst.path,
+            sha256: None,
+        };
+        for line in BufReader::new(stdout).lines() {
+            let line = line?;
+            let Ok(entry) = serde_json::from_str::<JournalEntry>(&line) else {
+                sink.warn("journalctl: unparsable JSON entry");
                 continue;
-            }
-
-            let message = entry.message.as_deref().unwrap_or("");
-            let (kind, summary) = match entry.comm.as_deref() {
-                Some("sudo") => {
-                    let cmd = extract_field(message, "COMMAND=");
-                    let user = extract_field(message, "USER=");
-                    let tty = extract_field(message, "TTY=");
-                    let summary = format!(
-                        "{}: {}{}",
-                        user.as_deref().unwrap_or("?"),
-                        cmd.as_deref().unwrap_or("?"),
-                        tty.map(|t| format!(" ({t})")).unwrap_or_default()
-                    );
-                    (EventKind::PrivSudo, summary)
-                }
-                Some("su") => (EventKind::PrivSu, message.to_string()),
-                Some("pkexec") => (EventKind::PrivSu, message.to_string()),
-                _ => (EventKind::AuthSsh, message.to_string()),
             };
-
-            sink.push_event(Event {
-                run_id: ctx.run_id,
-                ts_utc: ts_us,
-                ts_precision: fp_core::TimePrecision::Exact,
-                ts_raw: entry.realtime.clone().unwrap_or_default(),
-                ts_raw_format: TimeFormat::JournaldRealtime,
-                ts_tz_assumed: None,
-                source_kind: self.kind().to_string(),
-                source_inst: inst.id,
-                kind,
-                actor: Some(Actor {
-                    uid: None,
-                    user: None,
-                    pid: None,
-                    exe: entry.exe.as_ref().map(PathBuf::from),
-                    app: entry.comm.clone(),
-                }),
-                subject: extract_field(message, "COMMAND=").unwrap_or_default(),
-                subject_host: None,
-                summary,
-                attrs: json!({
-                    "cursor": entry.cursor,
-                    "comm": entry.comm,
-                    "message": entry.message,
-                }),
-                provenance: Provenance {
-                    file: inst.path.clone(),
-                    file_sha256: None,
-                    locator: entry.cursor.unwrap_or_default(),
-                },
-                confidence: Confidence::Direct,
-            });
+            // journalctl's window is whole seconds; the exact bounds are applied here
+            if let Some(event) = entry
+                .into_event(ctx, inst, &origin)?
+                .filter(|e| in_window(ctx, e.ts_utc))
+            {
+                sink.event(event);
+            }
         }
-        Ok(fp_core::CollectStats::empty())
+
+        let status = child.wait()?;
+        let stderr = stderr_reader.join().unwrap_or_default();
+        if !status.success() {
+            bail!("journalctl exited {status}: {}", stderr.trim());
+        }
+        // a user outside `adm`/`systemd-journal` only sees their own entries; journalctl says so on stderr
+        if !stderr.trim().is_empty() {
+            sink.warn(format!("journalctl: {}", stderr.trim()));
+        }
+        Ok(())
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct JournalEntry {
     #[serde(rename = "__REALTIME_TIMESTAMP")]
-    realtime: Option<String>,
+    realtime: String,
     #[serde(rename = "__CURSOR")]
-    cursor: Option<String>,
+    cursor: String,
     #[serde(rename = "_COMM")]
     comm: Option<String>,
+    #[serde(rename = "_SYSTEMD_UNIT")]
+    unit: Option<String>,
     #[serde(rename = "_EXE")]
     exe: Option<String>,
-    #[serde(rename = "MESSAGE")]
-    message: Option<String>,
+    #[serde(rename = "_PID")]
+    pid: Option<String>,
+    #[serde(rename = "_UID")]
+    uid: Option<String>,
+    /// journald stores a non-UTF-8 message as an array of bytes
+    #[serde(rename = "MESSAGE", default, deserialize_with = "message_text")]
+    message: String,
+}
+
+fn message_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Message {
+        Text(String),
+        Bytes(Vec<u8>),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Message::deserialize(d)? {
+        Message::Text(s) => s,
+        Message::Bytes(b) => String::from_utf8_lossy(&b).into_owned(),
+        Message::Other(_) => String::new(),
+    })
+}
+
+/// A parsed sudo `MESSAGE`: `paya : TTY=/dev/pts/1 ; PWD=/home/paya ; USER=root ; COMMAND=/usr/bin/apt install ./x.deb`
+#[derive(Debug, Default, PartialEq)]
+struct SudoLine<'a> {
+    invoker: &'a str,
+    target: Option<&'a str>,
+    tty: Option<&'a str>,
+    pwd: Option<&'a str>,
+    command: Option<&'a str>,
+    /// `3 incorrect password attempts`, `user NOT in sudoers`, …
+    problem: Option<&'a str>,
+}
+
+fn parse_sudo(message: &str) -> Option<SudoLine<'_>> {
+    let (invoker, rest) = message.split_once(" : ")?;
+    let (fields, command) = match rest.split_once("COMMAND=") {
+        Some((fields, cmd)) => (fields, Some(cmd.trim())),
+        None => (rest, None),
+    };
+    let mut line = SudoLine {
+        invoker: invoker.trim(),
+        command,
+        ..SudoLine::default()
+    };
+    for field in fields
+        .split(" ; ")
+        .map(str::trim)
+        .filter(|f| !f.is_empty() && *f != ";")
+    {
+        match field.split_once('=') {
+            Some(("TTY", v)) => line.tty = Some(v.strip_prefix("/dev/").unwrap_or(v)),
+            Some(("PWD", v)) => line.pwd = Some(v),
+            Some(("USER", v)) => line.target = Some(v),
+            Some(_) => {}
+            None => line.problem = Some(field.trim_end_matches(" ;")),
+        }
+    }
+    Some(line)
+}
+
+/// `from 203.0.113.7 port 51234`
+fn ssh_peer(message: &str) -> Option<String> {
+    let after = message.split_once(" from ")?.1;
+    Some(after.split_whitespace().next()?.to_string())
 }
 
 impl JournalEntry {
-    fn realtime_us(&self) -> Option<i64> {
-        self.realtime.as_ref().and_then(|s| s.parse().ok())
+    fn into_event(
+        self,
+        ctx: &CollectCtx,
+        inst: &SourceInstance,
+        origin: &Origin,
+    ) -> Result<Option<Event>> {
+        let stamp = Stamp::parse(self.realtime.as_str(), TimeFormat::JournaldRealtime, None)?;
+        let comm = self.comm.as_deref().unwrap_or_default();
+        let message = redact_secrets(&self.message);
+        let message = message.as_ref();
+        let is_ssh = self
+            .unit
+            .as_deref()
+            .is_some_and(|u| u == "ssh.service" || u == "sshd.service");
+        let mut actor = Actor {
+            uid: self.uid.as_deref().and_then(|u| u.parse().ok()),
+            pid: self.pid.as_deref().and_then(|p| p.parse().ok()),
+            exe: self.exe.as_ref().map(PathBuf::from),
+            ..Actor::app(comm)
+        };
+        let mut attrs = json!({ "comm": comm, "unit": self.unit, "message": message });
+        let mut subject_host = None;
+
+        let (kind, subject, summary) = if message.starts_with("pam_") {
+            (
+                EventKind::AuthSession,
+                comm.to_string(),
+                message.to_string(),
+            )
+        } else if is_ssh {
+            if !SSH_KEPT_PREFIXES.iter().any(|p| message.starts_with(p)) {
+                return Ok(None);
+            }
+            subject_host = ssh_peer(message);
+            (
+                EventKind::AuthSsh,
+                subject_host.clone().unwrap_or_default(),
+                message.to_string(),
+            )
+        } else if comm == "sudo" {
+            let Some(sudo) = parse_sudo(message) else {
+                return Ok(None);
+            };
+            actor.user = Some(sudo.invoker.to_string());
+            let mut summary = format!("{}: {}", sudo.invoker, sudo.command.unwrap_or("?"));
+            if let Some(target) = sudo.target.filter(|t| *t != "root") {
+                summary.push_str(&format!(" (as {target})"));
+            }
+            if let Some(tty) = sudo.tty {
+                summary.push_str(&format!(" ({tty})"));
+            }
+            if let Some(problem) = sudo.problem {
+                summary.push_str(&format!(" [{problem}]"));
+            }
+            attrs = json!({
+                "comm": comm,
+                "message": message,
+                "invoker": sudo.invoker,
+                "target_user": sudo.target,
+                "tty": sudo.tty,
+                "pwd": sudo.pwd,
+                "problem": sudo.problem,
+            });
+            (
+                EventKind::PrivSudo,
+                sudo.command.unwrap_or_default().to_string(),
+                summary,
+            )
+        } else {
+            (
+                EventKind::PrivSu,
+                comm.to_string(),
+                format!("{comm}: {message}"),
+            )
+        };
+
+        Ok(Some(Event {
+            actor: Some(actor),
+            subject_host,
+            attrs,
+            ..new_event(
+                ctx,
+                inst,
+                stamp,
+                kind,
+                subject,
+                summary,
+                origin.at(self.cursor),
+            )
+        }))
     }
 }
 
-fn extract_field(msg: &str, prefix: &str) -> Option<String> {
-    msg.split_whitespace()
-        .find(|w| w.starts_with(prefix))
-        .map(|w| w.strip_prefix(prefix).unwrap_or(w).to_string())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sudo_fields() {
+        let got = parse_sudo("paya : TTY=/dev/pts/1 ; PWD=/home/paya/Downloads ; USER=root ; COMMAND=/usr/bin/apt install ./zoom_amd64.deb").unwrap();
+        assert_eq!(
+            got,
+            SudoLine {
+                invoker: "paya",
+                target: Some("root"),
+                tty: Some("pts/1"),
+                pwd: Some("/home/paya/Downloads"),
+                command: Some("/usr/bin/apt install ./zoom_amd64.deb"),
+                problem: None,
+            }
+        );
+    }
+
+    #[test]
+    fn sudo_failure() {
+        let got = parse_sudo("eve : 3 incorrect password attempts ; TTY=pts/0 ; PWD=/tmp ; USER=root ; COMMAND=/bin/sh -c id; whoami").unwrap();
+        assert_eq!(got.problem, Some("3 incorrect password attempts"));
+        assert_eq!(got.command, Some("/bin/sh -c id; whoami"));
+        assert_eq!(got.invoker, "eve");
+    }
+
+    fn entry(json: &str) -> Option<Event> {
+        let ctx = CollectCtx {
+            run_id: 1,
+            since: None,
+            until: None,
+            assume_tz: None,
+            temp_dir: "/tmp".into(),
+        };
+        let inst =
+            SourceInstance::new("auth.journald", "journald", None, "/var/log/journal".into());
+        let origin = Origin {
+            file: &inst.path,
+            sha256: None,
+        };
+        serde_json::from_str::<JournalEntry>(json)
+            .unwrap()
+            .into_event(&ctx, &inst, &origin)
+            .unwrap()
+    }
+
+    #[test]
+    fn journald_sudo_entry() {
+        let e = entry(r#"{"__REALTIME_TIMESTAMP":"1792172276000000","__CURSOR":"s=abc;i=1","_COMM":"sudo","_UID":"1000","_PID":"4242","MESSAGE":"paya : TTY=/dev/pts/1 ; PWD=/home/paya ; USER=root ; COMMAND=/usr/bin/apt install ./zoom_amd64.deb"}"#).unwrap();
+        assert_eq!(e.kind, EventKind::PrivSudo);
+        assert_eq!(
+            e.summary,
+            "paya: /usr/bin/apt install ./zoom_amd64.deb (pts/1)"
+        );
+        assert_eq!(e.subject, "/usr/bin/apt install ./zoom_amd64.deb");
+        assert_eq!(e.actor.as_ref().unwrap().user.as_deref(), Some("paya"));
+        assert_eq!(e.provenance.locator, "s=abc;i=1");
+    }
+
+    #[test]
+    fn journald_pam_is_session_not_sudo() {
+        let e = entry(r#"{"__REALTIME_TIMESTAMP":"1","__CURSOR":"c","_COMM":"sudo","MESSAGE":"pam_unix(sudo:session): session opened for user root(uid=0) by paya(uid=1000)"}"#).unwrap();
+        assert_eq!(e.kind, EventKind::AuthSession);
+    }
+
+    #[test]
+    fn journald_ssh_keeps_logins_only() {
+        let e = entry(r#"{"__REALTIME_TIMESTAMP":"1","__CURSOR":"c","_COMM":"sshd","_SYSTEMD_UNIT":"sshd.service","MESSAGE":"Accepted publickey for paya from 203.0.113.7 port 51234 ssh2"}"#).unwrap();
+        assert_eq!(
+            (e.kind, e.subject_host.as_deref()),
+            (EventKind::AuthSsh, Some("203.0.113.7"))
+        );
+        assert!(entry(r#"{"__REALTIME_TIMESTAMP":"1","__CURSOR":"c","_COMM":"sshd","_SYSTEMD_UNIT":"ssh.service","MESSAGE":"Received disconnect from 203.0.113.7"}"#).is_none());
+    }
+
+    #[test]
+    fn journald_binary_message() {
+        let e = entry(
+            r#"{"__REALTIME_TIMESTAMP":"1","__CURSOR":"c","_COMM":"su","MESSAGE":[40,116,111,41]}"#,
+        )
+        .unwrap();
+        assert_eq!(e.summary, "su: (to)");
+    }
 }
