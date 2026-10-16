@@ -1,3 +1,3 @@
 pub mod schema;
 
-pub use schema::Store;
+pub use schema::{EventFilter, EventRow, Store};

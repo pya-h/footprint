@@ -1,5 +1,5 @@
 use anyhow::Result;
-use fp_core::{CollectStats, Event, Privilege, SourceInstance, StateRecord};
+use fp_core::{Artifact, CollectStats, Event, Privilege, SourceInstance, StateRecord};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +32,7 @@ pub struct CollectCtx {
 pub struct Sink {
     events: Arc<Mutex<Vec<Event>>>,
     states: Arc<Mutex<Vec<StateRecord>>>,
+    artifacts: Arc<Mutex<Vec<Artifact>>>,
     errors: Arc<Mutex<Vec<String>>>,
 }
 
@@ -40,6 +41,7 @@ impl Sink {
         Self {
             events: Arc::new(Mutex::new(Vec::new())),
             states: Arc::new(Mutex::new(Vec::new())),
+            artifacts: Arc::new(Mutex::new(Vec::new())),
             errors: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -52,6 +54,10 @@ impl Sink {
         self.states.lock().unwrap().push(record);
     }
 
+    pub fn push_artifact(&self, artifact: Artifact) {
+        self.artifacts.lock().unwrap().push(artifact);
+    }
+
     pub fn error(&self, msg: String) {
         self.errors.lock().unwrap().push(msg);
     }
@@ -60,7 +66,7 @@ impl Sink {
         CollectStats {
             events: self.events.lock().unwrap().len(),
             states: self.states.lock().unwrap().len(),
-            artifacts: 0,
+            artifacts: self.artifacts.lock().unwrap().len(),
             errors: std::mem::take(&mut *self.errors.lock().unwrap()),
         }
     }
@@ -71,6 +77,10 @@ impl Sink {
 
     pub fn drain_states(&self) -> Vec<StateRecord> {
         std::mem::take(&mut *self.states.lock().unwrap())
+    }
+
+    pub fn drain_artifacts(&self) -> Vec<Artifact> {
+        std::mem::take(&mut *self.artifacts.lock().unwrap())
     }
 }
 

@@ -1,5 +1,5 @@
 use fp_core::{Artifact, Event, Link, SourceInstance, StateRecord};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -237,6 +237,178 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
         Ok(count as u64)
     }
+
+    pub fn list_events(
+        &self,
+        filter: &EventFilter,
+    ) -> Result<Vec<EventRow>, StoreError> {
+        let mut sql = String::from(
+            "SELECT e.id, e.ts_utc, e.ts_precision, e.kind, s.app, s.profile,
+                    e.subject, e.subject_host, e.summary, e.confidence
+             FROM events e
+             JOIN sources s ON s.id = e.source_id
+             WHERE 1=1"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(lo) = filter.since {
+            sql.push_str(" AND e.ts_utc >= ?");
+            params.push(Box::new(lo));
+        }
+        if let Some(hi) = filter.until {
+            sql.push_str(" AND e.ts_utc <= ?");
+            params.push(Box::new(hi));
+        }
+        if let Some(ref host) = filter.host {
+            sql.push_str(" AND e.subject_host = ?");
+            params.push(Box::new(host.clone()));
+        }
+        if !filter.kinds.is_empty() {
+            let placeholders: Vec<String> = (0..filter.kinds.len()).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!(" AND e.kind IN ({})", placeholders.join(",")));
+            for k in &filter.kinds {
+                params.push(Box::new(k.clone()));
+            }
+        }
+        if let Some(ref m) = filter.match_text {
+            sql.push_str(" AND (e.subject LIKE ? OR e.summary LIKE ? OR e.attrs_json LIKE ?)");
+            let like = format!("%{m}%");
+            params.push(Box::new(like.clone()));
+            params.push(Box::new(like.clone()));
+            params.push(Box::new(like));
+        }
+        sql.push_str(" ORDER BY e.ts_utc");
+        if let Some(limit) = filter.limit {
+            sql.push_str(" LIMIT ?");
+            params.push(Box::new(limit as i64));
+        }
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_refs.as_slice(), |row| {
+            Ok(EventRow {
+                id: row.get::<_, i64>(0)? as u64,
+                ts_utc: row.get(1)?,
+                ts_precision: row.get(2)?,
+                kind: row.get(3)?,
+                app: row.get(4)?,
+                profile: row.get(5)?,
+                subject: row.get(6)?,
+                subject_host: row.get(7)?,
+                summary: row.get(8)?,
+                confidence: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_event(&self, id: u64) -> Result<Option<EventDetail>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.*, s.app, s.profile, s.path
+             FROM events e
+             JOIN sources s ON s.id = e.source_id
+             WHERE e.id = ?"
+        )?;
+        let row = stmt.query_row([&(id as i64)], |row| {
+            Ok(EventDetail {
+                id: row.get::<_, i64>(0)? as u64,
+                run_id: row.get::<_, i64>(1)? as u64,
+                source_id: row.get::<_, i64>(2)? as u64,
+                ts_utc: row.get(3)?,
+                ts_precision: row.get(4)?,
+                ts_raw: row.get(5)?,
+                ts_raw_format: row.get(6)?,
+                ts_tz_assumed: row.get(7)?,
+                kind: row.get(8)?,
+                actor_json: row.get(9)?,
+                subject: row.get(10)?,
+                subject_host: row.get(11)?,
+                summary: row.get(12)?,
+                attrs_json: row.get(13)?,
+                locator: row.get(14)?,
+                confidence: row.get(15)?,
+                app: row.get::<_, Option<String>>(17)?,
+                profile: row.get::<_, Option<String>>(18)?,
+                path: row.get::<_, Option<String>>(19)?,
+            })
+        }).optional()?;
+        Ok(row)
+    }
+
+    pub fn search_events(&self, query: &str) -> Result<Vec<EventRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.id, e.ts_utc, e.ts_precision, e.kind, s.app, s.profile,
+                    e.subject, e.subject_host, e.summary, e.confidence
+             FROM events_fts f
+             JOIN events e ON e.id = f.rowid
+             JOIN sources s ON s.id = e.source_id
+             WHERE events_fts MATCH ?
+             ORDER BY e.ts_utc"
+        )?;
+        let rows = stmt.query_map([query], |row| {
+            Ok(EventRow {
+                id: row.get::<_, i64>(0)? as u64,
+                ts_utc: row.get(1)?,
+                ts_precision: row.get(2)?,
+                kind: row.get(3)?,
+                app: row.get(4)?,
+                profile: row.get(5)?,
+                subject: row.get(6)?,
+                subject_host: row.get(7)?,
+                summary: row.get(8)?,
+                confidence: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct EventFilter {
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    pub kinds: Vec<String>,
+    pub host: Option<String>,
+    pub match_text: Option<String>,
+    pub limit: Option<usize>,
+    pub reverse: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct EventRow {
+    pub id: u64,
+    pub ts_utc: i64,
+    pub ts_precision: String,
+    pub kind: String,
+    pub app: Option<String>,
+    pub profile: Option<String>,
+    pub subject: Option<String>,
+    pub subject_host: Option<String>,
+    pub summary: Option<String>,
+    pub confidence: String,
+}
+
+#[derive(Debug)]
+pub struct EventDetail {
+    pub id: u64,
+    pub run_id: u64,
+    pub source_id: u64,
+    pub ts_utc: i64,
+    pub ts_precision: String,
+    pub ts_raw: String,
+    pub ts_raw_format: String,
+    pub ts_tz_assumed: Option<String>,
+    pub kind: String,
+    pub actor_json: String,
+    pub subject: Option<String>,
+    pub subject_host: Option<String>,
+    pub summary: Option<String>,
+    pub attrs_json: String,
+    pub locator: String,
+    pub confidence: String,
+    pub app: Option<String>,
+    pub profile: Option<String>,
+    pub path: Option<String>,
 }
 
 fn now_micros() -> i64 {
