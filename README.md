@@ -9,7 +9,7 @@ A local, read-only activity timeline and provenance tool for Linux. It reads the
 
 It never runs in the background, never modifies the files it reads, never opens secrets (cookies, saved passwords, wallets, keys), and never touches the network.
 
-> Status: early development. The workspace, time model, case store and Chromium pipeline are in; the pkg, shell and desktop collectors are in with open fixes. See [Roadmap](#roadmap).
+> Status: early development. The collectors are done and verified against a real host; correlation (`trace`) is next. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -21,11 +21,11 @@ Most of what a person does on a Linux desktop is already written down in small S
 
 | | |
 |---|---|
-| **Collectors** | Chromium family (Chrome, Chromium, Brave, Edge, Vivaldi, Opera; native, snap and flatpak; all profiles): visits, redirects, downloads, site permissions, extensions · XDM download manager · dpkg / apt · journald (`sudo`, `su`, `pkexec`, ssh) · bash / zsh / fish history · GTK recently used files |
+| **Collectors** | Chromium family (Chrome, Chromium, Brave, Edge, Vivaldi, Opera; native, snap and flatpak; all profiles): visits, server and client redirects, downloads, searches, site permissions (granted and one-time use), extensions · XDM download manager · dpkg / apt, including rotated `.gz` logs · journald (`sudo`, `su`, `pkexec`, ssh logins) · bash / zsh / fish history · python / psql / mysql / sqlite3 / node REPL history · GTK recently used files |
 | **Planned collectors** | Firefox / Zen / LibreWolf · rpm / dnf, pacman, zypper, snap, flatpak · auth.log / secure · KDE recent documents · filesystem timeline (statx) · persistence snapshot · live processes and sockets · clamscan / rkhunter / chkrootkit import |
-| **Availability-aware** | Every source is probed first. An app that isn't installed is a coverage note, not an error, and each kind of evidence has a fallback chain (e.g. downloads: browser history → download managers → file xattrs → shell `curl`/`wget` → file times) |
+| **Fault-tolerant** | A source that fails is recorded as `error` and the run goes on; skipped lines mark it `partial`. Every source will be probed first: an app that isn't installed is a coverage note, and each kind of evidence gets a fallback chain (e.g. downloads: browser history → download managers → file xattrs → shell `curl`/`wget` → file times) |
 | **One time model** | WebKit, PRTime, Unix, journald, .NET binary, local-naive and RFC 3339 timestamps are all normalized to UTC; the raw value is always kept |
-| **Case database** | A single SQLite file (`0600`) with full-text search, idempotent re-runs, and provenance for every event (source file, its sha256, and the exact row or line) |
+| **Case database** | A single SQLite file (`0600`) with full-text search, idempotent re-runs (a second `collect` adds only what is new), and provenance for every event (source file, its sha256, and the exact row, cursor or line) |
 | **Correlation** | Redirect chains, download → file → install links, untimed shell commands anchored to apt and sudo logs |
 | **Trace** | `footprint trace <file>` prints the full provenance chain with a confidence on every edge |
 | **State and diff** | Site permissions, extensions, startup units, cron, rc files, PAM, SUID files; diff two runs |
@@ -42,8 +42,9 @@ footprint show 1832
 
 ```text
 2026-10-16 21:03:17  Brave/Default  web.redirect         https://zoom.us/download
-2026-10-16 21:06:20  xdm            dl.manager_download  ~/Downloads/Programs/zoom_amd64.deb ← https://cdn.zoom.us/prod/7.2.1.5760/zoom_amd64.deb
-2026-10-16 21:07:56  journald       priv.sudo            paya: /usr/bin/apt install ./zoom_amd64.deb
+2026-10-16 21:06:20  xdm            dl.manager_download  ~/Downloads/Programs/zoom_amd64.deb ← https://cdn.zoom.us/prod/7.2.1.5760/zoom_amd64.deb (288.8 MiB)
+2026-10-16 21:07:56  journald       priv.sudo            paya: /usr/bin/apt install ./zoom_amd64.deb (pts/1)
+2026-10-16 21:07:59  apt            pkg.install          install: zoom:amd64 (+1 more) ← apt install ./zoom_amd64.deb
 2026-10-16 21:08:00  dpkg           pkg.install          zoom:amd64 7.2.1.5760
 ```
 
@@ -51,21 +52,24 @@ footprint show 1832
 
 | Command | |
 |---|---|
-| `collect [--since T] [--until T] [--sources LIST] [--home DIR] [--assume-tz TZ]` | discover sources and collect them into the case |
-| `sources` | discovered sources, their availability and errors |
-| `list [--since T] [--until T] [--kind K,..] [--host H] [--match TEXT] [--format table\|jsonl]` | merged timeline |
+| `collect [--since T] [--until T] [--sources LIST] [--exclude LIST] [--home DIR] [--root DIR] [--assume-tz TZ]` | discover sources and collect them into the case. `LIST` takes kinds or families (`chromium`, `pkg`, `shell.history`) |
+| `sources [--run R \| --all-runs]` | sources of the last run with status (`ok`, `partial`, `unavailable`, `error: …`) |
+| `list [--since T] [--until T] [--kind K,..] [--host H,..] [--match TEXT] [--limit N] [--reverse] [--format table\|jsonl]` | merged timeline; `--kind web.*` matches a family, `--host zoom.us` also matches its subdomains |
 | `show <id>` | one event with provenance and raw timestamp |
 | `search <query>` | full-text search over subjects, summaries and attributes |
 | `trace`, `state`, `diff`, `ioc`, `export`, `explain` | upcoming, see the roadmap |
 
 Times accept `2026-10-16T20:40`, `20:40` (today), `-24h`, `-30d`, `yesterday`, `@1792172917`.
-The case file defaults to `./footprint.db`; pass `-c PATH` to use another.
+The case file defaults to `./footprint.db`; pass `-c PATH` to use another. Read commands never create one.
+`--root` points system sources (`/var/log`, the journal) at a mounted disk image; `--assume-tz` fixes the
+offset for logs that store local time (by default the host's zone *at that date* is used).
 
 ## Build
 
 ```bash
 cargo build --release
 ./target/release/footprint --help
+cargo test   # includes the fake-zoom scenario, built from synthetic fixtures
 ```
 
 It runs as your user. Some sources (the full journal, root's crontab, `/root`) need root; without it they are reported as partial instead of failing.
@@ -73,10 +77,19 @@ It runs as your user. Some sources (the full journal, root's crontab, `/root`) n
 ## Safety
 
 - **Read-only**: source databases are copied to a private temp dir (`0700`, one subdir per source) and opened read-only. Originals are never written, locked or vacuumed.
-- **No secrets**: cookies, saved logins, `Web Data`, extension storage, keyrings, SSH and GPG private keys and wallet files are on an enforced deny-list.
-- **Evidence is untrusted**: size limits, no symlink escapes, and control characters stripped before printing. Nothing found is ever executed.
+- **No secrets**: cookies, saved logins, `Web Data`, extension storage, keyrings, SSH and GPG private keys, wallet files and `.env` files are on a deny-list enforced by the one helper every read goes through.
+- **Redaction**: passwords typed inline in shell/REPL history or sudo command lines (`PASSWORD '…'`, `PGPASSWORD=…`, `--password …`, `user:pass@host`, `Authorization: …`) are masked as `***` before they are stored.
+- **Evidence is untrusted**: size limits (including gunzip), and nothing found is ever executed. symlink-escape checks and stripping control characters before printing.
 - **No network**, ever.
 - **The case file is private** (`0600`): it holds your browsing history.
+
+## Limitations
+
+- **Untimed history** (bash without `HISTTIMEFORMAT`, REPLs) is stored as `(untimed)` and doesn't show up in
+  time-filtered lists until anchoring against apt/sudo lands. `list --kind shell.command` shows it.
+- **journald visibility**: outside the `adm`/`systemd-journal` groups you only see your own entries, and this is
+  not yet reported as `partial`.
+- Recently-used files cover GTK apps only; KDE comes with the fallbacks.
 
 ## Layout
 
@@ -86,14 +99,15 @@ crates/
   store     SQLite case schema, dedup, queries, FTS5
   collect   Collector trait + one module per source family
   cli       footprint binary (clap)
+  fixtures  synthetic evidence in the real formats, for tests (never real data)
 ```
 
 ## Roadmap
 
 - workspace, time model, case store, `sources`
 - Chromium collector, `list` / `show` / `search`
-- XDM, dpkg/apt, journald, shell, desktop (in, fixes in progress) — planned
-- fixes for bugs found on a real host — planned
+- XDM, dpkg/apt, journald, shell and REPL history, desktop
+- fixes for bugs found on a real host
 - availability checks, coverage report, fallback sources — planned
 - correlation and `trace` — planned
 - filesystem timeline, persistence snapshot, `state`, `diff` — planned
