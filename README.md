@@ -93,9 +93,12 @@ crates/
 - workspace, time model, case store, `sources`
 - Chromium collector, `list` / `show` / `search`
 - XDM, dpkg/apt, journald, shell, desktop (in, fixes in progress) — planned
+- fixes for bugs found on a real host — planned
+- availability checks, coverage report, fallback sources — planned
 - correlation and `trace` — planned
 - filesystem timeline, persistence snapshot, `state`, `diff` — planned
 - IOCs and `export` — planned
+- interactive TUI (`footprint tui`) — planned
 - Firefox family, live state, scanner import, polish — planned
 
 Linux only for now. The collector interface keeps Windows and macOS open, but they aren't being built.
