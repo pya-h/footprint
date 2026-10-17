@@ -253,3 +253,63 @@ fn coverage_report_prints_categories() {
     assert!(cov.contains("Packages"));
     assert!(cov.contains("Covered"));
 }
+
+#[test]
+fn fake_zoom_trace_matches_scenario() {
+    let case = setup();
+    collect(&case);
+
+    let deb_path = case.scenario.home.join("Downloads/Programs/zoom_amd64.deb");
+    let trace_out = footprint(&case.db, &["trace", deb_path.to_str().unwrap()]);
+    assert!(trace_out.contains("artifact"), "{trace_out}");
+    assert!(trace_out.contains("downloaded_as"), "{trace_out}");
+    assert!(trace_out.contains("dlmgr.xdm"), "{trace_out}");
+    assert!(
+        trace_out.contains("https://cdn.zoom.us/prod/7.2.1.5760/zoom_amd64.deb"),
+        "{trace_out}"
+    );
+    assert!(
+        trace_out.contains("no browser download row: XDM intercepted it"),
+        "{trace_out}"
+    );
+    assert!(trace_out.contains("navigated_from"), "{trace_out}");
+    assert!(
+        trace_out.contains("https://zoom.us/download"),
+        "{trace_out}"
+    );
+    assert!(trace_out.contains("installed_from"), "{trace_out}");
+    assert!(
+        trace_out.contains("apt install ./zoom_amd64.deb"),
+        "{trace_out}"
+    );
+    assert!(trace_out.contains("pkg.install"), "{trace_out}");
+    assert!(trace_out.contains("zoom:amd64 7.2.1.5760"), "{trace_out}");
+}
+
+#[test]
+fn bash_anchoring_anchors_untimed_command() {
+    let case = setup();
+    collect(&case);
+
+    let events_list = events(&case.db, &["--kind", "shell.command"]);
+    let bash_apt = events_list
+        .iter()
+        .find(|e| e["subject"] == "sudo apt install ./zoom_amd64.deb")
+        .unwrap();
+
+    assert_eq!(bash_apt["ts_precision"], "second");
+    assert_eq!(bash_apt["confidence"], "derived");
+    assert_eq!(bash_apt["ts_utc"], local(21, 7, 58) * 1_000_000);
+}
+
+#[test]
+fn show_displays_provenance_links() {
+    let case = setup();
+    collect(&case);
+
+    let xdm = events(&case.db, &["--kind", "dl.*"]);
+    let id = xdm[0]["id"].as_u64().unwrap();
+    let show_out = footprint(&case.db, &["show", &id.to_string()]);
+    assert!(show_out.contains("links:"), "{show_out}");
+    assert!(show_out.contains("downloaded_as"), "{show_out}");
+}

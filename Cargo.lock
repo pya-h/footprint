@@ -390,6 +390,7 @@ dependencies = [
  "clap",
  "fp-collect",
  "fp-core",
+ "fp-correlate",
  "fp-fixtures",
  "fp-store",
  "libc",
@@ -434,6 +435,23 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "fp-correlate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fp-core",
+ "fp-store",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror",
 ]
 

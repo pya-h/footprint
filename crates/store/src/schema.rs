@@ -102,7 +102,13 @@ impl Store {
             |r| r.get(0),
         )?;
         match (version, has_tables) {
-            (SCHEMA_VERSION, _) => Ok(()),
+            (SCHEMA_VERSION, _) => {
+                self.conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS links_uniq ON links(src_type, src_id, rel, dst_type, dst_id)",
+                    [],
+                )?;
+                Ok(())
+            }
             (0, false) => {
                 self.conn.execute_batch(SCHEMA)?;
                 self.conn
@@ -238,7 +244,7 @@ impl Store {
 
     pub fn insert_link(&mut self, link: &Link) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO links (src_type, src_id, rel, dst_type, dst_id, confidence, why)
+            "INSERT OR IGNORE INTO links (src_type, src_id, rel, dst_type, dst_id, confidence, why)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 link.src_type.to_string(),
@@ -251,6 +257,38 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn insert_links(&mut self, links: &[Link]) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        let mut count = 0;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO links (src_type, src_id, rel, dst_type, dst_id, confidence, why)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for link in links {
+                count += stmt.execute(params![
+                    link.src_type.to_string(),
+                    link.src_id,
+                    link.rel,
+                    link.dst_type.to_string(),
+                    link.dst_id,
+                    link.confidence.to_string(),
+                    link.why,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(count)
+    }
+
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    pub fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
     }
 
     pub fn sources(&self, run_id: Option<u64>) -> Result<Vec<SourceRow>, StoreError> {
@@ -388,6 +426,143 @@ impl Store {
             .optional()?;
         Ok(row)
     }
+
+    pub fn get_events_by_kinds(&self, kinds: &[&str]) -> Result<Vec<EventDetail>, StoreError> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT e.id, e.run_id, e.source_id, e.ts_utc, e.ts_precision, e.ts_raw, e.ts_raw_format,
+                    e.ts_tz_assumed, e.kind, e.actor_json, e.subject, e.subject_host, e.summary,
+                    e.attrs_json, e.locator, e.prov_file, e.prov_sha256, e.confidence,
+                    s.kind, s.app, s.profile
+             FROM events e JOIN sources s ON s.id = e.source_id
+             WHERE e.kind IN ({placeholders})
+             ORDER BY e.ts_utc, e.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(kinds), |row| {
+            Ok(EventDetail {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                source_id: row.get(2)?,
+                ts_utc: row.get(3)?,
+                ts_precision: row.get(4)?,
+                ts_raw: row.get(5)?,
+                ts_raw_format: row.get(6)?,
+                ts_tz_assumed: row.get(7)?,
+                kind: row.get(8)?,
+                actor_json: row.get(9)?,
+                subject: row.get(10)?,
+                subject_host: row.get(11)?,
+                summary: row.get(12)?,
+                attrs_json: row.get(13)?,
+                locator: row.get(14)?,
+                prov_file: row.get(15)?,
+                prov_sha256: row.get(16)?,
+                confidence: row.get(17)?,
+                source_kind: row.get(18)?,
+                app: row.get(19)?,
+                profile: row.get(20)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn list_artifacts(&self) -> Result<Vec<ArtifactRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, sha256, size, mtime_ns, ctime_ns, btime_ns, owner_pkg, first_seen_run
+             FROM artifacts ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], ArtifactRow::from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn get_artifact(&self, id: u64) -> Result<Option<ArtifactRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, sha256, size, mtime_ns, ctime_ns, btime_ns, owner_pkg, first_seen_run
+             FROM artifacts WHERE id = ?1",
+        )?;
+        Ok(stmt.query_row([id], ArtifactRow::from_row).optional()?)
+    }
+
+    pub fn get_artifact_by_path(&self, path: &str) -> Result<Option<ArtifactRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, sha256, size, mtime_ns, ctime_ns, btime_ns, owner_pkg, first_seen_run
+             FROM artifacts WHERE path = ?1",
+        )?;
+        Ok(stmt.query_row([path], ArtifactRow::from_row).optional()?)
+    }
+
+    pub fn update_artifact_metadata(
+        &mut self,
+        id: u64,
+        meta: &ArtifactMeta<'_>,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE artifacts SET
+                sha256 = COALESCE(?2, sha256),
+                size = COALESCE(?3, size),
+                mtime_ns = COALESCE(?4, mtime_ns),
+                ctime_ns = COALESCE(?5, ctime_ns),
+                btime_ns = COALESCE(?6, btime_ns),
+                owner_pkg = COALESCE(?7, owner_pkg)
+             WHERE id = ?1",
+            params![
+                id,
+                meta.sha256,
+                meta.size,
+                meta.mtime_ns,
+                meta.ctime_ns,
+                meta.btime_ns,
+                meta.owner_pkg
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_event_anchoring(
+        &mut self,
+        id: u64,
+        ts_utc: i64,
+        ts_precision: &str,
+        confidence: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE events SET ts_utc = ?2, ts_precision = ?3, confidence = ?4 WHERE id = ?1",
+            params![id, ts_utc, ts_precision, confidence],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_links_for(&self, typ: &str, id: u64) -> Result<Vec<LinkRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT src_type, src_id, rel, dst_type, dst_id, confidence, why
+             FROM links
+             WHERE (src_type = ?1 AND src_id = ?2) OR (dst_type = ?1 AND dst_id = ?2)",
+        )?;
+        let rows = stmt.query_map(params![typ, id], LinkRow::from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn list_links(&self) -> Result<Vec<LinkRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT src_type, src_id, rel, dst_type, dst_id, confidence, why
+             FROM links",
+        )?;
+        let rows = stmt.query_map([], LinkRow::from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn list_state_by_kind(&self, kind: &str) -> Result<Vec<StateRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, run_id, kind, key, value_json, locator
+             FROM state WHERE kind = ?1",
+        )?;
+        let rows = stmt.query_map([kind], StateRow::from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
 
 /// `web.*` matches every `web.` kind; anything else matches exactly.
@@ -487,6 +662,93 @@ pub struct EventDetail {
     pub source_kind: String,
     pub app: Option<String>,
     pub profile: Option<String>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct ArtifactMeta<'a> {
+    pub sha256: Option<&'a str>,
+    pub size: Option<i64>,
+    pub mtime_ns: Option<i64>,
+    pub ctime_ns: Option<i64>,
+    pub btime_ns: Option<i64>,
+    pub owner_pkg: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ArtifactRow {
+    pub id: u64,
+    pub path: String,
+    pub sha256: Option<String>,
+    pub size: Option<i64>,
+    pub mtime_ns: Option<i64>,
+    pub ctime_ns: Option<i64>,
+    pub btime_ns: Option<i64>,
+    pub owner_pkg: Option<String>,
+    pub first_seen_run: Option<u64>,
+}
+
+impl ArtifactRow {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            path: row.get(1)?,
+            sha256: row.get(2)?,
+            size: row.get(3)?,
+            mtime_ns: row.get(4)?,
+            ctime_ns: row.get(5)?,
+            btime_ns: row.get(6)?,
+            owner_pkg: row.get(7)?,
+            first_seen_run: row.get(8)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LinkRow {
+    pub src_type: String,
+    pub src_id: u64,
+    pub rel: String,
+    pub dst_type: String,
+    pub dst_id: u64,
+    pub confidence: String,
+    pub why: Option<String>,
+}
+
+impl LinkRow {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            src_type: row.get(0)?,
+            src_id: row.get(1)?,
+            rel: row.get(2)?,
+            dst_type: row.get(3)?,
+            dst_id: row.get(4)?,
+            confidence: row.get(5)?,
+            why: row.get(6)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StateRow {
+    pub rowid: i64,
+    pub run_id: u64,
+    pub kind: String,
+    pub key: String,
+    pub value_json: String,
+    pub locator: Option<String>,
+}
+
+impl StateRow {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            rowid: row.get(0)?,
+            run_id: row.get(1)?,
+            kind: row.get(2)?,
+            key: row.get(3)?,
+            value_json: row.get(4)?,
+            locator: row.get(5)?,
+        })
+    }
 }
 
 fn now_micros() -> i64 {
@@ -619,6 +881,7 @@ CREATE TABLE links (
 );
 CREATE INDEX links_src ON links(src_type, src_id);
 CREATE INDEX links_dst ON links(dst_type, dst_id);
+CREATE UNIQUE INDEX IF NOT EXISTS links_uniq ON links(src_type, src_id, rel, dst_type, dst_id);
 
 CREATE TABLE state (
     run_id INTEGER NOT NULL,

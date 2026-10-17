@@ -45,6 +45,8 @@ enum Command {
     Show { id: u64 },
     /// Full-text search over subjects, summaries and attributes (FTS5 syntax)
     Search { query: String },
+    /// Walk provenance links backwards and forwards from an artifact path, URL, or event ID
+    Trace { target: String },
 }
 
 #[derive(Args)]
@@ -118,6 +120,7 @@ fn main() -> Result<()> {
             let store = Store::open(&cli.case)?;
             print_rows(store.search_events(&query)?, Format::Table)
         }
+        Command::Trace { target } => trace(&cli.case, &target),
     }
 }
 
@@ -238,6 +241,10 @@ fn collect(case: &PathBuf, args: CollectArgs) -> Result<()> {
                 store.update_source_status(inst.id, &Availability::Empty, Some("empty"))?;
             }
         }
+    }
+
+    if let Err(e) = fp_correlate::correlate(&mut store, &env.root) {
+        errors.push(format!("correlate: {e:#}"));
     }
 
     store.finish_run(run_id, &errors)?;
@@ -508,6 +515,31 @@ fn show(case: &PathBuf, id: u64) -> Result<()> {
     field("locator", &dash(&ev.locator));
     field("actor", &dash(&ev.actor_json));
     field("attrs", &dash(&ev.attrs_json));
+
+    let links = store.get_links_for("event", ev.id)?;
+    if !links.is_empty() {
+        println!("links:");
+        for l in links {
+            let target = if l.src_type == "event" && l.src_id == ev.id {
+                format!("{} {}", l.dst_type, l.dst_id)
+            } else {
+                format!("{} {}", l.src_type, l.src_id)
+            };
+            let why_str = l.why.map(|w| format!(" ({w})")).unwrap_or_default();
+            println!(
+                "  - {:<16} {:<16} [{}{}]",
+                l.rel, target, l.confidence, why_str
+            );
+        }
+    }
+    Ok(())
+}
+
+fn trace(case: &PathBuf, target: &str) -> Result<()> {
+    let mut store = Store::open(case)?;
+    let _ = fp_correlate::correlate(&mut store, std::path::Path::new("/"));
+    let rendered = fp_correlate::render_trace(&store, target)?;
+    print!("{rendered}");
     Ok(())
 }
 
