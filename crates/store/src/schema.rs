@@ -255,8 +255,10 @@ impl Store {
 
     pub fn sources(&self, run_id: Option<u64>) -> Result<Vec<SourceRow>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, kind, app, profile, path, status, note FROM sources
-             WHERE ?1 IS NULL OR run_id = ?1 ORDER BY run_id, id",
+            "SELECT s.id, s.run_id, s.kind, s.app, s.profile, s.path, s.status, s.note,
+                    (SELECT COUNT(*) FROM events e WHERE e.source_id = s.id)
+             FROM sources s
+             WHERE ?1 IS NULL OR s.run_id = ?1 ORDER BY s.run_id, s.id",
         )?;
         let rows = stmt.query_map([run_id], |row| {
             Ok(SourceRow {
@@ -268,6 +270,7 @@ impl Store {
                 path: row.get(5)?,
                 status: row.get(6)?,
                 note: row.get(7)?,
+                event_count: row.get(8)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -458,6 +461,7 @@ pub struct SourceRow {
     pub path: Option<String>,
     pub status: Option<String>,
     pub note: Option<String>,
+    pub event_count: u64,
 }
 
 #[derive(Debug)]

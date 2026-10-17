@@ -239,12 +239,44 @@ pub enum Privilege {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SourceStatus {
-    Ok,
+#[serde(rename_all = "snake_case")]
+pub enum Availability {
+    #[serde(alias = "ok")]
+    Present,
+    #[serde(alias = "unavailable")]
+    NotInstalled,
+    Empty,
+    Unreadable {
+        needs_root: bool,
+    },
+    Unsupported {
+        reason: String,
+    },
     Partial,
-    Unavailable,
     Error(String),
 }
+
+impl fmt::Display for Availability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Availability::Present => write!(f, "present"),
+            Availability::NotInstalled => write!(f, "not installed"),
+            Availability::Empty => write!(f, "empty"),
+            Availability::Unreadable { needs_root } => {
+                if *needs_root {
+                    write!(f, "unreadable (needs root)")
+                } else {
+                    write!(f, "unreadable")
+                }
+            }
+            Availability::Unsupported { reason } => write!(f, "unsupported ({reason})"),
+            Availability::Partial => write!(f, "partial"),
+            Availability::Error(e) => write!(f, "error: {e}"),
+        }
+    }
+}
+
+pub type SourceStatus = Availability;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceInstance {
@@ -253,7 +285,7 @@ pub struct SourceInstance {
     pub app: String,
     pub profile: Option<String>,
     pub path: PathBuf,
-    pub status: SourceStatus,
+    pub status: Availability,
     pub note: Option<String>,
 }
 
@@ -265,7 +297,7 @@ impl SourceInstance {
             app: app.to_string(),
             profile,
             path,
-            status: SourceStatus::Ok,
+            status: Availability::Present,
             note: None,
         }
     }
@@ -332,5 +364,34 @@ mod tests {
             rotation_base("/var/log/apt/history.log.1.gz"),
             "/var/log/apt/history.log"
         );
+    }
+
+    #[test]
+    fn availability_display_and_serde() {
+        assert_eq!(Availability::Present.to_string(), "present");
+        assert_eq!(Availability::NotInstalled.to_string(), "not installed");
+        assert_eq!(Availability::Empty.to_string(), "empty");
+        assert_eq!(
+            Availability::Unreadable { needs_root: true }.to_string(),
+            "unreadable (needs root)"
+        );
+        assert_eq!(
+            Availability::Unsupported {
+                reason: "bad schema".into()
+            }
+            .to_string(),
+            "unsupported (bad schema)"
+        );
+        assert_eq!(Availability::Partial.to_string(), "partial");
+        assert_eq!(
+            Availability::Error("failed".into()).to_string(),
+            "error: failed"
+        );
+
+        // backward compatibility aliases
+        let ok: Availability = serde_json::from_str("\"ok\"").unwrap();
+        assert_eq!(ok, Availability::Present);
+        let unavail: Availability = serde_json::from_str("\"unavailable\"").unwrap();
+        assert_eq!(unavail, Availability::NotInstalled);
     }
 }

@@ -2,7 +2,7 @@ use crate::collector::{CollectCtx, Collector, Env, Sink};
 use crate::event::{Origin, Stamp, new_event};
 use crate::redact::redact_secrets;
 use crate::utils::{in_window, read_evidence};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use fp_core::time::TimeFormat;
 use fp_core::{Actor, EventKind, SourceInstance};
 use regex::Regex;
@@ -57,6 +57,9 @@ static DANGEROUS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     .collect()
 });
 
+use fp_core::Availability;
+use std::path::PathBuf;
+
 pub struct ShellCollector;
 
 impl Collector for ShellCollector {
@@ -65,24 +68,52 @@ impl Collector for ShellCollector {
     }
 
     fn discover(&self, env: &Env) -> Vec<SourceInstance> {
-        HISTORIES
-            .iter()
-            .map(|(app, rel, _)| SourceInstance::new(self.kind(), app, None, env.home.join(rel)))
-            .filter(|inst| inst.path.is_file())
+        let mut candidates: Vec<(&str, PathBuf, Format)> = Vec::new();
+
+        // 1. Check $HISTFILE if set
+        if let Some(histfile) = std::env::var_os("HISTFILE").map(PathBuf::from)
+            && histfile.is_file()
+        {
+            candidates.push(("bash", histfile, Format::Bash));
+        }
+
+        // 2. Check $ZDOTDIR if set
+        if let Some(zdotdir) = std::env::var_os("ZDOTDIR").map(PathBuf::from) {
+            let zsh_hist = zdotdir.join(".zsh_history");
+            if zsh_hist.is_file() {
+                candidates.push(("zsh", zsh_hist, Format::Zsh));
+            }
+        }
+
+        // 3. Default known histories
+        for &(app, rel, format) in HISTORIES {
+            let path = env.home.join(rel);
+            if !candidates.iter().any(|(_, p, _)| p == &path) && path.is_file() {
+                candidates.push((app, path, format));
+            }
+        }
+
+        candidates
+            .into_iter()
+            .map(|(app, path, _)| {
+                let mut inst = SourceInstance::new(self.kind(), app, None, path);
+                if let Ok(meta) = std::fs::metadata(&inst.path)
+                    && meta.len() == 0
+                {
+                    inst.status = Availability::Empty;
+                }
+                inst
+            })
             .collect()
     }
 
     fn collect(&self, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut Sink) -> Result<()> {
-        let Some(format) = HISTORIES
-            .iter()
-            .find(|(app, rel, _)| *app == inst.app && inst.path.ends_with(rel))
-            .map(|(_, _, f)| *f)
-        else {
-            bail!(
-                "no history format known for {} at {}",
-                inst.app,
-                inst.path.display()
-            );
+        let format = match inst.app.as_str() {
+            "bash" => Format::Bash,
+            "zsh" => Format::Zsh,
+            "fish" => Format::Fish,
+            "node" => Format::LinesNewestFirst,
+            _ => Format::Lines,
         };
         let file = read_evidence(&inst.path)?;
         let entries = match format {
@@ -444,5 +475,25 @@ mod tests {
         assert_eq!(flagged("echo aGk= | base64 -d"), ["base64-decode"]);
         assert!(flagged("sudo apt install ./zoom_amd64.deb").is_empty());
         assert!(flagged("evaluate --shell").is_empty());
+    }
+
+    #[test]
+    fn discover_custom_histfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("custom_hist");
+        std::fs::write(&custom, "echo test\n").unwrap();
+        unsafe {
+            std::env::set_var("HISTFILE", &custom);
+        }
+        let env = Env::test(dir.path().to_path_buf(), PathBuf::from("/"));
+        let instances = ShellCollector.discover(&env);
+        unsafe {
+            std::env::remove_var("HISTFILE");
+        }
+        assert!(
+            instances
+                .iter()
+                .any(|i| i.path == custom && i.app == "bash")
+        );
     }
 }

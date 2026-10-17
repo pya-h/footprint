@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
 use clap::{Args, Parser, Subcommand};
 use fp_collect::{CollectCtx, Collector, Env, Sink};
-use fp_core::{SourceInstance, SourceStatus};
+use fp_core::{Availability, SourceInstance};
 use fp_store::{Batch, EventFilter, EventRow, NewRun, Store};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -35,6 +35,9 @@ enum Command {
         run: Option<u64>,
         #[arg(long)]
         all_runs: bool,
+        /// show coverage report across evidence categories
+        #[arg(long)]
+        coverage: bool,
     },
     /// Merged timeline
     List(ListArgs),
@@ -59,9 +62,12 @@ struct CollectArgs {
     /// offset for logs that store local time (`+03:30`, `UTC`); default: the host zone at each date
     #[arg(long)]
     assume_tz: Option<String>,
-    /// home directory to read user sources from
+    /// home directory to read user sources from (can be repeated)
+    #[arg(long = "home", action = clap::ArgAction::Append)]
+    home: Vec<PathBuf>,
+    /// discover and collect homes of all users (uid >= 1000) when running as root
     #[arg(long)]
-    home: Option<PathBuf>,
+    all_users: bool,
     /// root for system sources (`/var/log`, the journal), e.g. a mounted disk image
     #[arg(long, default_value = "/")]
     root: PathBuf,
@@ -101,7 +107,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Command::Collect(args) => collect(&cli.case, args),
-        Command::Sources { run, all_runs } => sources(&cli.case, run, all_runs),
+        Command::Sources {
+            run,
+            all_runs,
+            coverage,
+        } => sources(&cli.case, run, all_runs, coverage),
         Command::List(args) => list(&cli.case, args),
         Command::Show { id } => show(&cli.case, id),
         Command::Search { query } => {
@@ -139,8 +149,18 @@ fn collect(case: &PathBuf, args: CollectArgs) -> Result<()> {
     }
 
     let mut env = Env::current();
-    if let Some(home) = args.home {
-        env.home = home;
+    if !args.home.is_empty() {
+        env.home = args.home[0].clone();
+        env.user_targets.clear();
+        for h in &args.home {
+            env.add_user_home(h.clone(), None, None);
+        }
+    }
+    if args.all_users {
+        if env.euid != 0 && env.uid != 0 {
+            bail!("--all-users requires root privileges");
+        }
+        env.load_all_users()?;
     }
     env.root = args.root;
 
@@ -172,7 +192,7 @@ fn collect(case: &PathBuf, args: CollectArgs) -> Result<()> {
     for collector in &collectors {
         for mut inst in collector.discover(&env) {
             inst.id = store.insert_source(run_id, &inst)?;
-            if inst.status != SourceStatus::Ok {
+            if inst.status != Availability::Present {
                 continue;
             }
             read += 1;
@@ -181,7 +201,7 @@ fn collect(case: &PathBuf, args: CollectArgs) -> Result<()> {
                 let msg = format!("{}: {e:#}", label(&inst));
                 store.update_source_status(
                     inst.id,
-                    &SourceStatus::Error(format!("{e:#}")),
+                    &Availability::Error(format!("{e:#}")),
                     None,
                 )?;
                 eprintln!("error: {msg}");
@@ -207,9 +227,15 @@ fn collect(case: &PathBuf, args: CollectArgs) -> Result<()> {
                 }
                 store.update_source_status(
                     inst.id,
-                    &SourceStatus::Partial,
+                    &Availability::Partial,
                     Some(&sink.warnings.join("; ")),
                 )?;
+            } else if stats.events_new == 0
+                && stats.events_known == 0
+                && stats.states == 0
+                && stats.artifacts == 0
+            {
+                store.update_source_status(inst.id, &Availability::Empty, Some("empty"))?;
             }
         }
     }
@@ -238,44 +264,163 @@ fn label(inst: &SourceInstance) -> String {
     }
 }
 
-fn sources(case: &PathBuf, run: Option<u64>, all_runs: bool) -> Result<()> {
+fn sources(case: &PathBuf, run: Option<u64>, all_runs: bool, coverage: bool) -> Result<()> {
     let store = Store::open(case)?;
     let run = match (run, all_runs) {
         (_, true) => None,
         (Some(r), _) => Some(r),
         (None, false) => store.last_run_id()?,
     };
-    for s in store.sources(run)? {
-        let status: SourceStatus = s
+    let rows = store.sources(run)?;
+    if coverage {
+        print_coverage(&rows);
+        return Ok(());
+    }
+
+    for s in rows {
+        let status: Availability = s
             .status
             .as_deref()
             .map(serde_json::from_str)
             .transpose()
             .context("unreadable source status")?
-            .unwrap_or(SourceStatus::Ok);
-        let status = match status {
-            SourceStatus::Ok => "ok".to_string(),
-            SourceStatus::Partial => "partial".to_string(),
-            SourceStatus::Unavailable => "unavailable".to_string(),
-            SourceStatus::Error(e) => format!("error: {e}"),
-        };
+            .unwrap_or(Availability::Present);
         let app = match (&s.app, &s.profile) {
             (Some(a), Some(p)) => format!("{a}/{p}"),
             (Some(a), None) => a.clone(),
             _ => "-".into(),
         };
+        let count_str = if s.event_count > 0 {
+            format!("{} events", s.event_count)
+        } else {
+            "-".to_string()
+        };
         println!(
-            "{:>5}  run {:<3} {:<18} {:<24} {:<12} {}{}",
+            "{:>5}  run {:<3} {:<18} {:<24} {:<14} {:<10} {}{}",
             s.id,
             s.run_id,
             s.kind,
             app,
-            status,
+            status.to_string(),
+            count_str,
             s.path.as_deref().unwrap_or("-"),
             s.note.map(|n| format!("  ({n})")).unwrap_or_default()
         );
     }
     Ok(())
+}
+
+fn print_coverage(sources: &[fp_store::SourceRow]) {
+    println!(
+        "{:<18} {:<10} {:<32} NOTES / FALLBACKS",
+        "CATEGORY", "STATUS", "ANSWERING SOURCES"
+    );
+    let categories: &[(&str, &[&str])] = &[
+        ("Browser history", &["chromium.history", "firefox.history"]),
+        ("Downloads", &["dlmgr.xdm", "dlmgr.xattr", "dlmgr.detect"]),
+        (
+            "Packages",
+            &[
+                "pkg.dpkg",
+                "pkg.apt",
+                "pkg.pacman",
+                "pkg.dnf",
+                "pkg.zypper",
+                "pkg.flatpak",
+            ],
+        ),
+        ("Privilege", &["auth.journald", "auth.log"]),
+        ("Shell", &["shell.history"]),
+        (
+            "Desktop activity",
+            &["desktop.recent", "desktop.kde", "desktop.zeitgeist"],
+        ),
+    ];
+
+    for &(cat_name, kinds) in categories {
+        let matching: Vec<&fp_store::SourceRow> = sources
+            .iter()
+            .filter(|s| kinds.contains(&s.kind.as_str()))
+            .collect();
+        let mut answering = Vec::new();
+        let mut notes = Vec::new();
+
+        for s in &matching {
+            let app = match (&s.app, &s.profile) {
+                (Some(a), Some(p)) => format!("{a}/{p}"),
+                (Some(a), None) => a.clone(),
+                _ => s.kind.clone(),
+            };
+            let status: Availability = s
+                .status
+                .as_deref()
+                .and_then(|st| serde_json::from_str(st).ok())
+                .unwrap_or(Availability::Present);
+
+            match status {
+                Availability::Present if s.event_count > 0 => {
+                    answering.push(format!("{app} ({} events)", s.event_count));
+                }
+                Availability::Present => {
+                    answering.push(format!("{app} (0 events)"));
+                }
+                Availability::NotInstalled => {
+                    notes.push(format!("{app} not installed"));
+                }
+                Availability::Empty => {
+                    notes.push(format!("{app} empty"));
+                }
+                Availability::Unsupported { reason } => {
+                    notes.push(format!("{app} unsupported ({reason})"));
+                }
+                Availability::Unreadable { needs_root } => {
+                    notes.push(format!(
+                        "{app} unreadable{}",
+                        if needs_root { " (needs root)" } else { "" }
+                    ));
+                }
+                Availability::Partial => {
+                    answering.push(format!("{app} (partial, {} events)", s.event_count));
+                }
+                Availability::Error(ref e) => {
+                    notes.push(format!("{app} error: {e}"));
+                }
+            }
+        }
+
+        let has_events = matching.iter().any(|s| s.event_count > 0);
+        let has_present = matching.iter().any(|s| {
+            s.status
+                .as_deref()
+                .and_then(|st| serde_json::from_str::<Availability>(st).ok())
+                == Some(Availability::Present)
+        });
+
+        let status_str = if has_events {
+            "Covered"
+        } else if has_present {
+            "Partial"
+        } else {
+            "Gap"
+        };
+
+        let ans_str = if answering.is_empty() {
+            "none".to_string()
+        } else {
+            answering.join(", ")
+        };
+
+        let note_str = if notes.is_empty() {
+            "-".to_string()
+        } else {
+            notes.join("; ")
+        };
+
+        println!(
+            "{:<18} {:<10} {:<32} {}",
+            cat_name, status_str, ans_str, note_str
+        );
+    }
 }
 
 fn list(case: &PathBuf, args: ListArgs) -> Result<()> {

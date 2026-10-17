@@ -18,6 +18,7 @@ quick-xml = "0.37"
 # rotated logs are gzipped (`dpkg.log.2.gz`)
 flate2 = "1"
 regex = "1"
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

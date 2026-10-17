@@ -6,7 +6,7 @@ use crate::utils::{
 };
 use anyhow::{Context, Result};
 use fp_core::time::TimeFormat;
-use fp_core::{Actor, Artifact, EventKind, SourceInstance, SourceStatus, StateRecord};
+use fp_core::{Actor, Artifact, EventKind, SourceInstance, StateRecord};
 use rusqlite::Connection;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -223,7 +223,7 @@ impl Collector for ChromiumCollector {
             for (profile, path) in list_profiles(&root) {
                 let mut inst = SourceInstance::new(self.kind(), app, Some(profile), path);
                 if !inst.path.join("History").exists() && !inst.path.join("Preferences").exists() {
-                    inst.status = SourceStatus::Unavailable;
+                    inst.status = fp_core::Availability::Empty;
                     inst.note = Some("no History or Preferences".into());
                 }
                 out.push(inst);
@@ -703,12 +703,7 @@ mod tests {
             .join(".var/app/com.google.Chrome/config/BraveSoftware/Brave-Browser");
         fs::create_dir_all(&brave).unwrap();
         fs::create_dir_all(&decoy).unwrap();
-        let env = Env {
-            home: tmp.path().into(),
-            root: "/".into(),
-            uid: 0,
-            euid: 0,
-        };
+        let env = Env::test(tmp.path().into(), "/".into());
         assert_eq!(ChromiumCollector::roots(&env), vec![("Brave", brave)]);
     }
 }

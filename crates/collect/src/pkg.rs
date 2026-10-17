@@ -360,12 +360,7 @@ mod tests {
         std::fs::create_dir_all(&log).unwrap();
         std::fs::write(log.join("history.log"), "").unwrap();
         std::fs::write(log.join("history.log.1.gz"), "").unwrap();
-        let env = Env {
-            home: root.path().into(),
-            root: root.path().into(),
-            uid: 0,
-            euid: 0,
-        };
+        let env = Env::test(root.path().into(), root.path().into());
         assert_eq!(AptCollector.discover(&env).len(), 2);
         assert!(DpkgCollector.discover(&env).is_empty());
     }

@@ -411,6 +411,7 @@ name = "fp-collect"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs",
  "flate2",
  "fp-core",

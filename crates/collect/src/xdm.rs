@@ -5,11 +5,12 @@ use crate::utils::{
 };
 use anyhow::{Result, bail};
 use fp_core::time::TimeFormat;
-use fp_core::{Actor, Artifact, EventKind, SourceInstance};
+use fp_core::{Actor, Artifact, Availability, EventKind, SourceInstance};
 use serde_json::json;
 use std::path::PathBuf;
 
 const XDM_DB: &str = ".xdm-app-data/downloads.db";
+const XDM_JAVA_DIR: &str = ".xdman";
 /// Only these are read; the same table also stores site and proxy passwords (`pass`, `proxy_pass`).
 const COLUMNS: &[&str] = &[
     "id",
@@ -30,11 +31,53 @@ impl Collector for XdmCollector {
     }
 
     fn discover(&self, env: &Env) -> Vec<SourceInstance> {
+        let mut instances = Vec::new();
+
+        let java_path = env.home.join(XDM_JAVA_DIR);
+        if java_path.is_dir() {
+            let mut inst = SourceInstance::new(self.kind(), "xdm-java", None, java_path);
+            inst.status = Availability::Unsupported {
+                reason: "older Java XDM (~/.xdman) not yet supported".to_string(),
+            };
+            instances.push(inst);
+        }
+
         let path = env.home.join(XDM_DB);
         if !path.exists() {
-            return Vec::new();
+            let mut inst = SourceInstance::new(self.kind(), "xdm", None, path);
+            inst.status = Availability::NotInstalled;
+            instances.push(inst);
+            return instances;
         }
-        vec![SourceInstance::new(self.kind(), "xdm", None, path)]
+
+        let mut inst = SourceInstance::new(self.kind(), "xdm", None, path.clone());
+        let meta = std::fs::metadata(&path);
+        if meta.as_ref().is_ok_and(|m| m.len() == 0) {
+            inst.status = Availability::Empty;
+        } else {
+            match rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                Ok(conn) => match table_has_columns(&conn, "downloads", COLUMNS) {
+                    Ok(true) => inst.status = Availability::Present,
+                    Ok(false) => {
+                        inst.status = Availability::Unsupported {
+                            reason: "table `downloads` missing expected columns".to_string(),
+                        };
+                    }
+                    Err(e) => {
+                        inst.status = Availability::Error(format!("cannot read schema: {e:#}"));
+                    }
+                },
+                Err(e) => {
+                    inst.status = Availability::Error(format!("cannot open database: {e:#}"));
+                }
+            }
+        }
+        instances.push(inst);
+        instances
     }
 
     fn collect(&self, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut Sink) -> Result<()> {
@@ -101,5 +144,45 @@ impl Collector for XdmCollector {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovers_not_installed_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::test(dir.path().to_path_buf(), PathBuf::from("/"));
+        let instances = XdmCollector.discover(&env);
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].status, Availability::NotInstalled);
+    }
+
+    #[test]
+    fn discovers_java_xdm_as_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".xdman")).unwrap();
+        let env = Env::test(dir.path().to_path_buf(), PathBuf::from("/"));
+        let instances = XdmCollector.discover(&env);
+        let java = instances.iter().find(|i| i.app == "xdm-java").unwrap();
+        assert!(matches!(java.status, Availability::Unsupported { .. }));
+    }
+
+    #[test]
+    fn checks_schema_and_marks_unsupported_on_missing_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join(".xdm-app-data");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("downloads.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE downloads (id TEXT, name TEXT);")
+            .unwrap();
+
+        let env = Env::test(dir.path().to_path_buf(), PathBuf::from("/"));
+        let instances = XdmCollector.discover(&env);
+        let xdm = instances.iter().find(|i| i.app == "xdm").unwrap();
+        assert!(matches!(xdm.status, Availability::Unsupported { .. }));
     }
 }

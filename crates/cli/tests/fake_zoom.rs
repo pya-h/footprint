@@ -225,7 +225,7 @@ fn missing_journal_is_unavailable_not_an_error() {
         .lines()
         .find(|l| l.contains("auth.journald"))
         .unwrap();
-    assert!(journald.contains("unavailable"), "{journald}");
+    assert!(journald.contains("not installed"), "{journald}");
     assert!(!sources.contains("error"), "{sources}");
 }
 
@@ -241,4 +241,15 @@ fn read_commands_never_create_a_case() {
         .unwrap();
     assert!(!out.status.success());
     assert!(!db.exists());
+}
+
+#[test]
+fn coverage_report_prints_categories() {
+    let case = setup();
+    collect(&case);
+    let cov = footprint(&case.db, &["sources", "--coverage"]);
+    assert!(cov.contains("Browser history"));
+    assert!(cov.contains("Downloads"));
+    assert!(cov.contains("Packages"));
+    assert!(cov.contains("Covered"));
 }

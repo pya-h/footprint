@@ -4,7 +4,7 @@ use crate::redact::redact_secrets;
 use crate::utils::in_window;
 use anyhow::{Context, Result, bail};
 use fp_core::time::TimeFormat;
-use fp_core::{Actor, Event, EventKind, SourceInstance, SourceStatus};
+use fp_core::{Actor, Event, EventKind, SourceInstance};
 use serde::Deserialize;
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read};
@@ -31,6 +31,8 @@ const SSH_KEPT_PREFIXES: &[&str] = &[
     "Disconnected from user ",
 ];
 
+use crate::probe::Probe;
+
 pub struct AuthCollector;
 
 impl Collector for AuthCollector {
@@ -40,19 +42,40 @@ impl Collector for AuthCollector {
 
     fn discover(&self, env: &Env) -> Vec<SourceInstance> {
         let persistent = env.system_path(PERSISTENT_JOURNAL);
+        let volatile = env.system_path(VOLATILE_JOURNAL);
         let live = env.root == Path::new("/");
-        let path = if persistent.is_dir() || !live {
-            persistent
+
+        let (path, is_volatile) = if persistent.is_dir() || !live {
+            (persistent, false)
+        } else if volatile.is_dir() {
+            (volatile, true)
         } else {
-            env.system_path(VOLATILE_JOURNAL)
+            (persistent, false)
         };
+
         let mut inst = SourceInstance::new(self.kind(), "journald", None, path);
-        if !Path::new(JOURNALCTL).exists() {
-            inst.status = SourceStatus::Unavailable;
+        let tool = Probe::tool_path(env, "journalctl");
+        if tool.is_none() {
+            inst.status = fp_core::Availability::NotInstalled;
             inst.note = Some(format!("{JOURNALCTL} not found"));
-        } else if !inst.path.is_dir() {
-            inst.status = SourceStatus::Unavailable;
+            return vec![inst];
+        }
+
+        if !inst.path.is_dir() {
+            inst.status = fp_core::Availability::NotInstalled;
             inst.note = Some("no journal directory".into());
+            return vec![inst];
+        }
+
+        let mut notes = Vec::new();
+        if is_volatile {
+            notes.push("volatile storage (/run/log/journal)".to_string());
+        }
+        if !Probe::can_read_system_journal(env) {
+            notes.push("user entries only (not in adm or systemd-journal group)".to_string());
+        }
+        if !notes.is_empty() {
+            inst.note = Some(notes.join("; "));
         }
         vec![inst]
     }
