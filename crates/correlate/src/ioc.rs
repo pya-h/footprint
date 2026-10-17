@@ -1,4 +1,5 @@
 use anyhow::Result;
+use fp_core::net::extract_host;
 use fp_core::{Confidence, Link, LinkType};
 use fp_store::{EventDetail, IocRow, Store};
 use std::net::IpAddr;
@@ -168,7 +169,7 @@ pub fn match_event_iocs(
             }
         } else if ioc_type == "path"
             && let Some(s) = subject
-            && glob_match(target, s)
+            && path_matches(target, s)
         {
             hits.push(target.to_string());
             continue;
@@ -238,12 +239,12 @@ fn match_event(ev: &EventDetail, ioc: &IocRow) -> Option<(String, String)> {
         }
         "path" => {
             if let Some(ref file) = ev.prov_file
-                && glob_match(target, file)
+                && path_matches(target, file)
             {
                 return Some(("prov_file".to_string(), file.clone()));
             }
             if let Some(ref subj) = ev.subject
-                && glob_match(target, subj)
+                && path_matches(target, subj)
             {
                 return Some(("subject".to_string(), subj.clone()));
             }
@@ -285,7 +286,7 @@ fn match_artifact(art: &fp_store::ArtifactRow, ioc: &IocRow) -> Option<(String, 
                 return Some(("artifact.sha256".to_string(), sha.clone()));
             }
         }
-        "path" if glob_match(target, &art.path) => {
+        "path" if path_matches(target, &art.path) => {
             return Some(("artifact.path".to_string(), art.path.clone()));
         }
         _ => {}
@@ -311,12 +312,12 @@ fn match_state(st: &fp_store::StateRow, ioc: &IocRow) -> Option<(String, String)
             }
         }
         "path" => {
-            if glob_match(target, &st.key) {
+            if path_matches(target, &st.key) {
                 return Some(("state.key".to_string(), st.key.clone()));
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&st.value_json)
                 && let Some(p) = v.get("path").and_then(|p| p.as_str())
-                && glob_match(target, p)
+                && path_matches(target, p)
             {
                 return Some(("state.value.path".to_string(), p.to_string()));
             }
@@ -416,15 +417,32 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     px == p_bytes.len()
 }
 
-fn extract_host(s: &str) -> Option<String> {
-    if let Some(rest) = s.strip_prefix("https://").or(s.strip_prefix("http://")) {
-        let host_port = rest.split('/').next().unwrap_or(rest);
-        let host = host_port.split(':').next().unwrap_or(host_port);
-        if !host.is_empty() {
-            return Some(host.to_string());
+pub fn path_matches(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.trim();
+    let text = text.trim();
+    if pattern.is_empty() || text.is_empty() {
+        return false;
+    }
+    if glob_match(pattern, text) {
+        return true;
+    }
+    for raw_token in text.split_whitespace() {
+        let token = raw_token.trim_matches(['"', '\'', ';', '(', ')', '<', '>', '&', '|']);
+        if token.is_empty() {
+            continue;
+        }
+        if glob_match(pattern, token) {
+            return true;
+        }
+        if !pattern.contains('/')
+            && !pattern.contains('*')
+            && !pattern.contains('?')
+            && (token == pattern || token.ends_with(&format!("/{pattern}")))
+        {
+            return true;
         }
     }
-    None
+    false
 }
 
 #[cfg(test)]
@@ -455,6 +473,23 @@ mod tests {
         assert!(glob_match("*/zoom*", "/home/user/zoom.deb"));
         assert!(glob_match("/etc/cron*", "/etc/cron.d/job"));
         assert!(!glob_match("*.rpm", "/tmp/zoom.deb"));
+    }
+
+    #[test]
+    fn test_path_matches() {
+        assert!(path_matches("/tmp/evil.sh", "/tmp/evil.sh"));
+        assert!(path_matches("/tmp/evil.sh", "bash /tmp/evil.sh"));
+        assert!(path_matches(
+            "zoom_amd64.deb",
+            "apt install ./zoom_amd64.deb"
+        ));
+        assert!(path_matches(
+            "zoom_amd64.deb",
+            "sudo dpkg -i /tmp/zoom_amd64.deb"
+        ));
+        assert!(path_matches("/etc/cron*", "cat /etc/cron.d/malware;"));
+        assert!(!path_matches("/tmp/evil.sh", "echo hello world"));
+        assert!(!path_matches("evil.sh", "bash other_evil.sh"));
     }
 
     #[test]

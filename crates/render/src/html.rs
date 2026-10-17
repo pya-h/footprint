@@ -32,12 +32,14 @@ pub fn render_html<W: Write>(writer: &mut W, report: &ExportReport) -> Result<()
     }
     let total_hosts = unique_hosts.len();
 
-    let (time_start, time_end) =
-        if let (Some(first), Some(last)) = (report.events.first(), report.events.last()) {
-            (first.ts_local.as_str(), last.ts_local.as_str())
-        } else {
-            ("-", "-")
-        };
+    let (time_start, time_end) = if let (Some(min_ev), Some(max_ev)) = (
+        report.events.iter().min_by_key(|e| e.ts_utc),
+        report.events.iter().max_by_key(|e| e.ts_utc),
+    ) {
+        (min_ev.ts_local.as_str(), max_ev.ts_local.as_str())
+    } else {
+        ("-", "-")
+    };
 
     writeln!(
         writer,
@@ -489,7 +491,8 @@ document.addEventListener("DOMContentLoaded", () => {{
     row.addEventListener("click", () => {{
       const details = row.nextElementSibling;
       if (details && details.classList.contains("details-row")) {{
-        details.style.display = (details.style.display === "table-row") ? "none" : "table-row";
+        const isVisible = window.getComputedStyle(details).display !== "none";
+        details.style.display = isVisible ? "none" : "table-row";
       }}
     }});
   }});

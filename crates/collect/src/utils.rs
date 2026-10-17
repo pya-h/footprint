@@ -141,16 +141,7 @@ pub fn with_rotations(base: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn extract_host(url: &str) -> Option<String> {
-    let rest = url.split_once("://")?.1;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = match host_port.strip_prefix('[') {
-        Some(v6) => v6.split(']').next()?,
-        None => host_port.split([':', ',']).next()?,
-    };
-    (!host.is_empty()).then(|| host.to_lowercase())
-}
+pub use fp_core::net::extract_host;
 
 pub fn human_size(bytes: i64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];

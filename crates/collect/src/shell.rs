@@ -70,18 +70,26 @@ impl Collector for ShellCollector {
     fn discover(&self, env: &Env) -> Vec<SourceInstance> {
         let mut candidates: Vec<(&str, PathBuf, Format)> = Vec::new();
 
-        // 1. Check $HISTFILE if set
-        if let Some(histfile) = std::env::var_os("HISTFILE").map(PathBuf::from)
-            && histfile.is_file()
-        {
-            candidates.push(("bash", histfile, Format::Bash));
-        }
+        let is_host_env = env.root == std::path::Path::new("/");
+        if is_host_env {
+            // 1. Check $HISTFILE if set and belongs to target home
+            if let Some(histfile) = std::env::var_os("HISTFILE").map(PathBuf::from)
+                && histfile.is_file()
+                && (histfile.starts_with(&env.home)
+                    || std::env::var_os("HOME").map(PathBuf::from).as_ref() == Some(&env.home))
+            {
+                candidates.push(("bash", histfile, Format::Bash));
+            }
 
-        // 2. Check $ZDOTDIR if set
-        if let Some(zdotdir) = std::env::var_os("ZDOTDIR").map(PathBuf::from) {
-            let zsh_hist = zdotdir.join(".zsh_history");
-            if zsh_hist.is_file() {
-                candidates.push(("zsh", zsh_hist, Format::Zsh));
+            // 2. Check $ZDOTDIR if set and belongs to target home
+            if let Some(zdotdir) = std::env::var_os("ZDOTDIR").map(PathBuf::from)
+                && (zdotdir.starts_with(&env.home)
+                    || std::env::var_os("HOME").map(PathBuf::from).as_ref() == Some(&env.home))
+            {
+                let zsh_hist = zdotdir.join(".zsh_history");
+                if zsh_hist.is_file() {
+                    candidates.push(("zsh", zsh_hist, Format::Zsh));
+                }
             }
         }
 

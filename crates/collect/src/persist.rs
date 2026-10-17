@@ -913,7 +913,7 @@ fn emit_state_entry(
         return;
     };
 
-    let sha256 = hash_file(path).unwrap_or_default();
+    let sha256 = hash_file(path);
     let mtime_us = meta.mtime() * 1_000_000 + meta.mtime_nsec() / 1_000;
     let ctime_us = meta.ctime() * 1_000_000 + meta.ctime_nsec() / 1_000;
     let size = meta.len() as i64;
@@ -964,7 +964,7 @@ fn emit_state_entry(
         value,
         provenance: Provenance {
             file: path.to_path_buf(),
-            file_sha256: Some(sha256),
+            file_sha256: sha256,
             locator: format!("persist:{kind}:{path_str}"),
         },
     });

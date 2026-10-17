@@ -3,7 +3,8 @@ use crate::event::{Stamp, new_event};
 use crate::utils::{guard, in_window};
 use anyhow::Result;
 use fp_core::{
-    Availability, Event, EventKind, Provenance, SourceInstance, TimePrecision, time::TimeFormat,
+    Artifact, Availability, Event, EventKind, Provenance, SourceInstance, TimePrecision,
+    time::TimeFormat,
 };
 use serde_json::json;
 use std::ffi::CString;
@@ -153,9 +154,9 @@ struct StatInfo {
     _ctime_us: i64,
     btime_us: Option<i64>,
     size: i64,
-    mtime_nsec: u32,
-    ctime_nsec: u32,
-    btime_nsec: Option<u32>,
+    mtime_ns: i64,
+    ctime_ns: i64,
+    btime_ns: Option<i64>,
 }
 
 fn stat_entry(path: &Path) -> Option<StatInfo> {
@@ -172,43 +173,40 @@ fn stat_entry(path: &Path) -> Option<StatInfo> {
     };
 
     if res == 0 {
-        let mtime_us = (statx_buf.stx_mtime.tv_sec as i64) * 1_000_000
-            + (statx_buf.stx_mtime.tv_nsec as i64) / 1_000;
-        let ctime_us = (statx_buf.stx_ctime.tv_sec as i64) * 1_000_000
-            + (statx_buf.stx_ctime.tv_nsec as i64) / 1_000;
-        let (btime_us, btime_nsec) = if statx_buf.stx_mask & libc::STATX_BTIME != 0 {
-            (
-                Some(
-                    (statx_buf.stx_btime.tv_sec as i64) * 1_000_000
-                        + (statx_buf.stx_btime.tv_nsec as i64) / 1_000,
-                ),
-                Some(statx_buf.stx_btime.tv_nsec),
+        let mtime_ns = (statx_buf.stx_mtime.tv_sec as i64) * 1_000_000_000
+            + (statx_buf.stx_mtime.tv_nsec as i64);
+        let ctime_ns = (statx_buf.stx_ctime.tv_sec as i64) * 1_000_000_000
+            + (statx_buf.stx_ctime.tv_nsec as i64);
+        let btime_ns = if statx_buf.stx_mask & libc::STATX_BTIME != 0 {
+            Some(
+                (statx_buf.stx_btime.tv_sec as i64) * 1_000_000_000
+                    + (statx_buf.stx_btime.tv_nsec as i64),
             )
         } else {
-            (None, None)
+            None
         };
         Some(StatInfo {
-            mtime_us,
-            _ctime_us: ctime_us,
-            btime_us,
+            mtime_us: mtime_ns / 1_000,
+            _ctime_us: ctime_ns / 1_000,
+            btime_us: btime_ns.map(|ns| ns / 1_000),
             size: statx_buf.stx_size as i64,
-            mtime_nsec: statx_buf.stx_mtime.tv_nsec,
-            ctime_nsec: statx_buf.stx_ctime.tv_nsec,
-            btime_nsec,
+            mtime_ns,
+            ctime_ns,
+            btime_ns,
         })
     } else {
         // Fallback to symlink_metadata
         let meta = fs::symlink_metadata(path).ok()?;
-        let mtime_us = meta.mtime() * 1_000_000 + (meta.mtime_nsec() as i64) / 1_000;
-        let ctime_us = meta.ctime() * 1_000_000 + (meta.ctime_nsec() as i64) / 1_000;
+        let mtime_ns = meta.mtime() * 1_000_000_000 + (meta.mtime_nsec() as i64);
+        let ctime_ns = meta.ctime() * 1_000_000_000 + (meta.ctime_nsec() as i64);
         Some(StatInfo {
-            mtime_us,
-            _ctime_us: ctime_us,
+            mtime_us: mtime_ns / 1_000,
+            _ctime_us: ctime_ns / 1_000,
             btime_us: None,
             size: meta.len() as i64,
-            mtime_nsec: meta.mtime_nsec() as u32,
-            ctime_nsec: meta.ctime_nsec() as u32,
-            btime_nsec: None,
+            mtime_ns,
+            ctime_ns,
+            btime_ns: None,
         })
     }
 }
@@ -222,6 +220,20 @@ fn inspect_file(path: &Path, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut
 
     let btime_in_window = info.btime_us.is_some_and(|bt| in_window(ctx, bt));
     let mtime_in_window = in_window(ctx, info.mtime_us);
+
+    if !btime_in_window && !mtime_in_window {
+        return;
+    }
+
+    sink.artifact(Artifact {
+        path: path.to_path_buf(),
+        sha256: None,
+        size: Some(info.size),
+        mtime_ns: Some(info.mtime_ns),
+        ctime_ns: Some(info.ctime_ns),
+        btime_ns: info.btime_ns,
+        owner_pkg: None,
+    });
 
     if let Some(btime_us) = info.btime_us {
         if btime_in_window {
@@ -237,9 +249,9 @@ fn inspect_file(path: &Path, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut
                 subject_host: None,
                 attrs: json!({
                     "size": info.size,
-                    "mtime_ns": info.mtime_nsec,
-                    "ctime_ns": info.ctime_nsec,
-                    "btime_ns": info.btime_nsec,
+                    "mtime_ns": info.mtime_ns,
+                    "ctime_ns": info.ctime_ns,
+                    "btime_ns": info.btime_ns,
                 }),
                 ..new_event(
                     ctx,
@@ -270,9 +282,9 @@ fn inspect_file(path: &Path, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut
                 subject_host: None,
                 attrs: json!({
                     "size": info.size,
-                    "mtime_ns": info.mtime_nsec,
-                    "ctime_ns": info.ctime_nsec,
-                    "btime_ns": info.btime_nsec,
+                    "mtime_ns": info.mtime_ns,
+                    "ctime_ns": info.ctime_ns,
+                    "btime_ns": info.btime_ns,
                 }),
                 ..new_event(
                     ctx,
@@ -302,9 +314,9 @@ fn inspect_file(path: &Path, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut
             subject_host: None,
             attrs: json!({
                 "size": info.size,
-                "mtime_ns": info.mtime_nsec,
-                "ctime_ns": info.ctime_nsec,
-                "btime_ns": info.btime_nsec,
+                "mtime_ns": info.mtime_ns,
+                "ctime_ns": info.ctime_ns,
+                "btime_ns": info.btime_ns,
             }),
             ..new_event(
                 ctx,

@@ -220,10 +220,11 @@ enum ExportCliFormat {
     Html,
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, clap::ValueEnum, Debug, PartialEq, Eq)]
 enum Format {
     Table,
     Jsonl,
+    Csv,
 }
 
 fn main() -> Result<()> {
@@ -652,6 +653,12 @@ fn print_grouped(
                 println!("{:>6}  {}", count, key);
             }
         }
+        Format::Csv => {
+            println!("count,group");
+            for (key, count) in sorted {
+                println!("{},{}", count, fp_render::csv::escape_csv(&key));
+            }
+        }
     }
     Ok(())
 }
@@ -666,6 +673,9 @@ fn local_time(ts_utc: i64, precision: &str, pattern: &str) -> String {
 }
 
 fn print_rows(rows: Vec<EventRow>, format: Format, iocs: &[fp_store::IocRow]) -> Result<()> {
+    if matches!(format, Format::Csv) {
+        println!("id,time,source,kind,summary,ioc_hits");
+    }
     for row in rows {
         let ioc_hits = fp_correlate::match_event_iocs(
             row.subject_host.as_deref(),
@@ -702,6 +712,24 @@ fn print_rows(rows: Vec<EventRow>, format: Format, iocs: &[fp_store::IocRow]) ->
                     row.kind,
                     summary_text,
                     ioc_badge
+                );
+            }
+            Format::Csv => {
+                let source = match (&row.app, &row.profile) {
+                    (Some(a), Some(p)) => format!("{a}/{p}"),
+                    (Some(a), None) => a.clone(),
+                    _ => "-".into(),
+                };
+                let summary_text = row.summary.or(row.subject).unwrap_or_default();
+                let time_str = local_time(row.ts_utc, &row.ts_precision, "%Y-%m-%d %H:%M:%S");
+                println!(
+                    "{},{},{},{},{},{}",
+                    row.id,
+                    fp_render::csv::escape_csv(&time_str),
+                    fp_render::csv::escape_csv(&source),
+                    fp_render::csv::escape_csv(&row.kind),
+                    fp_render::csv::escape_csv(&summary_text),
+                    fp_render::csv::escape_csv(&ioc_hits.join(";")),
                 );
             }
         }
@@ -856,6 +884,18 @@ fn state(case: &PathBuf, args: StateArgs) -> Result<()> {
                 );
             }
         }
+        Format::Csv => {
+            println!("run,kind,key,value");
+            for row in rows {
+                println!(
+                    "{},{},{},{}",
+                    row.run_id,
+                    fp_render::csv::escape_csv(&row.kind),
+                    fp_render::csv::escape_csv(&row.key),
+                    fp_render::csv::escape_csv(&row.value_json),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -987,6 +1027,41 @@ fn diff(case: &PathBuf, args: DiffArgs) -> Result<()> {
                 println!("no differences between run {run_a} and run {run_b}");
             }
         }
+        Format::Csv => {
+            println!("diff,kind,key,detail");
+            for (kind, key) in all_keys {
+                match (map_a.get(&(kind, key)), map_b.get(&(kind, key))) {
+                    (None, Some(b)) => {
+                        let detail = describe_state_summary(&b.value_json, "added");
+                        println!(
+                            "+,{},{},{}",
+                            fp_render::csv::escape_csv(kind),
+                            fp_render::csv::escape_csv(key),
+                            fp_render::csv::escape_csv(&detail)
+                        );
+                    }
+                    (Some(_a), None) => {
+                        println!(
+                            "-,{},{},removed",
+                            fp_render::csv::escape_csv(kind),
+                            fp_render::csv::escape_csv(key)
+                        );
+                    }
+                    (Some(a), Some(b)) => {
+                        if a.value_json != b.value_json {
+                            let change_desc = describe_diff_change(&a.value_json, &b.value_json);
+                            println!(
+                                "~,{},{},{}",
+                                fp_render::csv::escape_csv(kind),
+                                fp_render::csv::escape_csv(key),
+                                fp_render::csv::escape_csv(&change_desc)
+                            );
+                        }
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1108,6 +1183,25 @@ fn ioc(case: &PathBuf, args: IocArgs) -> Result<()> {
                         }
                     }
                 }
+                Format::Csv => {
+                    println!(
+                        "target_type,target_id,target_desc,ioc_id,ioc_type,ioc_value,matched_field,matched_value,note"
+                    );
+                    for h in hits {
+                        println!(
+                            "{},{},{},{},{},{},{},{},{}",
+                            fp_render::csv::escape_csv(&h.target_type),
+                            h.target_id,
+                            fp_render::csv::escape_csv(&h.target_desc),
+                            h.ioc_id,
+                            fp_render::csv::escape_csv(&h.ioc_type),
+                            fp_render::csv::escape_csv(&h.ioc_value),
+                            fp_render::csv::escape_csv(&h.matched_field),
+                            fp_render::csv::escape_csv(&h.matched_value),
+                            fp_render::csv::escape_csv(h.ioc_note.as_deref().unwrap_or("")),
+                        );
+                    }
+                }
             }
         }
         IocCommand::List => {
@@ -1204,7 +1298,11 @@ fn parse_ioc_line(line: &str) -> (String, String, Option<String>) {
 fn detect_ioc_type(val: &str) -> String {
     if val.len() == 64 && val.chars().all(|c| c.is_ascii_hexdigit()) {
         "sha256".to_string()
-    } else if val.starts_with('/') || val.contains('*') || val.contains('?') {
+    } else if val.starts_with('/')
+        || val.starts_with("./")
+        || val.contains('*')
+        || val.contains('?')
+    {
         "path".to_string()
     } else if val.contains("://") {
         "url".to_string()
@@ -1217,6 +1315,17 @@ fn detect_ioc_type(val: &str) -> String {
         "cidr".to_string()
     } else if val.parse::<std::net::IpAddr>().is_ok() {
         "ip".to_string()
+    } else if val.ends_with(".deb")
+        || val.ends_with(".rpm")
+        || val.ends_with(".tar.gz")
+        || val.ends_with(".zip")
+        || val.ends_with(".sh")
+        || val.ends_with(".service")
+        || val.ends_with(".desktop")
+        || val.ends_with(".so")
+        || val.ends_with(".exe")
+    {
+        "path".to_string()
     } else {
         "domain".to_string()
     }

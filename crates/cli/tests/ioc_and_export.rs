@@ -145,6 +145,19 @@ fn test_ioc_check_inline_list_and_export() {
     assert!(ok);
     assert!(stdout.contains("\"ioc_value\":\"us09-web-zoom.com\""));
 
+    // 2b. ioc check (csv)
+    let (ok, stdout, _) = run_footprint(&[
+        "-c",
+        case.to_str().unwrap(),
+        "ioc",
+        "check",
+        "--format",
+        "csv",
+    ]);
+    assert!(ok);
+    assert!(stdout.contains("target_type,target_id"));
+    assert!(stdout.contains("us09-web-zoom.com"));
+
     // 3. list shows inline [IOC: ...] badge
     let (ok, stdout, _) = run_footprint(&[
         "-c",
@@ -155,6 +168,34 @@ fn test_ioc_check_inline_list_and_export() {
     ]);
     assert!(ok);
     assert!(stdout.contains("[IOC: us09-web-zoom.com]"));
+
+    // 3b. list --format csv
+    let (ok, stdout, _) = run_footprint(&[
+        "-c",
+        case.to_str().unwrap(),
+        "list",
+        "--host",
+        "us09-web-zoom.com",
+        "--format",
+        "csv",
+    ]);
+    assert!(ok);
+    assert!(stdout.contains("id,time,source,kind,summary,ioc_hits"));
+    assert!(stdout.contains("us09-web-zoom.com"));
+
+    // 3c. list --group-by host --format csv
+    let (ok, stdout, _) = run_footprint(&[
+        "-c",
+        case.to_str().unwrap(),
+        "list",
+        "--group-by",
+        "host",
+        "--format",
+        "csv",
+    ]);
+    assert!(ok);
+    assert!(stdout.contains("count,group"));
+    assert!(stdout.contains("us09-web-zoom.com"));
 
     // 4. export --format jsonl --redact
     let jsonl_out = dir.path().join("case_export.jsonl");
