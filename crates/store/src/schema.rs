@@ -556,11 +556,43 @@ impl Store {
     }
 
     pub fn list_state_by_kind(&self, kind: &str) -> Result<Vec<StateRow>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        self.list_state(None, Some(kind), None)
+    }
+
+    pub fn list_state(
+        &self,
+        run_id: Option<u64>,
+        kind: Option<&str>,
+        match_text: Option<&str>,
+    ) -> Result<Vec<StateRow>, StoreError> {
+        let mut sql = String::from(
             "SELECT rowid, run_id, kind, key, value_json, locator
-             FROM state WHERE kind = ?1",
-        )?;
-        let rows = stmt.query_map([kind], StateRow::from_row)?;
+             FROM state WHERE 1=1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(r) = run_id {
+            sql.push_str(" AND run_id = ?");
+            params.push(Box::new(r));
+        }
+
+        if let Some(k) = kind {
+            sql.push_str(" AND kind LIKE ? ESCAPE '\\'");
+            params.push(Box::new(kind_pattern(k)));
+        }
+
+        if let Some(m) = match_text {
+            sql.push_str(" AND (key LIKE ? ESCAPE '\\' OR value_json LIKE ? ESCAPE '\\')");
+            let pat = format!("%{}%", escape_like(m));
+            params.push(Box::new(pat.clone()));
+            params.push(Box::new(pat));
+        }
+
+        sql.push_str(" ORDER BY kind ASC, key ASC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(&param_refs[..], StateRow::from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 }
@@ -1130,6 +1162,71 @@ mod tests {
         assert_eq!(detail.prov_file.as_deref(), Some("/h/History"));
         assert_eq!(detail.app.as_deref(), Some("Brave"));
         assert!(store.get_event(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_state_filters() {
+        let (_dir, mut store) = open_case();
+        let (r1, _) = run(&mut store);
+        let batch1 = Batch {
+            source_identity: "test",
+            events: &[],
+            states: &[
+                StateRecord {
+                    run_id: r1,
+                    kind: "persist.cron".into(),
+                    key: "/etc/crontab".into(),
+                    value: json!({"owner": "cron"}),
+                    provenance: Provenance {
+                        file: "/etc/crontab".into(),
+                        file_sha256: None,
+                        locator: "test".into(),
+                    },
+                },
+                StateRecord {
+                    run_id: r1,
+                    kind: "persist.systemd".into(),
+                    key: "/etc/systemd/system/malicious.service".into(),
+                    value: json!({"owner": null}),
+                    provenance: Provenance {
+                        file: "/etc/systemd/system/malicious.service".into(),
+                        file_sha256: None,
+                        locator: "test".into(),
+                    },
+                },
+                StateRecord {
+                    run_id: r1,
+                    kind: "web.site_permission".into(),
+                    key: "zoom.us|camera".into(),
+                    value: json!({"decision": "allow"}),
+                    provenance: Provenance {
+                        file: "/h/Preferences".into(),
+                        file_sha256: None,
+                        locator: "test".into(),
+                    },
+                },
+            ],
+            artifacts: &[],
+        };
+        store.ingest(r1, &batch1).unwrap();
+
+        let all = store.list_state(Some(r1), None, None).unwrap();
+        assert_eq!(all.len(), 3);
+
+        let persist_only = store.list_state(Some(r1), Some("persist.*"), None).unwrap();
+        assert_eq!(persist_only.len(), 2);
+
+        let systemd_only = store
+            .list_state(Some(r1), Some("persist.systemd"), None)
+            .unwrap();
+        assert_eq!(systemd_only.len(), 1);
+        assert_eq!(systemd_only[0].key, "/etc/systemd/system/malicious.service");
+
+        let matched = store.list_state(Some(r1), None, Some("malicious")).unwrap();
+        assert_eq!(matched.len(), 1);
+
+        let non_existent_run = store.list_state(Some(999), None, None).unwrap();
+        assert!(non_existent_run.is_empty());
     }
 
     #[test]

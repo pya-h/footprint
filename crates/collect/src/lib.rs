@@ -6,6 +6,8 @@ pub mod desktop;
 pub mod desktop_fallbacks;
 pub mod downloads;
 pub mod event;
+pub mod fs;
+pub mod persist;
 pub mod pkg;
 pub mod pkg_fallbacks;
 pub mod probe;
@@ -35,5 +37,7 @@ pub fn registry() -> Vec<Box<dyn Collector>> {
         Box::new(desktop::DesktopCollector),
         Box::new(desktop_fallbacks::KdeRecentCollector),
         Box::new(desktop_fallbacks::ZeitgeistCollector),
+        Box::new(fs::FilesystemCollector),
+        Box::new(persist::PersistCollector),
     ]
 }

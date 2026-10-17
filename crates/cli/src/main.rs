@@ -47,6 +47,10 @@ enum Command {
     Search { query: String },
     /// Walk provenance links backwards and forwards from an artifact path, URL, or event ID
     Trace { target: String },
+    /// Captured state records (permissions, persistence, sockets)
+    State(StateArgs),
+    /// Diff state records between two runs
+    Diff(DiffArgs),
 }
 
 #[derive(Args)]
@@ -84,17 +88,56 @@ struct ListArgs {
     /// event kinds; `web.*` matches a family
     #[arg(short, long, value_delimiter = ',')]
     kind: Vec<String>,
+    /// source kinds or apps
+    #[arg(long, value_delimiter = ',')]
+    source: Vec<String>,
     /// hosts, each also matching its subdomains
     #[arg(long, value_delimiter = ',')]
     host: Vec<String>,
     /// substring of subject, summary or attributes
     #[arg(short, long)]
     r#match: Option<String>,
+    /// aggregate count of events by dimension
+    #[arg(long, value_enum)]
+    group_by: Option<GroupBy>,
     #[arg(short, long)]
     limit: Option<usize>,
     /// newest first
     #[arg(short, long)]
     reverse: bool,
+    #[arg(long, value_enum, default_value_t = Format::Table)]
+    format: Format,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+enum GroupBy {
+    Dir,
+    Host,
+    Source,
+    Minute,
+}
+
+#[derive(Args)]
+struct StateArgs {
+    /// state kinds or pattern (e.g. `web.site_permission`, `persist.*`, `persist.systemd`)
+    #[arg(short, long)]
+    kind: Option<String>,
+    /// a run id; defaults to the last run
+    #[arg(short, long)]
+    run: Option<u64>,
+    /// substring of key or value
+    #[arg(short, long)]
+    r#match: Option<String>,
+    #[arg(long, value_enum, default_value_t = Format::Table)]
+    format: Format,
+}
+
+#[derive(Args)]
+struct DiffArgs {
+    /// first run ID (or 'prev')
+    run_a: String,
+    /// second run ID (or 'last')
+    run_b: String,
     #[arg(long, value_enum, default_value_t = Format::Table)]
     format: Format,
 }
@@ -121,6 +164,8 @@ fn main() -> Result<()> {
             print_rows(store.search_events(&query)?, Format::Table)
         }
         Command::Trace { target } => trace(&cli.case, &target),
+        Command::State(args) => state(&cli.case, args),
+        Command::Diff(args) => diff(&cli.case, args),
     }
 }
 
@@ -438,10 +483,95 @@ fn list(case: &PathBuf, args: ListArgs) -> Result<()> {
         kinds: args.kind,
         hosts: args.host,
         match_text: args.r#match,
-        limit: args.limit,
+        limit: if args.group_by.is_some() {
+            None
+        } else {
+            args.limit
+        },
         reverse: args.reverse,
     };
-    print_rows(store.list_events(&filter)?, args.format)
+    let mut rows = store.list_events(&filter)?;
+
+    if !args.source.is_empty() {
+        rows.retain(|r| {
+            let app = r.app.as_deref().unwrap_or("");
+            let source_str = match (&r.app, &r.profile) {
+                (Some(a), Some(p)) => format!("{a}/{p}"),
+                (Some(a), None) => a.clone(),
+                _ => String::new(),
+            };
+            args.source.iter().any(|s| {
+                s == &r.kind || s == app || s == &source_str || r.kind.starts_with(s.as_str())
+            })
+        });
+    }
+
+    if let Some(gb) = args.group_by {
+        print_grouped(rows, gb, args.format, args.limit)
+    } else {
+        print_rows(rows, args.format)
+    }
+}
+
+fn print_grouped(
+    rows: Vec<EventRow>,
+    group_by: GroupBy,
+    format: Format,
+    limit: Option<usize>,
+) -> Result<()> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for r in &rows {
+        let key = match group_by {
+            GroupBy::Dir => {
+                let subj = r.subject.as_deref().unwrap_or("");
+                if subj.contains('/') {
+                    std::path::Path::new(subj)
+                        .parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "/".into())
+                } else {
+                    "-".into()
+                }
+            }
+            GroupBy::Host => r.subject_host.clone().unwrap_or_else(|| "-".into()),
+            GroupBy::Source => match (&r.app, &r.profile) {
+                (Some(a), Some(p)) => format!("{a}/{p}"),
+                (Some(a), None) => a.clone(),
+                _ => r.kind.clone(),
+            },
+            GroupBy::Minute => local_time(r.ts_utc, &r.ts_precision, "%Y-%m-%d %H:%M"),
+        };
+        *counts.entry(key).or_insert(0) += 1;
+    }
+
+    let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    if let Some(lim) = limit {
+        sorted.truncate(lim);
+    }
+
+    match format {
+        Format::Jsonl => {
+            for (key, count) in sorted {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "group": key,
+                        "count": count,
+                    })
+                );
+            }
+        }
+        Format::Table => {
+            println!("{:>6}  GROUP", "COUNT");
+            for (key, count) in sorted {
+                println!("{:>6}  {}", count, key);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn local_time(ts_utc: i64, precision: &str, pattern: &str) -> String {
@@ -541,6 +671,271 @@ fn trace(case: &PathBuf, target: &str) -> Result<()> {
     let rendered = fp_correlate::render_trace(&store, target)?;
     print!("{rendered}");
     Ok(())
+}
+
+fn state(case: &PathBuf, args: StateArgs) -> Result<()> {
+    let store = Store::open(case)?;
+    let run_id = match args.run {
+        Some(r) => Some(r),
+        None => store.last_run_id()?,
+    };
+    let rows = store.list_state(run_id, args.kind.as_deref(), args.r#match.as_deref())?;
+
+    match args.format {
+        Format::Jsonl => {
+            for row in rows {
+                println!("{}", serde_json::to_string(&row)?);
+            }
+        }
+        Format::Table => {
+            if rows.is_empty() {
+                println!("no state records found");
+                return Ok(());
+            }
+            println!("{:>5}  {:<24} {:<42} DETAILS", "RUN", "KIND", "KEY");
+            for row in rows {
+                let parsed: Option<serde_json::Value> = serde_json::from_str(&row.value_json).ok();
+                let mut details_parts = Vec::new();
+
+                if let Some(ref val) = parsed {
+                    if let Some(flags) = val.get("flags").and_then(|f| f.as_array())
+                        && !flags.is_empty()
+                    {
+                        let flag_strs: Vec<&str> =
+                            flags.iter().filter_map(|s| s.as_str()).collect();
+                        details_parts.push(format!("flags: [{}]", flag_strs.join(", ")));
+                    }
+                    if let Some(pkg) = val.get("owner_pkg").and_then(|p| p.as_str()) {
+                        details_parts.push(format!("pkg: {pkg}"));
+                    }
+                    if let Some(integ) = val.get("integrity").and_then(|i| i.as_str())
+                        && integ != "ok"
+                        && integ != "unowned"
+                    {
+                        details_parts.push(format!("integrity: {integ}"));
+                    }
+                    if let Some(decision) = val.get("decision").and_then(|d| d.as_str()) {
+                        details_parts.push(format!("decision: {decision}"));
+                    }
+                    if let Some(ww) = val
+                        .get("details")
+                        .and_then(|d| d.get("world_writable_path_entries"))
+                        .and_then(|w| w.as_array())
+                        && !ww.is_empty()
+                    {
+                        let paths: Vec<&str> = ww.iter().filter_map(|p| p.as_str()).collect();
+                        details_parts.push(format!("world-writable: {}", paths.join(", ")));
+                    }
+                    if let Some(u0) = val
+                        .get("details")
+                        .and_then(|d| d.get("uid0_users"))
+                        .and_then(|u| u.as_array())
+                    {
+                        let non_root: Vec<&str> = u0
+                            .iter()
+                            .filter_map(|u| u.as_str())
+                            .filter(|&u| u != "root")
+                            .collect();
+                        if !non_root.is_empty() {
+                            details_parts.push(format!("uid0 non-root: {}", non_root.join(", ")));
+                        }
+                    }
+                }
+
+                let details = if details_parts.is_empty() {
+                    "-".to_string()
+                } else {
+                    details_parts.join("; ")
+                };
+
+                println!(
+                    "{:>5}  {:<24} {:<42} {}",
+                    row.run_id, row.kind, row.key, details
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_run_id(store: &Store, s: &str) -> Result<u64> {
+    if let Ok(id) = s.parse::<u64>() {
+        return Ok(id);
+    }
+    let last = store.last_run_id()?.context("no runs found in case")?;
+    match s.to_lowercase().as_str() {
+        "last" | "latest" => Ok(last),
+        "prev" | "previous" => {
+            if last <= 1 {
+                bail!("no previous run before run {last}");
+            }
+            Ok(last - 1)
+        }
+        _ => bail!("invalid run id '{s}'; expected integer, 'last', or 'prev'"),
+    }
+}
+
+fn diff(case: &PathBuf, args: DiffArgs) -> Result<()> {
+    let store = Store::open(case)?;
+    let run_a = resolve_run_id(&store, &args.run_a)?;
+    let run_b = resolve_run_id(&store, &args.run_b)?;
+
+    let states_a = store.list_state(Some(run_a), None, None)?;
+    let states_b = store.list_state(Some(run_b), None, None)?;
+
+    let mut map_a: std::collections::HashMap<(&str, &str), &fp_store::StateRow> =
+        std::collections::HashMap::new();
+    for row in &states_a {
+        map_a.insert((&row.kind, &row.key), row);
+    }
+
+    let mut map_b: std::collections::HashMap<(&str, &str), &fp_store::StateRow> =
+        std::collections::HashMap::new();
+    for row in &states_b {
+        map_b.insert((&row.kind, &row.key), row);
+    }
+
+    let mut all_keys: std::collections::BTreeSet<(&str, &str)> = std::collections::BTreeSet::new();
+    for k in map_a.keys() {
+        all_keys.insert(*k);
+    }
+    for k in map_b.keys() {
+        all_keys.insert(*k);
+    }
+
+    match args.format {
+        Format::Jsonl => {
+            for (kind, key) in all_keys {
+                match (map_a.get(&(kind, key)), map_b.get(&(kind, key))) {
+                    (None, Some(b)) => {
+                        let val_b: serde_json::Value =
+                            serde_json::from_str(&b.value_json).unwrap_or(serde_json::Value::Null);
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "diff": "+",
+                                "kind": kind,
+                                "key": key,
+                                "run_a": null,
+                                "run_b": val_b,
+                            })
+                        );
+                    }
+                    (Some(a), None) => {
+                        let val_a: serde_json::Value =
+                            serde_json::from_str(&a.value_json).unwrap_or(serde_json::Value::Null);
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "diff": "-",
+                                "kind": kind,
+                                "key": key,
+                                "run_a": val_a,
+                                "run_b": null,
+                            })
+                        );
+                    }
+                    (Some(a), Some(b)) => {
+                        if a.value_json != b.value_json {
+                            let val_a: serde_json::Value = serde_json::from_str(&a.value_json)
+                                .unwrap_or(serde_json::Value::Null);
+                            let val_b: serde_json::Value = serde_json::from_str(&b.value_json)
+                                .unwrap_or(serde_json::Value::Null);
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "diff": "~",
+                                    "kind": kind,
+                                    "key": key,
+                                    "run_a": val_a,
+                                    "run_b": val_b,
+                                })
+                            );
+                        }
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+        Format::Table => {
+            let mut diff_count = 0;
+            println!("{:<4} {:<24} {:<42} CHANGE", "DIFF", "KIND", "KEY");
+            for (kind, key) in all_keys {
+                match (map_a.get(&(kind, key)), map_b.get(&(kind, key))) {
+                    (None, Some(b)) => {
+                        diff_count += 1;
+                        let detail = describe_state_summary(&b.value_json, "added");
+                        println!("{:<4} {:<24} {:<42} {}", "+", kind, key, detail);
+                    }
+                    (Some(_a), None) => {
+                        diff_count += 1;
+                        println!("{:<4} {:<24} {:<42} removed", "-", kind, key);
+                    }
+                    (Some(a), Some(b)) => {
+                        if a.value_json != b.value_json {
+                            diff_count += 1;
+                            let change_desc = describe_diff_change(&a.value_json, &b.value_json);
+                            println!("{:<4} {:<24} {:<42} {}", "~", kind, key, change_desc);
+                        }
+                    }
+                    (None, None) => {}
+                }
+            }
+            if diff_count == 0 {
+                println!("no differences between run {run_a} and run {run_b}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn describe_state_summary(val_str: &str, prefix: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(val_str) else {
+        return prefix.to_string();
+    };
+    if let Some(flags) = v.get("flags").and_then(|f| f.as_array())
+        && !flags.is_empty()
+    {
+        let flag_strs: Vec<&str> = flags.iter().filter_map(|s| s.as_str()).collect();
+        return format!("{prefix} [{}]", flag_strs.join(", "));
+    }
+    prefix.to_string()
+}
+
+fn describe_diff_change(old_str: &str, new_str: &str) -> String {
+    let Ok(old_v) = serde_json::from_str::<serde_json::Value>(old_str) else {
+        return "content changed".to_string();
+    };
+    let Ok(new_v) = serde_json::from_str::<serde_json::Value>(new_str) else {
+        return "content changed".to_string();
+    };
+
+    let mut changes = Vec::new();
+    if old_v.get("sha256") != new_v.get("sha256") {
+        changes.push("sha256 changed");
+    }
+    if old_v.get("decision") != new_v.get("decision") {
+        let old_d = old_v
+            .get("decision")
+            .and_then(|d| d.as_str())
+            .unwrap_or("none");
+        let new_d = new_v
+            .get("decision")
+            .and_then(|d| d.as_str())
+            .unwrap_or("none");
+        return format!("decision: {old_d} -> {new_d}");
+    }
+    if old_v.get("flags") != new_v.get("flags") {
+        changes.push("flags changed");
+    }
+    if old_v.get("owner_pkg") != new_v.get("owner_pkg") {
+        changes.push("package owner changed");
+    }
+    if changes.is_empty() {
+        "metadata changed".to_string()
+    } else {
+        changes.join(", ")
+    }
 }
 
 fn hostname() -> String {
