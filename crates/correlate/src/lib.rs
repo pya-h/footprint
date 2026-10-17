@@ -2,6 +2,7 @@ pub mod anchoring;
 pub mod chains;
 pub mod downloads;
 pub mod install;
+pub mod ioc;
 pub mod permissions;
 pub mod trace;
 
@@ -9,6 +10,7 @@ use anyhow::Result;
 use fp_store::Store;
 use std::path::Path;
 
+pub use ioc::{IocHit, check_iocs, correlate_iocs, match_event_iocs};
 pub use trace::render_trace;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -18,6 +20,7 @@ pub struct CorrelateStats {
     pub installs: usize,
     pub anchored: usize,
     pub permissions: usize,
+    pub iocs: usize,
 }
 
 /// Runs all correlation passes over the case database.
@@ -28,12 +31,14 @@ pub struct CorrelateStats {
 /// 3. Artifact -> install command and install command -> pkg.install
 /// 4. Bash command anchoring against apt/sudo
 /// 5. Site -> permission join
+/// 6. IOC match against iocs table
 pub fn correlate(store: &mut Store, root: &Path) -> Result<CorrelateStats> {
     let chains = chains::correlate_navigation_chains(store)?;
     let downloads = downloads::correlate_downloads(store, root)?;
     let installs = install::correlate_install(store, root)?;
     let anchored = anchoring::correlate_anchoring(store)?;
     let permissions = permissions::correlate_site_permissions(store)?;
+    let iocs = ioc::correlate_iocs(store)?;
 
     Ok(CorrelateStats {
         chains,
@@ -41,6 +46,7 @@ pub fn correlate(store: &mut Store, root: &Path) -> Result<CorrelateStats> {
         installs,
         anchored,
         permissions,
+        iocs,
     })
 }
 

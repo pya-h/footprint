@@ -13,6 +13,7 @@ fp-core = { path = "../core" }
 fp-store = { path = "../store" }
 fp-collect = { path = "../collect" }
 fp-correlate = { path = "../correlate" }
+fp-render = { path = "../render" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 chrono = "0.4"

@@ -51,6 +51,10 @@ enum Command {
     State(StateArgs),
     /// Diff state records between two runs
     Diff(DiffArgs),
+    /// Manage and match Indicators of Compromise (domain, IP, CIDR, sha256, path, url)
+    Ioc(IocArgs),
+    /// Export timeline events to JSONL, CSV, or standalone HTML report
+    Export(ExportArgs),
 }
 
 #[derive(Args)]
@@ -142,6 +146,80 @@ struct DiffArgs {
     format: Format,
 }
 
+#[derive(Args)]
+struct IocArgs {
+    #[command(subcommand)]
+    cmd: IocCommand,
+}
+
+#[derive(Subcommand)]
+enum IocCommand {
+    /// Add an indicator of compromise
+    Add {
+        /// type of IOC: domain, ip, cidr, sha256, path, url
+        ioc_type: String,
+        /// value to match
+        value: String,
+        /// optional description / context note
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Import indicators of compromise from a file
+    Import {
+        /// file containing IOCs (one per line, auto-detected or 'type value [note]')
+        file: PathBuf,
+    },
+    /// Check the case database against all configured IOCs
+    Check {
+        #[arg(long, value_enum, default_value_t = Format::Table)]
+        format: Format,
+    },
+    /// List all configured IOCs
+    List,
+}
+
+#[derive(Args)]
+struct ExportArgs {
+    /// output format: jsonl, csv, html
+    #[arg(short, long, value_enum)]
+    format: ExportCliFormat,
+    /// output file path
+    #[arg(short, long)]
+    out: PathBuf,
+    /// hash sensitive query parameters and credentials in URLs and attributes
+    #[arg(long)]
+    redact: bool,
+
+    #[arg(short, long, allow_hyphen_values = true)]
+    since: Option<String>,
+    #[arg(short, long, allow_hyphen_values = true)]
+    until: Option<String>,
+    /// event kinds; `web.*` matches a family
+    #[arg(short, long, value_delimiter = ',')]
+    kind: Vec<String>,
+    /// source kinds or apps
+    #[arg(long, value_delimiter = ',')]
+    source: Vec<String>,
+    /// hosts, each also matching its subdomains
+    #[arg(long, value_delimiter = ',')]
+    host: Vec<String>,
+    /// substring of subject, summary or attributes
+    #[arg(short, long)]
+    r#match: Option<String>,
+    #[arg(short, long)]
+    limit: Option<usize>,
+    /// newest first
+    #[arg(short, long)]
+    reverse: bool,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ExportCliFormat {
+    Jsonl,
+    Csv,
+    Html,
+}
+
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum Format {
     Table,
@@ -161,11 +239,14 @@ fn main() -> Result<()> {
         Command::Show { id } => show(&cli.case, id),
         Command::Search { query } => {
             let store = Store::open(&cli.case)?;
-            print_rows(store.search_events(&query)?, Format::Table)
+            let iocs = store.list_iocs().unwrap_or_default();
+            print_rows(store.search_events(&query)?, Format::Table, &iocs)
         }
         Command::Trace { target } => trace(&cli.case, &target),
         Command::State(args) => state(&cli.case, args),
         Command::Diff(args) => diff(&cli.case, args),
+        Command::Ioc(args) => ioc(&cli.case, args),
+        Command::Export(args) => export(&cli.case, args),
     }
 }
 
@@ -506,10 +587,11 @@ fn list(case: &PathBuf, args: ListArgs) -> Result<()> {
         });
     }
 
+    let iocs = store.list_iocs().unwrap_or_default();
     if let Some(gb) = args.group_by {
         print_grouped(rows, gb, args.format, args.limit)
     } else {
-        print_rows(rows, args.format)
+        print_rows(rows, args.format, &iocs)
     }
 }
 
@@ -583,23 +665,43 @@ fn local_time(ts_utc: i64, precision: &str, pattern: &str) -> String {
         .unwrap_or_else(|| format!("@{ts_utc}µs"))
 }
 
-fn print_rows(rows: Vec<EventRow>, format: Format) -> Result<()> {
+fn print_rows(rows: Vec<EventRow>, format: Format, iocs: &[fp_store::IocRow]) -> Result<()> {
     for row in rows {
+        let ioc_hits = fp_correlate::match_event_iocs(
+            row.subject_host.as_deref(),
+            row.subject.as_deref(),
+            row.summary.as_deref(),
+            iocs,
+        );
+        let ioc_badge = if ioc_hits.is_empty() {
+            String::new()
+        } else {
+            format!(" [IOC: {}]", ioc_hits.join(", "))
+        };
+
         match format {
-            Format::Jsonl => println!("{}", serde_json::to_string(&row)?),
+            Format::Jsonl => {
+                let mut val = serde_json::to_value(&row)?;
+                if !ioc_hits.is_empty() {
+                    val["ioc_hits"] = serde_json::json!(ioc_hits);
+                }
+                println!("{}", serde_json::to_string(&val)?);
+            }
             Format::Table => {
                 let source = match (&row.app, &row.profile) {
                     (Some(a), Some(p)) => format!("{a}/{p}"),
                     (Some(a), None) => a.clone(),
                     _ => "-".into(),
                 };
+                let summary_text = row.summary.or(row.subject).unwrap_or_default();
                 println!(
-                    "{:>6}  {:<19}  {:<18} {:<21} {}",
+                    "{:>6}  {:<19}  {:<18} {:<21} {}{}",
                     row.id,
                     local_time(row.ts_utc, &row.ts_precision, "%Y-%m-%d %H:%M:%S"),
                     source,
                     row.kind,
-                    row.summary.or(row.subject).unwrap_or_default()
+                    summary_text,
+                    ioc_badge
                 );
             }
         }
@@ -942,6 +1044,182 @@ fn hostname() -> String {
     fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn ioc(case: &PathBuf, args: IocArgs) -> Result<()> {
+    match args.cmd {
+        IocCommand::Add {
+            ioc_type,
+            value,
+            note,
+        } => {
+            let mut store = Store::open_or_create(case)?;
+            let id = store.insert_ioc(&ioc_type, &value, note.as_deref())?;
+            println!(
+                "added IOC #{id}: {ioc_type} {value}{}",
+                note.map(|n| format!(" ({n})")).unwrap_or_default()
+            );
+        }
+        IocCommand::Import { file } => {
+            let mut store = Store::open_or_create(case)?;
+            let content = fs::read_to_string(&file)
+                .with_context(|| format!("failed to read IOC file {}", file.display()))?;
+            let mut count = 0;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let (ioc_type, val, note) = parse_ioc_line(line);
+                if !val.is_empty() {
+                    store.insert_ioc(&ioc_type, &val, note.as_deref())?;
+                    count += 1;
+                }
+            }
+            println!("imported {count} IOCs from {}", file.display());
+        }
+        IocCommand::Check { format } => {
+            let store = Store::open(case)?;
+            let hits = fp_correlate::check_iocs(&store)?;
+            match format {
+                Format::Jsonl => {
+                    for hit in hits {
+                        println!("{}", serde_json::to_string(&hit)?);
+                    }
+                }
+                Format::Table => {
+                    if hits.is_empty() {
+                        println!("No IOC hits found.");
+                    } else {
+                        println!(
+                            "{:<28} {:<8} {:<30} {:<18} {:<30} NOTE",
+                            "TARGET", "TYPE", "IOC VALUE", "FIELD", "MATCHED VALUE"
+                        );
+                        for h in hits {
+                            println!(
+                                "{:<28} {:<8} {:<30} {:<18} {:<30} {}",
+                                h.target_desc,
+                                h.ioc_type,
+                                h.ioc_value,
+                                h.matched_field,
+                                h.matched_value,
+                                h.ioc_note.unwrap_or_else(|| "-".into())
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        IocCommand::List => {
+            let store = Store::open(case)?;
+            let iocs = store.list_iocs()?;
+            if iocs.is_empty() {
+                println!("No IOCs configured. Add one with 'footprint ioc add <type> <value>'.");
+            } else {
+                println!(
+                    "{:<6} {:<8} {:<36} {:<20} NOTE",
+                    "ID", "TYPE", "VALUE", "ADDED"
+                );
+                for ioc in iocs {
+                    let added = local_time(ioc.added_utc, "second", "%Y-%m-%d %H:%M:%S");
+                    println!(
+                        "{:<6} {:<8} {:<36} {:<20} {}",
+                        ioc.id,
+                        ioc.ioc_type,
+                        ioc.value,
+                        added,
+                        ioc.note.unwrap_or_else(|| "-".into())
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn export(case: &PathBuf, args: ExportArgs) -> Result<()> {
+    let store = Store::open(case)?;
+    let filter = EventFilter {
+        since: args.since.as_deref().map(time::parse).transpose()?,
+        until: args.until.as_deref().map(time::parse).transpose()?,
+        kinds: args.kind,
+        hosts: args.host,
+        match_text: args.r#match,
+        limit: args.limit,
+        reverse: args.reverse,
+    };
+
+    let fmt = match args.format {
+        ExportCliFormat::Jsonl => fp_render::ExportFormat::Jsonl,
+        ExportCliFormat::Csv => fp_render::ExportFormat::Csv,
+        ExportCliFormat::Html => fp_render::ExportFormat::Html,
+    };
+
+    let count = fp_render::export_case(&store, &filter, &args.source, fmt, &args.out, args.redact)?;
+    println!(
+        "exported {count} events to {} ({:?}{})",
+        args.out.display(),
+        args.format,
+        if args.redact { ", redacted" } else { "" }
+    );
+    Ok(())
+}
+
+fn parse_ioc_line(line: &str) -> (String, String, Option<String>) {
+    let (body, note) = match line.split_once('#') {
+        Some((b, n)) => (b.trim(), Some(n.trim().to_string())),
+        None => (line.trim(), None),
+    };
+
+    let parts: Vec<&str> = if body.contains(',') {
+        body.split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        body.split_whitespace().collect()
+    };
+
+    if parts.len() >= 2
+        && matches!(
+            parts[0].to_lowercase().as_str(),
+            "domain" | "ip" | "cidr" | "sha256" | "path" | "url"
+        )
+    {
+        let ioc_type = parts[0].to_lowercase();
+        let val = parts[1].to_string();
+        let note = if parts.len() > 2 {
+            Some(parts[2..].join(" "))
+        } else {
+            note
+        };
+        (ioc_type, val, note)
+    } else {
+        let val = parts.first().copied().unwrap_or(body);
+        let ioc_type = detect_ioc_type(val);
+        (ioc_type, val.to_string(), note)
+    }
+}
+
+fn detect_ioc_type(val: &str) -> String {
+    if val.len() == 64 && val.chars().all(|c| c.is_ascii_hexdigit()) {
+        "sha256".to_string()
+    } else if val.starts_with('/') || val.contains('*') || val.contains('?') {
+        "path".to_string()
+    } else if val.contains("://") {
+        "url".to_string()
+    } else if val.contains('/')
+        && val
+            .split('/')
+            .next()
+            .is_some_and(|ip| ip.parse::<std::net::IpAddr>().is_ok())
+    {
+        "cidr".to_string()
+    } else if val.parse::<std::net::IpAddr>().is_ok() {
+        "ip".to_string()
+    } else {
+        "domain".to_string()
+    }
 }
 
 #[cfg(test)]

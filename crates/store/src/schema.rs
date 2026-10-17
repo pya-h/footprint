@@ -326,8 +326,12 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
     }
 
-    pub fn list_events(&self, filter: &EventFilter) -> Result<Vec<EventRow>, StoreError> {
-        let mut sql = format!("{EVENT_ROW_SELECT} WHERE 1=1");
+    fn build_events_query(
+        &self,
+        base_select: &str,
+        filter: &EventFilter,
+    ) -> (String, Vec<rusqlite::types::Value>) {
+        let mut sql = format!("{base_select} WHERE 1=1");
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
 
         if let Some(lo) = filter.since {
@@ -373,9 +377,23 @@ impl Store {
             sql.push_str(" LIMIT ?");
             args.push((limit as i64).into());
         }
+        (sql, args)
+    }
 
+    pub fn list_events(&self, filter: &EventFilter) -> Result<Vec<EventRow>, StoreError> {
+        let (sql, args) = self.build_events_query(EVENT_ROW_SELECT, filter);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(args), EventRow::from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn list_events_detailed(
+        &self,
+        filter: &EventFilter,
+    ) -> Result<Vec<EventDetail>, StoreError> {
+        let (sql, args) = self.build_events_query(EVENT_DETAIL_SELECT, filter);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(args), EventDetail::from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -427,9 +445,45 @@ impl Store {
         Ok(row)
     }
 
+    pub fn get_all_events(&self) -> Result<Vec<EventDetail>, StoreError> {
+        let sql = "SELECT e.id, e.run_id, e.source_id, e.ts_utc, e.ts_precision, e.ts_raw, e.ts_raw_format,
+                    e.ts_tz_assumed, e.kind, e.actor_json, e.subject, e.subject_host, e.summary,
+                    e.attrs_json, e.locator, e.prov_file, e.prov_sha256, e.confidence,
+                    s.kind, s.app, s.profile
+             FROM events e JOIN sources s ON s.id = e.source_id
+             ORDER BY e.ts_utc, e.id";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(EventDetail {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                source_id: row.get(2)?,
+                ts_utc: row.get(3)?,
+                ts_precision: row.get(4)?,
+                ts_raw: row.get(5)?,
+                ts_raw_format: row.get(6)?,
+                ts_tz_assumed: row.get(7)?,
+                kind: row.get(8)?,
+                actor_json: row.get(9)?,
+                subject: row.get(10)?,
+                subject_host: row.get(11)?,
+                summary: row.get(12)?,
+                attrs_json: row.get(13)?,
+                locator: row.get(14)?,
+                prov_file: row.get(15)?,
+                prov_sha256: row.get(16)?,
+                confidence: row.get(17)?,
+                source_kind: row.get(18)?,
+                app: row.get(19)?,
+                profile: row.get(20)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub fn get_events_by_kinds(&self, kinds: &[&str]) -> Result<Vec<EventDetail>, StoreError> {
         if kinds.is_empty() {
-            return Ok(Vec::new());
+            return self.get_all_events();
         }
         let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
@@ -595,6 +649,44 @@ impl Store {
         let rows = stmt.query_map(&param_refs[..], StateRow::from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    pub fn insert_ioc(
+        &mut self,
+        ioc_type: &str,
+        value: &str,
+        note: Option<&str>,
+    ) -> Result<u64, StoreError> {
+        let now = now_micros();
+        self.conn.execute(
+            "INSERT INTO iocs (type, value, note, added_utc) VALUES (?1, ?2, ?3, ?4)",
+            params![ioc_type, value, note, now],
+        )?;
+        Ok(self.conn.last_insert_rowid() as u64)
+    }
+
+    pub fn list_iocs(&self) -> Result<Vec<IocRow>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, type, value, note, added_utc FROM iocs ORDER BY id ASC")?;
+        let rows = stmt.query_map([], IocRow::from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn delete_ioc(&mut self, id: u64) -> Result<bool, StoreError> {
+        let n = self
+            .conn
+            .execute("DELETE FROM iocs WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    pub fn list_runs(&self) -> Result<Vec<RunRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, started_utc, finished_utc, host, user, uid, euid, tool_version, tz, args, errors_json
+             FROM runs ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], RunRow::from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
 
 /// `web.*` matches every `web.` kind; anything else matches exactly.
@@ -625,6 +717,13 @@ pub struct EventFilter {
 
 const EVENT_ROW_SELECT: &str = "SELECT e.id, e.ts_utc, e.ts_precision, e.kind, s.app, s.profile,
         e.subject, e.subject_host, e.summary, e.confidence
+     FROM events e JOIN sources s ON s.id = e.source_id";
+
+const EVENT_DETAIL_SELECT: &str =
+    "SELECT e.id, e.run_id, e.source_id, e.ts_utc, e.ts_precision, e.ts_raw, e.ts_raw_format,
+        e.ts_tz_assumed, e.kind, e.actor_json, e.subject, e.subject_host, e.summary,
+        e.attrs_json, e.locator, e.prov_file, e.prov_sha256, e.confidence,
+        s.kind, s.app, s.profile
      FROM events e JOIN sources s ON s.id = e.source_id";
 
 #[derive(Debug, serde::Serialize)]
@@ -694,6 +793,34 @@ pub struct EventDetail {
     pub source_kind: String,
     pub app: Option<String>,
     pub profile: Option<String>,
+}
+
+impl EventDetail {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            run_id: row.get(1)?,
+            source_id: row.get(2)?,
+            ts_utc: row.get(3)?,
+            ts_precision: row.get(4)?,
+            ts_raw: row.get(5)?,
+            ts_raw_format: row.get(6)?,
+            ts_tz_assumed: row.get(7)?,
+            kind: row.get(8)?,
+            actor_json: row.get(9)?,
+            subject: row.get(10)?,
+            subject_host: row.get(11)?,
+            summary: row.get(12)?,
+            attrs_json: row.get(13)?,
+            locator: row.get(14)?,
+            prov_file: row.get(15)?,
+            prov_sha256: row.get(16)?,
+            confidence: row.get(17)?,
+            source_kind: row.get(18)?,
+            app: row.get(19)?,
+            profile: row.get(20)?,
+        })
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -779,6 +906,62 @@ impl StateRow {
             key: row.get(3)?,
             value_json: row.get(4)?,
             locator: row.get(5)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct IocRow {
+    pub id: u64,
+    pub ioc_type: String,
+    pub value: String,
+    pub note: Option<String>,
+    pub added_utc: i64,
+}
+
+impl IocRow {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        let id_i64: i64 = row.get(0)?;
+        Ok(Self {
+            id: id_i64 as u64,
+            ioc_type: row.get(1)?,
+            value: row.get(2)?,
+            note: row.get(3)?,
+            added_utc: row.get(4)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RunRow {
+    pub id: u64,
+    pub started_utc: i64,
+    pub finished_utc: Option<i64>,
+    pub host: Option<String>,
+    pub user: Option<String>,
+    pub uid: Option<u32>,
+    pub euid: Option<u32>,
+    pub tool_version: Option<String>,
+    pub tz: Option<String>,
+    pub args: Option<String>,
+    pub errors_json: Option<String>,
+}
+
+impl RunRow {
+    fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        let id_i64: i64 = row.get(0)?;
+        Ok(Self {
+            id: id_i64 as u64,
+            started_utc: row.get(1)?,
+            finished_utc: row.get(2)?,
+            host: row.get(3)?,
+            user: row.get(4)?,
+            uid: row.get(5)?,
+            euid: row.get(6)?,
+            tool_version: row.get(7)?,
+            tz: row.get(8)?,
+            args: row.get(9)?,
+            errors_json: row.get(10)?,
         })
     }
 }
@@ -1227,6 +1410,33 @@ mod tests {
 
         let non_existent_run = store.list_state(Some(999), None, None).unwrap();
         assert!(non_existent_run.is_empty());
+    }
+
+    #[test]
+    fn ioc_crud() {
+        let (_dir, mut store) = open_case();
+        let id1 = store
+            .insert_ioc("domain", "us09-web-zoom.com", Some("malicious meeting"))
+            .unwrap();
+        assert_eq!(id1, 1);
+        let id2 = store.insert_ioc("sha256", "e9a522c7a40237", None).unwrap();
+        assert_eq!(id2, 2);
+
+        let iocs = store.list_iocs().unwrap();
+        assert_eq!(iocs.len(), 2);
+        assert_eq!(iocs[0].ioc_type, "domain");
+        assert_eq!(iocs[0].value, "us09-web-zoom.com");
+        assert_eq!(iocs[0].note.as_deref(), Some("malicious meeting"));
+        assert!(iocs[0].added_utc > 0);
+
+        let deleted = store.delete_ioc(id1).unwrap();
+        assert!(deleted);
+        let remaining = store.list_iocs().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, id2);
+
+        let not_found = store.delete_ioc(999).unwrap();
+        assert!(!not_found);
     }
 
     #[test]

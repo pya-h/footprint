@@ -392,6 +392,7 @@ dependencies = [
  "fp-core",
  "fp-correlate",
  "fp-fixtures",
+ "fp-render",
  "fp-store",
  "libc",
  "serde_json",
@@ -463,6 +464,23 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "fp-render"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fp-core",
+ "fp-correlate",
+ "fp-store",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
