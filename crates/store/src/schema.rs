@@ -377,6 +377,10 @@ impl Store {
             sql.push_str(" LIMIT ?");
             args.push((limit as i64).into());
         }
+        if let Some(offset) = filter.offset {
+            sql.push_str(" OFFSET ?");
+            args.push((offset as i64).into());
+        }
         (sql, args)
     }
 
@@ -712,10 +716,12 @@ pub struct EventFilter {
     pub hosts: Vec<String>,
     pub match_text: Option<String>,
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
     pub reverse: bool,
 }
 
-const EVENT_ROW_SELECT: &str = "SELECT e.id, e.ts_utc, e.ts_precision, e.kind, s.app, s.profile,
+const EVENT_ROW_SELECT: &str =
+    "SELECT e.id, e.run_id, e.ts_utc, e.ts_precision, e.kind, s.kind, s.app, s.profile,
         e.subject, e.subject_host, e.summary, e.confidence
      FROM events e JOIN sources s ON s.id = e.source_id";
 
@@ -729,9 +735,11 @@ const EVENT_DETAIL_SELECT: &str =
 #[derive(Debug, serde::Serialize)]
 pub struct EventRow {
     pub id: u64,
+    pub run_id: u64,
     pub ts_utc: i64,
     pub ts_precision: String,
     pub kind: String,
+    pub source_kind: String,
     pub app: Option<String>,
     pub profile: Option<String>,
     pub subject: Option<String>,
@@ -744,15 +752,17 @@ impl EventRow {
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
             id: row.get(0)?,
-            ts_utc: row.get(1)?,
-            ts_precision: row.get(2)?,
-            kind: row.get(3)?,
-            app: row.get(4)?,
-            profile: row.get(5)?,
-            subject: row.get(6)?,
-            subject_host: row.get(7)?,
-            summary: row.get(8)?,
-            confidence: row.get(9)?,
+            run_id: row.get(1)?,
+            ts_utc: row.get(2)?,
+            ts_precision: row.get(3)?,
+            kind: row.get(4)?,
+            source_kind: row.get(5)?,
+            app: row.get(6)?,
+            profile: row.get(7)?,
+            subject: row.get(8)?,
+            subject_host: row.get(9)?,
+            summary: row.get(10)?,
+            confidence: row.get(11)?,
         })
     }
 }

@@ -1,14 +1,9 @@
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Local};
 use clap::{Args, Parser, Subcommand};
-use fp_collect::{CollectCtx, Collector, Env, Sink};
-use fp_core::{Availability, SourceInstance};
-use fp_store::{Batch, EventFilter, EventRow, NewRun, Store};
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use fp_core::Availability;
+use fp_store::Store;
 use std::path::PathBuf;
-
-mod time;
+use std::sync::mpsc::channel;
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +50,8 @@ enum Command {
     Ioc(IocArgs),
     /// Export timeline events to JSONL, CSV, or standalone HTML report
     Export(ExportArgs),
+    /// Interactive terminal UI (default: the case at --case)
+    Tui,
 }
 
 #[derive(Args)]
@@ -238,163 +235,75 @@ fn main() -> Result<()> {
         } => sources(&cli.case, run, all_runs, coverage),
         Command::List(args) => list(&cli.case, args),
         Command::Show { id } => show(&cli.case, id),
-        Command::Search { query } => {
-            let store = Store::open(&cli.case)?;
-            let iocs = store.list_iocs().unwrap_or_default();
-            print_rows(store.search_events(&query)?, Format::Table, &iocs)
-        }
+        Command::Search { query } => search(&cli.case, &query),
         Command::Trace { target } => trace(&cli.case, &target),
         Command::State(args) => state(&cli.case, args),
         Command::Diff(args) => diff(&cli.case, args),
         Command::Ioc(args) => ioc(&cli.case, args),
         Command::Export(args) => export(&cli.case, args),
+        Command::Tui => fp_tui::run(&cli.case),
     }
-}
-
-/// `chromium` selects `chromium.history`; `all` selects everything.
-fn selected(kind: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|p| {
-        p == "all"
-            || kind == p
-            || kind
-                .strip_prefix(p.as_str())
-                .is_some_and(|rest| rest.starts_with('.'))
-    })
 }
 
 fn collect(case: &PathBuf, args: CollectArgs) -> Result<()> {
-    let since = args.since.as_deref().map(time::parse).transpose()?;
-    let until = args.until.as_deref().map(time::parse).transpose()?;
-    if let (Some(lo), Some(hi)) = (since, until)
-        && lo > hi
-    {
-        bail!("--since is after --until");
-    }
-    let collectors: Vec<Box<dyn Collector>> = fp_collect::registry()
-        .into_iter()
-        .filter(|c| selected(c.kind(), &args.sources) && !selected(c.kind(), &args.exclude))
-        .collect();
-    if collectors.is_empty() {
-        bail!("no source kind matches --sources/--exclude");
-    }
-
-    let mut env = Env::current();
-    if !args.home.is_empty() {
-        env.home = args.home[0].clone();
-        env.user_targets.clear();
-        for h in &args.home {
-            env.add_user_home(h.clone(), None, None);
-        }
-    }
-    if args.all_users {
-        if env.euid != 0 && env.uid != 0 {
-            bail!("--all-users requires root privileges");
-        }
-        env.load_all_users()?;
-    }
-    env.root = args.root;
-
-    let mut store = Store::open_or_create(case)?;
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let run_id = store.insert_run(&NewRun {
-        host: &hostname(),
-        user: &std::env::var("USER").unwrap_or_default(),
-        uid: env.uid,
-        euid: env.euid,
-        version: env!("CARGO_PKG_VERSION"),
-        tz: &Local::now().offset().to_string(),
-        args: &argv.join(" "),
-    })?;
-
-    let temp_dir = tempfile::Builder::new().prefix("footprint-").tempdir()?;
-    fs::set_permissions(temp_dir.path(), fs::Permissions::from_mode(0o700))?;
-    let ctx = CollectCtx {
-        run_id,
-        since,
-        until,
+    let params = fp_query::CollectParams {
+        since: args.since,
+        until: args.until,
+        sources: args.sources,
+        exclude: args.exclude,
         assume_tz: args.assume_tz,
-        temp_dir: temp_dir.path().to_path_buf(),
+        homes: args.home,
+        all_users: args.all_users,
+        root: args.root,
     };
-
-    let mut errors = Vec::new();
-    let mut totals = fp_store::IngestStats::default();
-    let mut read = 0;
-    for collector in &collectors {
-        for mut inst in collector.discover(&env) {
-            inst.id = store.insert_source(run_id, &inst)?;
-            if inst.status != Availability::Present {
-                continue;
+    let (tx, rx) = channel();
+    let case_owned = case.clone();
+    let handle = std::thread::spawn(move || fp_query::run_collect(&case_owned, &params, Some(&tx)));
+    while let Ok(event) = rx.recv() {
+        match event {
+            fp_query::CollectEvent::InstanceError { label, error } => {
+                eprintln!("error: {label}: {error}");
             }
-            read += 1;
-            let mut sink = Sink::default();
-            if let Err(e) = collector.collect(&inst, &ctx, &mut sink) {
-                let msg = format!("{}: {e:#}", label(&inst));
-                store.update_source_status(
-                    inst.id,
-                    &Availability::Error(format!("{e:#}")),
-                    None,
-                )?;
-                eprintln!("error: {msg}");
-                errors.push(msg);
-                continue;
-            }
-            let stats = store.ingest(
-                run_id,
-                &Batch {
-                    source_identity: &inst.identity(),
-                    events: &sink.events,
-                    states: &sink.states,
-                    artifacts: &sink.artifacts,
-                },
-            )?;
-            totals.events_new += stats.events_new;
-            totals.events_known += stats.events_known;
-            totals.states += stats.states;
-            totals.artifacts += stats.artifacts;
-            if !sink.warnings.is_empty() {
-                for w in &sink.warnings {
-                    eprintln!("warning: {}: {w}", label(&inst));
+            fp_query::CollectEvent::InstanceDone {
+                label, warnings, ..
+            } => {
+                for w in &warnings {
+                    eprintln!("warning: {label}: {w}");
                 }
-                store.update_source_status(
-                    inst.id,
-                    &Availability::Partial,
-                    Some(&sink.warnings.join("; ")),
-                )?;
-            } else if stats.events_new == 0
-                && stats.events_known == 0
-                && stats.states == 0
-                && stats.artifacts == 0
-            {
-                store.update_source_status(inst.id, &Availability::Empty, Some("empty"))?;
             }
+            fp_query::CollectEvent::Finished(summary) => {
+                println!(
+                    "run {}: {} new events ({} already in the case), {} states, {} artifacts from {} sources{} → {}",
+                    summary.run_id,
+                    summary.totals.events_new,
+                    summary.totals.events_known,
+                    summary.totals.states,
+                    summary.totals.artifacts,
+                    summary.sources_read,
+                    if summary.errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {} failed", summary.errors.len())
+                    },
+                    case.display()
+                );
+            }
+            _ => {}
         }
     }
-
-    if let Err(e) = fp_correlate::correlate(&mut store, &env.root) {
-        errors.push(format!("correlate: {e:#}"));
-    }
-
-    store.finish_run(run_id, &errors)?;
-    println!(
-        "run {run_id}: {} new events ({} already in the case), {} states, {} artifacts from {read} sources{} → {}",
-        totals.events_new,
-        totals.events_known,
-        totals.states,
-        totals.artifacts,
-        if errors.is_empty() {
-            String::new()
-        } else {
-            format!(", {} failed", errors.len())
-        },
-        store.path().display()
-    );
+    handle.join().map_err(std::panic::resume_unwind)??;
     Ok(())
 }
 
-fn label(inst: &SourceInstance) -> String {
-    match &inst.profile {
-        Some(p) => format!("{} {}/{p}", inst.kind, inst.app),
-        None => format!("{} {} ({})", inst.kind, inst.app, inst.path.display()),
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ioc_type_detection() {
+        use super::detect_ioc_type;
+        assert_eq!(detect_ioc_type("us09-web-zoom.com"), "domain");
+        assert_eq!(detect_ioc_type("192.168.1.1"), "ip");
+        assert_eq!(detect_ioc_type("192.168.1.0/24"), "cidr");
+        assert_eq!(detect_ioc_type("/tmp/evil.sh"), "path");
     }
 }
 
@@ -405,25 +314,39 @@ fn sources(case: &PathBuf, run: Option<u64>, all_runs: bool, coverage: bool) -> 
         (Some(r), _) => Some(r),
         (None, false) => store.last_run_id()?,
     };
-    let rows = store.sources(run)?;
+    let rows = fp_query::sources(&store, run)?;
     if coverage {
-        print_coverage(&rows);
+        let cov = fp_query::coverage(&rows);
+        println!(
+            "{:<18} {:<10} {:<32} NOTES / FALLBACKS",
+            "CATEGORY", "STATUS", "ANSWERING SOURCES"
+        );
+        for row in &cov {
+            let status = match row.status {
+                fp_query::CoverageStatus::Covered => "Covered",
+                fp_query::CoverageStatus::Partial => "Partial",
+                fp_query::CoverageStatus::Gap => "Gap",
+            };
+            println!(
+                "{:<18} {:<10} {:<32} {}",
+                row.category,
+                status,
+                if row.answering.is_empty() {
+                    "none".to_string()
+                } else {
+                    row.answering.join(", ")
+                },
+                if row.notes.is_empty() {
+                    "-".to_string()
+                } else {
+                    row.notes.join("; ")
+                }
+            );
+        }
         return Ok(());
     }
 
-    for s in rows {
-        let status: Availability = s
-            .status
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()
-            .context("unreadable source status")?
-            .unwrap_or(Availability::Present);
-        let app = match (&s.app, &s.profile) {
-            (Some(a), Some(p)) => format!("{a}/{p}"),
-            (Some(a), None) => a.clone(),
-            _ => "-".into(),
-        };
+    for s in &rows {
         let count_str = if s.event_count > 0 {
             format!("{} events", s.event_count)
         } else {
@@ -434,136 +357,35 @@ fn sources(case: &PathBuf, run: Option<u64>, all_runs: bool, coverage: bool) -> 
             s.id,
             s.run_id,
             s.kind,
-            app,
-            status.to_string(),
+            s.label(),
+            s.status_display(),
             count_str,
             s.path.as_deref().unwrap_or("-"),
-            s.note.map(|n| format!("  ({n})")).unwrap_or_default()
+            s.note
+                .as_ref()
+                .map(|n| format!("  ({n})"))
+                .unwrap_or_default()
         );
     }
     Ok(())
 }
 
-fn print_coverage(sources: &[fp_store::SourceRow]) {
-    println!(
-        "{:<18} {:<10} {:<32} NOTES / FALLBACKS",
-        "CATEGORY", "STATUS", "ANSWERING SOURCES"
-    );
-    let categories: &[(&str, &[&str])] = &[
-        ("Browser history", &["chromium.history", "firefox.history"]),
-        ("Downloads", &["dlmgr.xdm", "dlmgr.xattr", "dlmgr.detect"]),
-        (
-            "Packages",
-            &[
-                "pkg.dpkg",
-                "pkg.apt",
-                "pkg.pacman",
-                "pkg.dnf",
-                "pkg.zypper",
-                "pkg.flatpak",
-            ],
-        ),
-        ("Privilege", &["auth.journald", "auth.log"]),
-        ("Shell", &["shell.history"]),
-        (
-            "Desktop activity",
-            &["desktop.recent", "desktop.kde", "desktop.zeitgeist"],
-        ),
-    ];
-
-    for &(cat_name, kinds) in categories {
-        let matching: Vec<&fp_store::SourceRow> = sources
-            .iter()
-            .filter(|s| kinds.contains(&s.kind.as_str()))
-            .collect();
-        let mut answering = Vec::new();
-        let mut notes = Vec::new();
-
-        for s in &matching {
-            let app = match (&s.app, &s.profile) {
-                (Some(a), Some(p)) => format!("{a}/{p}"),
-                (Some(a), None) => a.clone(),
-                _ => s.kind.clone(),
-            };
-            let status: Availability = s
-                .status
-                .as_deref()
-                .and_then(|st| serde_json::from_str(st).ok())
-                .unwrap_or(Availability::Present);
-
-            match status {
-                Availability::Present if s.event_count > 0 => {
-                    answering.push(format!("{app} ({} events)", s.event_count));
-                }
-                Availability::Present => {
-                    answering.push(format!("{app} (0 events)"));
-                }
-                Availability::NotInstalled => {
-                    notes.push(format!("{app} not installed"));
-                }
-                Availability::Empty => {
-                    notes.push(format!("{app} empty"));
-                }
-                Availability::Unsupported { reason } => {
-                    notes.push(format!("{app} unsupported ({reason})"));
-                }
-                Availability::Unreadable { needs_root } => {
-                    notes.push(format!(
-                        "{app} unreadable{}",
-                        if needs_root { " (needs root)" } else { "" }
-                    ));
-                }
-                Availability::Partial => {
-                    answering.push(format!("{app} (partial, {} events)", s.event_count));
-                }
-                Availability::Error(ref e) => {
-                    notes.push(format!("{app} error: {e}"));
-                }
-            }
-        }
-
-        let has_events = matching.iter().any(|s| s.event_count > 0);
-        let has_present = matching.iter().any(|s| {
-            s.status
-                .as_deref()
-                .and_then(|st| serde_json::from_str::<Availability>(st).ok())
-                == Some(Availability::Present)
-        });
-
-        let status_str = if has_events {
-            "Covered"
-        } else if has_present {
-            "Partial"
-        } else {
-            "Gap"
-        };
-
-        let ans_str = if answering.is_empty() {
-            "none".to_string()
-        } else {
-            answering.join(", ")
-        };
-
-        let note_str = if notes.is_empty() {
-            "-".to_string()
-        } else {
-            notes.join("; ")
-        };
-
-        println!(
-            "{:<18} {:<10} {:<32} {}",
-            cat_name, status_str, ans_str, note_str
-        );
-    }
-}
-
 fn list(case: &PathBuf, args: ListArgs) -> Result<()> {
     let store = Store::open(case)?;
-    let filter = EventFilter {
-        since: args.since.as_deref().map(time::parse).transpose()?,
-        until: args.until.as_deref().map(time::parse).transpose()?,
+    let filter = fp_query::TimelineFilter {
+        since: args
+            .since
+            .as_deref()
+            .map(fp_query::time::parse)
+            .transpose()?,
+        until: args
+            .until
+            .as_deref()
+            .map(fp_query::time::parse)
+            .transpose()?,
         kinds: args.kind,
         hosts: args.host,
+        sources: args.source,
         match_text: args.r#match,
         limit: if args.group_by.is_some() {
             None
@@ -572,32 +394,16 @@ fn list(case: &PathBuf, args: ListArgs) -> Result<()> {
         },
         reverse: args.reverse,
     };
-    let mut rows = store.list_events(&filter)?;
-
-    if !args.source.is_empty() {
-        rows.retain(|r| {
-            let app = r.app.as_deref().unwrap_or("");
-            let source_str = match (&r.app, &r.profile) {
-                (Some(a), Some(p)) => format!("{a}/{p}"),
-                (Some(a), None) => a.clone(),
-                _ => String::new(),
-            };
-            args.source.iter().any(|s| {
-                s == &r.kind || s == app || s == &source_str || r.kind.starts_with(s.as_str())
-            })
-        });
-    }
-
-    let iocs = store.list_iocs().unwrap_or_default();
+    let rows = fp_query::timeline(&store, &filter)?;
     if let Some(gb) = args.group_by {
         print_grouped(rows, gb, args.format, args.limit)
     } else {
-        print_rows(rows, args.format, &iocs)
+        print_rows(rows, args.format)
     }
 }
 
 fn print_grouped(
-    rows: Vec<EventRow>,
+    rows: Vec<fp_query::TimelineRow>,
     group_by: GroupBy,
     format: Format,
     limit: Option<usize>,
@@ -618,12 +424,13 @@ fn print_grouped(
                 }
             }
             GroupBy::Host => r.subject_host.clone().unwrap_or_else(|| "-".into()),
-            GroupBy::Source => match (&r.app, &r.profile) {
-                (Some(a), Some(p)) => format!("{a}/{p}"),
-                (Some(a), None) => a.clone(),
-                _ => r.kind.clone(),
-            },
-            GroupBy::Minute => local_time(r.ts_utc, &r.ts_precision, "%Y-%m-%d %H:%M"),
+            GroupBy::Source => r.source_label(),
+            GroupBy::Minute => fp_query::format_time(
+                r.ts_utc,
+                &r.ts_precision,
+                fp_query::Tz::Local,
+                "%Y-%m-%d %H:%M",
+            ),
         };
         *counts.entry(key).or_insert(0) += 1;
     }
@@ -663,73 +470,58 @@ fn print_grouped(
     Ok(())
 }
 
-fn local_time(ts_utc: i64, precision: &str, pattern: &str) -> String {
-    if precision == "order_only" {
-        return "(untimed)".to_string();
-    }
-    DateTime::from_timestamp_micros(ts_utc)
-        .map(|t| t.with_timezone(&Local).format(pattern).to_string())
-        .unwrap_or_else(|| format!("@{ts_utc}µs"))
-}
-
-fn print_rows(rows: Vec<EventRow>, format: Format, iocs: &[fp_store::IocRow]) -> Result<()> {
+fn print_rows(rows: Vec<fp_query::TimelineRow>, format: Format) -> Result<()> {
     if matches!(format, Format::Csv) {
         println!("id,time,source,kind,summary,ioc_hits");
     }
     for row in rows {
-        let ioc_hits = fp_correlate::match_event_iocs(
-            row.subject_host.as_deref(),
-            row.subject.as_deref(),
-            row.summary.as_deref(),
-            iocs,
-        );
-        let ioc_badge = if ioc_hits.is_empty() {
+        let ioc_badge = if row.ioc_hits.is_empty() {
             String::new()
         } else {
-            format!(" [IOC: {}]", ioc_hits.join(", "))
+            format!(" [IOC: {}]", row.ioc_hits.join(", "))
         };
 
         match format {
             Format::Jsonl => {
                 let mut val = serde_json::to_value(&row)?;
-                if !ioc_hits.is_empty() {
-                    val["ioc_hits"] = serde_json::json!(ioc_hits);
+                if !row.ioc_hits.is_empty() {
+                    val["ioc_hits"] = serde_json::json!(row.ioc_hits);
+                } else {
+                    val.as_object_mut().map(|m| m.remove("ioc_hits"));
                 }
                 println!("{}", serde_json::to_string(&val)?);
             }
             Format::Table => {
-                let source = match (&row.app, &row.profile) {
-                    (Some(a), Some(p)) => format!("{a}/{p}"),
-                    (Some(a), None) => a.clone(),
-                    _ => "-".into(),
-                };
-                let summary_text = row.summary.or(row.subject).unwrap_or_default();
                 println!(
                     "{:>6}  {:<19}  {:<18} {:<21} {}{}",
                     row.id,
-                    local_time(row.ts_utc, &row.ts_precision, "%Y-%m-%d %H:%M:%S"),
-                    source,
+                    fp_query::format_time(
+                        row.ts_utc,
+                        &row.ts_precision,
+                        fp_query::Tz::Local,
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    row.source_label(),
                     row.kind,
-                    summary_text,
+                    row.display_text(),
                     ioc_badge
                 );
             }
             Format::Csv => {
-                let source = match (&row.app, &row.profile) {
-                    (Some(a), Some(p)) => format!("{a}/{p}"),
-                    (Some(a), None) => a.clone(),
-                    _ => "-".into(),
-                };
-                let summary_text = row.summary.or(row.subject).unwrap_or_default();
-                let time_str = local_time(row.ts_utc, &row.ts_precision, "%Y-%m-%d %H:%M:%S");
+                let time_str = fp_query::format_time(
+                    row.ts_utc,
+                    &row.ts_precision,
+                    fp_query::Tz::Local,
+                    "%Y-%m-%d %H:%M:%S",
+                );
                 println!(
                     "{},{},{},{},{},{}",
                     row.id,
                     fp_render::csv::escape_csv(&time_str),
-                    fp_render::csv::escape_csv(&source),
+                    fp_render::csv::escape_csv(&row.source_label()),
                     fp_render::csv::escape_csv(&row.kind),
-                    fp_render::csv::escape_csv(&summary_text),
-                    fp_render::csv::escape_csv(&ioc_hits.join(";")),
+                    fp_render::csv::escape_csv(&row.display_text()),
+                    fp_render::csv::escape_csv(&row.ioc_hits.join(";")),
                 );
             }
         }
@@ -737,18 +529,27 @@ fn print_rows(rows: Vec<EventRow>, format: Format, iocs: &[fp_store::IocRow]) ->
     Ok(())
 }
 
+fn search(case: &PathBuf, query: &str) -> Result<()> {
+    let store = Store::open(case)?;
+    print_rows(fp_query::search(&store, query)?, Format::Table)
+}
+
 fn show(case: &PathBuf, id: u64) -> Result<()> {
     let store = Store::open(case)?;
-    let ev = store
-        .get_event(id)?
-        .with_context(|| format!("event {id} not found"))?;
+    let ev =
+        fp_query::event_detail(&store, id)?.with_context(|| format!("event {id} not found"))?;
     let field = |name: &str, value: &str| println!("{name:<12} {value}");
     let dash = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
     field("id", &ev.id.to_string());
     field("run", &ev.run_id.to_string());
     field(
         "time",
-        &local_time(ev.ts_utc, &ev.ts_precision, "%Y-%m-%d %H:%M:%S%.6f %:z"),
+        &fp_query::format_time(
+            ev.ts_utc,
+            &ev.ts_precision,
+            fp_query::Tz::Local,
+            "%Y-%m-%d %H:%M:%S%.6f %:z",
+        ),
     );
     field("precision", &ev.ts_precision);
     field(
@@ -773,22 +574,36 @@ fn show(case: &PathBuf, id: u64) -> Result<()> {
     field("file", &dash(&ev.prov_file));
     field("sha256", &dash(&ev.prov_sha256));
     field("locator", &dash(&ev.locator));
-    field("actor", &dash(&ev.actor_json));
-    field("attrs", &dash(&ev.attrs_json));
+    field(
+        "actor",
+        &ev.actor
+            .as_ref()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "-".into()),
+    );
+    field(
+        "attrs",
+        &ev.attrs
+            .as_ref()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "-".into()),
+    );
 
-    let links = store.get_links_for("event", ev.id)?;
-    if !links.is_empty() {
+    if !ev.links.is_empty() {
         println!("links:");
-        for l in links {
-            let target = if l.src_type == "event" && l.src_id == ev.id {
-                format!("{} {}", l.dst_type, l.dst_id)
-            } else {
-                format!("{} {}", l.src_type, l.src_id)
+        for l in &ev.links {
+            let arrow = match l.direction {
+                fp_query::LinkDirection::Outgoing => "->",
+                fp_query::LinkDirection::Incoming => "<-",
             };
-            let why_str = l.why.map(|w| format!(" ({w})")).unwrap_or_default();
+            let why_str = l
+                .why
+                .as_ref()
+                .map(|w| format!(" ({w})"))
+                .unwrap_or_default();
             println!(
-                "  - {:<16} {:<16} [{}{}]",
-                l.rel, target, l.confidence, why_str
+                "  - {:<16} {} {} {} [{}]{}",
+                l.rel, arrow, l.target_type, l.target_label, l.confidence, why_str
             );
         }
     }
@@ -809,12 +624,27 @@ fn state(case: &PathBuf, args: StateArgs) -> Result<()> {
         Some(r) => Some(r),
         None => store.last_run_id()?,
     };
-    let rows = store.list_state(run_id, args.kind.as_deref(), args.r#match.as_deref())?;
+    let rows = fp_query::state_records(
+        &store,
+        run_id,
+        args.kind.as_deref(),
+        args.r#match.as_deref(),
+    )?;
 
     match args.format {
         Format::Jsonl => {
-            for row in rows {
-                println!("{}", serde_json::to_string(&row)?);
+            for row in &rows {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "rowid": row.rowid,
+                        "run_id": row.run_id,
+                        "kind": row.kind,
+                        "key": row.key,
+                        "value_json": row.value_json,
+                        "locator": row.locator,
+                    })
+                );
             }
         }
         Format::Table => {
@@ -823,61 +653,13 @@ fn state(case: &PathBuf, args: StateArgs) -> Result<()> {
                 return Ok(());
             }
             println!("{:>5}  {:<24} {:<42} DETAILS", "RUN", "KIND", "KEY");
-            for row in rows {
-                let parsed: Option<serde_json::Value> = serde_json::from_str(&row.value_json).ok();
-                let mut details_parts = Vec::new();
-
-                if let Some(ref val) = parsed {
-                    if let Some(flags) = val.get("flags").and_then(|f| f.as_array())
-                        && !flags.is_empty()
-                    {
-                        let flag_strs: Vec<&str> =
-                            flags.iter().filter_map(|s| s.as_str()).collect();
-                        details_parts.push(format!("flags: [{}]", flag_strs.join(", ")));
-                    }
-                    if let Some(pkg) = val.get("owner_pkg").and_then(|p| p.as_str()) {
-                        details_parts.push(format!("pkg: {pkg}"));
-                    }
-                    if let Some(integ) = val.get("integrity").and_then(|i| i.as_str())
-                        && integ != "ok"
-                        && integ != "unowned"
-                    {
-                        details_parts.push(format!("integrity: {integ}"));
-                    }
-                    if let Some(decision) = val.get("decision").and_then(|d| d.as_str()) {
-                        details_parts.push(format!("decision: {decision}"));
-                    }
-                    if let Some(ww) = val
-                        .get("details")
-                        .and_then(|d| d.get("world_writable_path_entries"))
-                        .and_then(|w| w.as_array())
-                        && !ww.is_empty()
-                    {
-                        let paths: Vec<&str> = ww.iter().filter_map(|p| p.as_str()).collect();
-                        details_parts.push(format!("world-writable: {}", paths.join(", ")));
-                    }
-                    if let Some(u0) = val
-                        .get("details")
-                        .and_then(|d| d.get("uid0_users"))
-                        .and_then(|u| u.as_array())
-                    {
-                        let non_root: Vec<&str> = u0
-                            .iter()
-                            .filter_map(|u| u.as_str())
-                            .filter(|&u| u != "root")
-                            .collect();
-                        if !non_root.is_empty() {
-                            details_parts.push(format!("uid0 non-root: {}", non_root.join(", ")));
-                        }
-                    }
-                }
-
+            for row in &rows {
+                let details_parts = fp_query::state_details(row.parsed.as_ref());
                 let details = if details_parts.is_empty() {
                     "-".to_string()
                 } else {
                     details_parts.join("; ")
                 };
-
                 println!(
                     "{:>5}  {:<24} {:<42} {}",
                     row.run_id, row.kind, row.key, details
@@ -886,7 +668,7 @@ fn state(case: &PathBuf, args: StateArgs) -> Result<()> {
         }
         Format::Csv => {
             println!("run,kind,key,value");
-            for row in rows {
+            for row in &rows {
                 println!(
                     "{},{},{},{}",
                     row.run_id,
@@ -921,204 +703,61 @@ fn diff(case: &PathBuf, args: DiffArgs) -> Result<()> {
     let store = Store::open(case)?;
     let run_a = resolve_run_id(&store, &args.run_a)?;
     let run_b = resolve_run_id(&store, &args.run_b)?;
-
-    let states_a = store.list_state(Some(run_a), None, None)?;
-    let states_b = store.list_state(Some(run_b), None, None)?;
-
-    let mut map_a: std::collections::HashMap<(&str, &str), &fp_store::StateRow> =
-        std::collections::HashMap::new();
-    for row in &states_a {
-        map_a.insert((&row.kind, &row.key), row);
-    }
-
-    let mut map_b: std::collections::HashMap<(&str, &str), &fp_store::StateRow> =
-        std::collections::HashMap::new();
-    for row in &states_b {
-        map_b.insert((&row.kind, &row.key), row);
-    }
-
-    let mut all_keys: std::collections::BTreeSet<(&str, &str)> = std::collections::BTreeSet::new();
-    for k in map_a.keys() {
-        all_keys.insert(*k);
-    }
-    for k in map_b.keys() {
-        all_keys.insert(*k);
-    }
+    let entries = fp_query::diff_runs(&store, run_a, run_b)?;
 
     match args.format {
         Format::Jsonl => {
-            for (kind, key) in all_keys {
-                match (map_a.get(&(kind, key)), map_b.get(&(kind, key))) {
-                    (None, Some(b)) => {
-                        let val_b: serde_json::Value =
-                            serde_json::from_str(&b.value_json).unwrap_or(serde_json::Value::Null);
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "diff": "+",
-                                "kind": kind,
-                                "key": key,
-                                "run_a": null,
-                                "run_b": val_b,
-                            })
-                        );
-                    }
-                    (Some(a), None) => {
-                        let val_a: serde_json::Value =
-                            serde_json::from_str(&a.value_json).unwrap_or(serde_json::Value::Null);
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "diff": "-",
-                                "kind": kind,
-                                "key": key,
-                                "run_a": val_a,
-                                "run_b": null,
-                            })
-                        );
-                    }
-                    (Some(a), Some(b)) => {
-                        if a.value_json != b.value_json {
-                            let val_a: serde_json::Value = serde_json::from_str(&a.value_json)
-                                .unwrap_or(serde_json::Value::Null);
-                            let val_b: serde_json::Value = serde_json::from_str(&b.value_json)
-                                .unwrap_or(serde_json::Value::Null);
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "diff": "~",
-                                    "kind": kind,
-                                    "key": key,
-                                    "run_a": val_a,
-                                    "run_b": val_b,
-                                })
-                            );
-                        }
-                    }
-                    (None, None) => {}
-                }
+            for e in &entries {
+                let sign = match e.change {
+                    fp_query::DiffChange::Added => "+",
+                    fp_query::DiffChange::Removed => "-",
+                    fp_query::DiffChange::Changed => "~",
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "diff": sign,
+                        "kind": e.kind,
+                        "key": e.key,
+                        "run_a": e.run_a,
+                        "run_b": e.run_b,
+                    })
+                );
             }
         }
         Format::Table => {
-            let mut diff_count = 0;
             println!("{:<4} {:<24} {:<42} CHANGE", "DIFF", "KIND", "KEY");
-            for (kind, key) in all_keys {
-                match (map_a.get(&(kind, key)), map_b.get(&(kind, key))) {
-                    (None, Some(b)) => {
-                        diff_count += 1;
-                        let detail = describe_state_summary(&b.value_json, "added");
-                        println!("{:<4} {:<24} {:<42} {}", "+", kind, key, detail);
-                    }
-                    (Some(_a), None) => {
-                        diff_count += 1;
-                        println!("{:<4} {:<24} {:<42} removed", "-", kind, key);
-                    }
-                    (Some(a), Some(b)) => {
-                        if a.value_json != b.value_json {
-                            diff_count += 1;
-                            let change_desc = describe_diff_change(&a.value_json, &b.value_json);
-                            println!("{:<4} {:<24} {:<42} {}", "~", kind, key, change_desc);
-                        }
-                    }
-                    (None, None) => {}
-                }
+            for e in &entries {
+                let sign = match e.change {
+                    fp_query::DiffChange::Added => "+",
+                    fp_query::DiffChange::Removed => "-",
+                    fp_query::DiffChange::Changed => "~",
+                };
+                println!("{:<4} {:<24} {:<42} {}", sign, e.kind, e.key, e.detail);
             }
-            if diff_count == 0 {
+            if entries.is_empty() {
                 println!("no differences between run {run_a} and run {run_b}");
             }
         }
         Format::Csv => {
             println!("diff,kind,key,detail");
-            for (kind, key) in all_keys {
-                match (map_a.get(&(kind, key)), map_b.get(&(kind, key))) {
-                    (None, Some(b)) => {
-                        let detail = describe_state_summary(&b.value_json, "added");
-                        println!(
-                            "+,{},{},{}",
-                            fp_render::csv::escape_csv(kind),
-                            fp_render::csv::escape_csv(key),
-                            fp_render::csv::escape_csv(&detail)
-                        );
-                    }
-                    (Some(_a), None) => {
-                        println!(
-                            "-,{},{},removed",
-                            fp_render::csv::escape_csv(kind),
-                            fp_render::csv::escape_csv(key)
-                        );
-                    }
-                    (Some(a), Some(b)) => {
-                        if a.value_json != b.value_json {
-                            let change_desc = describe_diff_change(&a.value_json, &b.value_json);
-                            println!(
-                                "~,{},{},{}",
-                                fp_render::csv::escape_csv(kind),
-                                fp_render::csv::escape_csv(key),
-                                fp_render::csv::escape_csv(&change_desc)
-                            );
-                        }
-                    }
-                    (None, None) => {}
-                }
+            for e in &entries {
+                let sign = match e.change {
+                    fp_query::DiffChange::Added => "+",
+                    fp_query::DiffChange::Removed => "-",
+                    fp_query::DiffChange::Changed => "~",
+                };
+                println!(
+                    "{},{},{},{}",
+                    sign,
+                    fp_render::csv::escape_csv(&e.kind),
+                    fp_render::csv::escape_csv(&e.key),
+                    fp_render::csv::escape_csv(&e.detail)
+                );
             }
         }
     }
     Ok(())
-}
-
-fn describe_state_summary(val_str: &str, prefix: &str) -> String {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(val_str) else {
-        return prefix.to_string();
-    };
-    if let Some(flags) = v.get("flags").and_then(|f| f.as_array())
-        && !flags.is_empty()
-    {
-        let flag_strs: Vec<&str> = flags.iter().filter_map(|s| s.as_str()).collect();
-        return format!("{prefix} [{}]", flag_strs.join(", "));
-    }
-    prefix.to_string()
-}
-
-fn describe_diff_change(old_str: &str, new_str: &str) -> String {
-    let Ok(old_v) = serde_json::from_str::<serde_json::Value>(old_str) else {
-        return "content changed".to_string();
-    };
-    let Ok(new_v) = serde_json::from_str::<serde_json::Value>(new_str) else {
-        return "content changed".to_string();
-    };
-
-    let mut changes = Vec::new();
-    if old_v.get("sha256") != new_v.get("sha256") {
-        changes.push("sha256 changed");
-    }
-    if old_v.get("decision") != new_v.get("decision") {
-        let old_d = old_v
-            .get("decision")
-            .and_then(|d| d.as_str())
-            .unwrap_or("none");
-        let new_d = new_v
-            .get("decision")
-            .and_then(|d| d.as_str())
-            .unwrap_or("none");
-        return format!("decision: {old_d} -> {new_d}");
-    }
-    if old_v.get("flags") != new_v.get("flags") {
-        changes.push("flags changed");
-    }
-    if old_v.get("owner_pkg") != new_v.get("owner_pkg") {
-        changes.push("package owner changed");
-    }
-    if changes.is_empty() {
-        "metadata changed".to_string()
-    } else {
-        changes.join(", ")
-    }
-}
-
-fn hostname() -> String {
-    fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn ioc(case: &PathBuf, args: IocArgs) -> Result<()> {
@@ -1137,7 +776,7 @@ fn ioc(case: &PathBuf, args: IocArgs) -> Result<()> {
         }
         IocCommand::Import { file } => {
             let mut store = Store::open_or_create(case)?;
-            let content = fs::read_to_string(&file)
+            let content = std::fs::read_to_string(&file)
                 .with_context(|| format!("failed to read IOC file {}", file.display()))?;
             let mut count = 0;
             for line in content.lines() {
@@ -1215,7 +854,12 @@ fn ioc(case: &PathBuf, args: IocArgs) -> Result<()> {
                     "ID", "TYPE", "VALUE", "ADDED"
                 );
                 for ioc in iocs {
-                    let added = local_time(ioc.added_utc, "second", "%Y-%m-%d %H:%M:%S");
+                    let added = fp_query::format_time(
+                        ioc.added_utc,
+                        "second",
+                        fp_query::Tz::Local,
+                        "%Y-%m-%d %H:%M:%S",
+                    );
                     println!(
                         "{:<6} {:<8} {:<36} {:<20} {}",
                         ioc.id,
@@ -1233,9 +877,17 @@ fn ioc(case: &PathBuf, args: IocArgs) -> Result<()> {
 
 fn export(case: &PathBuf, args: ExportArgs) -> Result<()> {
     let store = Store::open(case)?;
-    let filter = EventFilter {
-        since: args.since.as_deref().map(time::parse).transpose()?,
-        until: args.until.as_deref().map(time::parse).transpose()?,
+    let filter = fp_store::EventFilter {
+        since: args
+            .since
+            .as_deref()
+            .map(fp_query::time::parse)
+            .transpose()?,
+        until: args
+            .until
+            .as_deref()
+            .map(fp_query::time::parse)
+            .transpose()?,
         kinds: args.kind,
         hosts: args.host,
         match_text: args.r#match,
@@ -1328,22 +980,5 @@ fn detect_ioc_type(val: &str) -> String {
         "path".to_string()
     } else {
         "domain".to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn source_selection() {
-        let all = ["all".to_string()];
-        let pkg = ["pkg".to_string()];
-        let exact = ["shell.history".to_string()];
-        assert!(selected("chromium.history", &all));
-        assert!(selected("pkg.apt", &pkg) && selected("pkg.dpkg", &pkg));
-        assert!(!selected("pkgx.foo", &pkg));
-        assert!(selected("shell.history", &exact) && !selected("shell.historyx", &exact));
-        assert!(!selected("auth.journald", &[]));
     }
 }

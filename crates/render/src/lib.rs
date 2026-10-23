@@ -139,7 +139,7 @@ pub fn export_case(
             run_id: r.run_id,
             ts_utc: r.ts_utc,
             ts_local,
-            source_kind: r.kind.clone(),
+            source_kind: r.source_kind,
             app: r.app,
             profile: r.profile,
             kind: r.kind,
@@ -284,6 +284,8 @@ mod tests {
         assert!(!content.contains("supersecret123"));
         assert!(content.contains("token=<sha256:"));
         assert!(content.contains("\"ioc_hits\":[\"zoom.us\"]"));
+        assert!(content.contains("\"source_kind\":\"chromium.history\""));
+        assert!(content.contains("\"kind\":\"web.visit\""));
 
         // 2. CSV without redact
         let csv_out = dir.path().join("export.csv");

@@ -9,7 +9,7 @@ A local, read-only activity timeline and provenance tool for Linux. It reads the
 
 It never runs in the background, never modifies the files it reads, never opens secrets (cookies, saved passwords, wallets, keys), and never touches the network.
 
-> Status: early development. The collectors are done and verified against a real host; correlation (`trace`) is next. See [Roadmap](#roadmap).
+> Status: early development. Everything through the IOC and export milestones is done; the interactive TUI is next. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -21,8 +21,8 @@ Most of what a person does on a Linux desktop is already written down in small S
 
 | | |
 |---|---|
-| **Collectors** | Chromium family (Chrome, Chromium, Brave, Edge, Vivaldi, Opera; native, snap and flatpak; all profiles): visits, server and client redirects, downloads, searches, site permissions (granted and one-time use), extensions · XDM download manager · dpkg / apt, including rotated `.gz` logs · journald (`sudo`, `su`, `pkexec`, ssh logins) · bash / zsh / fish history · python / psql / mysql / sqlite3 / node REPL history · GTK recently used files |
-| **Planned collectors** | Firefox / Zen / LibreWolf · rpm / dnf, pacman, zypper, snap, flatpak · auth.log / secure · KDE recent documents · filesystem timeline (statx) · persistence snapshot · live processes and sockets · clamscan / rkhunter / chkrootkit import |
+| **Collectors** | Chromium family (Chrome, Chromium, Brave, Edge, Vivaldi, Opera; native, snap and flatpak; all profiles): visits, server and client redirects, downloads, searches, site permissions (granted and one-time use), extensions · XDM download manager · dpkg / apt, including rotated `.gz` logs · rpm/dnf, pacman, zypper, snap, flatpak · journald (`sudo`, `su`, `pkexec`, ssh logins) · auth.log / secure · wtmp/btmp logins · bash / zsh / fish history · python / psql / mysql / sqlite3 / node REPL history · GTK recently used files · KDE recent documents · filesystem timeline (native statx walker) · persistence snapshot (systemd, cron, autostart, rc files, PAM, SUID, git hooks) |
+| **Planned collectors** | Firefox / Zen / LibreWolf · live processes and sockets · clamscan / rkhunter / chkrootkit import |
 | **Fault-tolerant** | A source that fails is recorded as `error` and the run goes on; skipped lines mark it `partial`. Every source will be probed first: an app that isn't installed is a coverage note, and each kind of evidence gets a fallback chain (e.g. downloads: browser history → download managers → file xattrs → shell `curl`/`wget` → file times) |
 | **One time model** | WebKit, PRTime, Unix, journald, .NET binary, local-naive and RFC 3339 timestamps are all normalized to UTC; the raw value is always kept |
 | **Case database** | A single SQLite file (`0600`) with full-text search, idempotent re-runs (a second `collect` adds only what is new), and provenance for every event (source file, its sha256, and the exact row, cursor or line) |
@@ -108,10 +108,10 @@ crates/
 - Chromium collector, `list` / `show` / `search`
 - XDM, dpkg/apt, journald, shell and REPL history, desktop
 - fixes for bugs found on a real host
-- availability checks, coverage report, fallback sources — planned
-- correlation and `trace` — planned
-- filesystem timeline, persistence snapshot, `state`, `diff` — planned
-- IOCs and `export` — planned
+- availability checks, coverage report, fallback sources
+- correlation and `trace`
+- filesystem timeline, persistence snapshot, `state`, `diff`
+- IOCs and `export`
 - interactive TUI (`footprint tui`) — planned
 - Firefox family, live state, scanner import, polish — planned
 

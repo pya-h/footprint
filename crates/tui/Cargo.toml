@@ -1,0 +1,16 @@
+[package]
+name = "fp-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+fp-core = { path = "../core" }
+fp-store = { path = "../store" }
+fp-query = { path = "../query" }
+# the interactive terminal UI
+ratatui = { version = "0.30", features = ["crossterm"] }
+crossterm = "0.29"
+chrono = "0.4"
+anyhow = "1"
+serde_json = "1"

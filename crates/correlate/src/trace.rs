@@ -9,6 +9,51 @@ pub struct TraceOptions {
     pub target: String,
 }
 
+/// What the trace starts from: an artifact or a single event.
+#[derive(Debug, Clone)]
+pub enum TraceHead {
+    Artifact {
+        id: u64,
+        path: String,
+        sha256: Option<String>,
+        size: Option<i64>,
+    },
+    Event {
+        id: u64,
+        ts_utc: i64,
+        source: String,
+        kind: String,
+        subject: String,
+    },
+}
+
+/// One line of provenance below the head. `arrow` is which way the edge points:
+/// backward (◄, where the evidence came from) or forward (►, what it led to).
+#[derive(Debug, Clone)]
+pub struct TraceRow {
+    pub arrow: TraceArrow,
+    pub rel: String,
+    pub ts_utc: Option<i64>,
+    pub source: String,
+    pub text: String,
+    pub confidence: Option<String>,
+    /// set when the row is an event the UI can jump to
+    pub event_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceArrow {
+    Back,
+    Forward,
+    Note,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraceTree {
+    pub head: TraceHead,
+    pub rows: Vec<TraceRow>,
+}
+
 fn local_time_str(ts_utc: i64) -> String {
     DateTime::from_timestamp_micros(ts_utc)
         .map(|t| t.with_timezone(&Local).format("%H:%M:%S").to_string())
@@ -37,27 +82,17 @@ fn source_label(ev: &EventDetail) -> String {
     ev.source_kind.clone()
 }
 
-pub fn render_trace(store: &Store, target: &str) -> Result<String> {
-    let mut out = String::new();
-
-    // 1. Try finding an artifact
+/// Builds the provenance tree for an artifact path, URL, or event id.
+pub fn trace_tree(store: &Store, target: &str) -> Result<TraceTree> {
     let artifacts = store.list_artifacts()?;
-    let matched_art = find_artifact(&artifacts, target);
-
-    if let Some(art) = matched_art {
-        render_artifact_trace(store, art, &mut out)?;
-        return Ok(out);
+    if let Some(art) = find_artifact(&artifacts, target) {
+        return artifact_tree(store, art);
     }
-
-    // 2. Try parsing as event ID
     if let Ok(id) = target.parse::<u64>()
         && let Some(ev) = store.get_event(id)?
     {
-        render_event_trace(store, &ev, &mut out)?;
-        return Ok(out);
+        return event_tree(store, &ev);
     }
-
-    // 3. Try finding event by subject / URL
     let filter = fp_store::EventFilter {
         match_text: Some(target.to_string()),
         limit: Some(1),
@@ -67,11 +102,64 @@ pub fn render_trace(store: &Store, target: &str) -> Result<String> {
     if let Some(row) = events.first()
         && let Some(ev) = store.get_event(row.id)?
     {
-        render_event_trace(store, &ev, &mut out)?;
-        return Ok(out);
+        return event_tree(store, &ev);
     }
+    bail!("no artifact or event found matching '{target}'")
+}
 
-    bail!("no artifact or event found matching '{target}'");
+/// Renders the tree in the text form: `rel time source text`, `◄`/`►` per edge.
+pub fn render_tree(tree: &TraceTree) -> String {
+    let mut out = String::new();
+    match &tree.head {
+        TraceHead::Artifact {
+            path, sha256, size, ..
+        } => {
+            let sha_display = sha256
+                .as_ref()
+                .map(|h| format!("sha256 {}…  ", &h[..8.min(h.len())]))
+                .unwrap_or_default();
+            let size_display = size
+                .map(|s| format!("{} B", format_bytes(s)))
+                .unwrap_or_default();
+            out.push_str(&format!("artifact  {path}  {sha_display}{size_display}\n"));
+        }
+        TraceHead::Event {
+            id,
+            ts_utc,
+            source,
+            kind,
+            subject,
+        } => {
+            out.push_str(&format!(
+                "event {id}  {}  {source}  {kind}  {subject}\n",
+                local_time_str(*ts_utc)
+            ));
+        }
+    }
+    for row in &tree.rows {
+        let time = row
+            .ts_utc
+            .map(local_time_str)
+            .unwrap_or_else(|| "        ".to_string());
+        let arrow = match row.arrow {
+            TraceArrow::Back => "◄",
+            TraceArrow::Forward => "►",
+            TraceArrow::Note => "◄",
+        };
+        if row.arrow == TraceArrow::Note {
+            out.push_str(&format!(" {arrow} {}\n", row.text));
+        } else {
+            out.push_str(&format!(
+                " {arrow} {:<16} {time}  {:<16}  {}\n",
+                row.rel, row.source, row.text
+            ));
+        }
+    }
+    out
+}
+
+pub fn render_trace(store: &Store, target: &str) -> Result<String> {
+    Ok(render_tree(&trace_tree(store, target)?))
 }
 
 fn find_artifact<'a>(artifacts: &'a [ArtifactRow], target: &str) -> Option<&'a ArtifactRow> {
@@ -93,25 +181,15 @@ fn find_artifact<'a>(artifacts: &'a [ArtifactRow], target: &str) -> Option<&'a A
     })
 }
 
-fn render_artifact_trace(store: &Store, art: &ArtifactRow, out: &mut String) -> Result<()> {
-    let sha_display = art
-        .sha256
-        .as_ref()
-        .map(|h| format!("sha256 {}…  ", &h[..8.min(h.len())]))
-        .unwrap_or_default();
-
-    let size_display = art
-        .size
-        .map(|s| format!("{} B", format_bytes(s)))
-        .unwrap_or_default();
-
-    out.push_str(&format!(
-        "artifact  {}  {}{}\n",
-        art.path, sha_display, size_display
-    ));
-
-    // Backward edges: find downloads
+fn artifact_tree(store: &Store, art: &ArtifactRow) -> Result<TraceTree> {
+    let head = TraceHead::Artifact {
+        id: art.id,
+        path: art.path.clone(),
+        sha256: art.sha256.clone(),
+        size: art.size,
+    };
     let links = store.get_links_for("artifact", art.id)?;
+    let mut rows = Vec::new();
     let mut visited_events = HashSet::new();
 
     for link in &links {
@@ -121,14 +199,15 @@ fn render_artifact_trace(store: &Store, art: &ArtifactRow, out: &mut String) -> 
             && let Some(dl_ev) = store.get_event(link.dst_id)?
         {
             visited_events.insert(dl_ev.id);
-            let time = local_time_str(dl_ev.ts_utc);
-            let src = source_label(&dl_ev);
-            let url = dl_ev.subject.as_deref().unwrap_or("");
-
-            out.push_str(&format!(
-                " ◄ {:<16} {}  {:<16}  {}\n",
-                "downloaded_as", time, src, url
-            ));
+            rows.push(TraceRow {
+                arrow: TraceArrow::Back,
+                rel: "downloaded_as".into(),
+                ts_utc: Some(dl_ev.ts_utc),
+                source: source_label(&dl_ev),
+                text: dl_ev.subject.clone().unwrap_or_default(),
+                confidence: Some(link.confidence.clone()),
+                event_id: Some(dl_ev.id),
+            });
 
             let dl_links = store.get_links_for("event", dl_ev.id)?;
             let intercepted = link
@@ -139,11 +218,19 @@ fn render_artifact_trace(store: &Store, art: &ArtifactRow, out: &mut String) -> 
                     .iter()
                     .any(|l| l.why.as_deref().is_some_and(|w| w.contains("intercepted")));
             if intercepted {
-                out.push_str(" ◄ (no browser download row: XDM intercepted it)\n");
+                rows.push(TraceRow {
+                    arrow: TraceArrow::Note,
+                    rel: String::new(),
+                    ts_utc: None,
+                    source: String::new(),
+                    text: "(no browser download row: XDM intercepted it)".into(),
+                    confidence: None,
+                    event_id: None,
+                });
             }
 
             // Follow backward navigation chain from download event
-            walk_navigation_chain_backwards(store, dl_ev.id, &mut visited_events, out)?;
+            walk_navigation_chain_backwards(store, dl_ev.id, &mut visited_events, &mut rows)?;
         }
     }
 
@@ -155,14 +242,16 @@ fn render_artifact_trace(store: &Store, art: &ArtifactRow, out: &mut String) -> 
             && let Some(inst_ev) = store.get_event(link.dst_id)?
         {
             visited_events.insert(inst_ev.id);
-            let time = local_time_str(inst_ev.ts_utc);
-            let src = source_label(&inst_ev);
-            let cmd = extract_cmd_display(&inst_ev);
-
-            out.push_str(&format!(
-                " ► {:<16} {}  {:<16}  {}\n",
-                "installed_from", time, src, cmd
-            ));
+            let (cmd, extra) = cmd_display(&inst_ev);
+            rows.push(TraceRow {
+                arrow: TraceArrow::Forward,
+                rel: "installed_from".into(),
+                ts_utc: Some(inst_ev.ts_utc),
+                source: source_label(&inst_ev),
+                text: format!("{cmd}{extra}"),
+                confidence: Some(link.confidence.clone()),
+                event_id: Some(inst_ev.id),
+            });
 
             // Follow forward edges to pkg.install
             let inst_links = store.get_links_for("event", inst_ev.id)?;
@@ -172,26 +261,44 @@ fn render_artifact_trace(store: &Store, art: &ArtifactRow, out: &mut String) -> 
                     && p_link.rel == "pkg.install"
                     && let Some(pkg_ev) = store.get_event(p_link.dst_id)?
                 {
-                    let p_time = local_time_str(pkg_ev.ts_utc);
-                    let p_src = source_label(&pkg_ev);
-                    let p_summary = pkg_ev.summary.as_deref().unwrap_or("");
-                    out.push_str(&format!(
-                        " ► {:<16} {}  {:<16}  {}   dpkg --verify: OK\n",
-                        "pkg.install", p_time, p_src, p_summary
-                    ));
+                    let p_summary = pkg_ev.summary.clone().unwrap_or_default();
+                    rows.push(TraceRow {
+                        arrow: TraceArrow::Forward,
+                        rel: "pkg.install".into(),
+                        ts_utc: Some(pkg_ev.ts_utc),
+                        source: source_label(&pkg_ev),
+                        text: format!("{p_summary}   dpkg --verify: OK"),
+                        confidence: Some(p_link.confidence.clone()),
+                        event_id: Some(pkg_ev.id),
+                    });
                 }
             }
         }
     }
 
-    Ok(())
+    Ok(TraceTree { head, rows })
+}
+
+fn event_tree(store: &Store, ev: &EventDetail) -> Result<TraceTree> {
+    let head = TraceHead::Event {
+        id: ev.id,
+        ts_utc: ev.ts_utc,
+        source: source_label(ev),
+        kind: ev.kind.clone(),
+        subject: ev.subject.clone().unwrap_or_default(),
+    };
+    let mut rows = Vec::new();
+    let mut visited = HashSet::new();
+    visited.insert(ev.id);
+    walk_navigation_chain_backwards(store, ev.id, &mut visited, &mut rows)?;
+    Ok(TraceTree { head, rows })
 }
 
 fn walk_navigation_chain_backwards(
     store: &Store,
     start_event_id: u64,
     visited: &mut HashSet<u64>,
-    out: &mut String,
+    rows: &mut Vec<TraceRow>,
 ) -> Result<()> {
     let mut current_id = start_event_id;
 
@@ -212,42 +319,27 @@ fn walk_navigation_chain_backwards(
         visited.insert(next_id);
 
         if let Some(next_ev) = store.get_event(next_id)? {
-            let time = local_time_str(next_ev.ts_utc);
-            let src = source_label(&next_ev);
-            let url = next_ev.subject.as_deref().unwrap_or("");
             let qual = extract_qualifier(&next_ev);
             let qual_str = if qual.is_empty() {
                 String::new()
             } else {
                 format!("  {qual}")
             };
-
-            out.push_str(&format!(
-                " ◄ {:<16} {}  {:<16}  {}{}\n",
-                link.rel, time, src, url, qual_str
-            ));
-
+            rows.push(TraceRow {
+                arrow: TraceArrow::Back,
+                rel: link.rel.clone(),
+                ts_utc: Some(next_ev.ts_utc),
+                source: source_label(&next_ev),
+                text: format!("{}{qual_str}", next_ev.subject.clone().unwrap_or_default()),
+                confidence: Some(link.confidence.clone()),
+                event_id: Some(next_ev.id),
+            });
             current_id = next_id;
         } else {
             break;
         }
     }
 
-    Ok(())
-}
-
-fn render_event_trace(store: &Store, ev: &EventDetail, out: &mut String) -> Result<()> {
-    let time = local_time_str(ev.ts_utc);
-    let src = source_label(ev);
-    let subj = ev.subject.as_deref().unwrap_or("");
-    out.push_str(&format!(
-        "event {}  {}  {}  {}  {}\n",
-        ev.id, time, src, ev.kind, subj
-    ));
-
-    let mut visited = HashSet::new();
-    visited.insert(ev.id);
-    walk_navigation_chain_backwards(store, ev.id, &mut visited, out)?;
     Ok(())
 }
 
@@ -269,7 +361,8 @@ fn extract_qualifier(ev: &EventDetail) -> &'static str {
     ""
 }
 
-fn extract_cmd_display(ev: &EventDetail) -> String {
+/// The command (or commandline) an install/sudo event carries, with tty/requester context.
+pub fn cmd_display(ev: &EventDetail) -> (String, String) {
     let mut cmd = ev.subject.clone().unwrap_or_default();
     let mut extra = String::new();
 
@@ -289,5 +382,5 @@ fn extract_cmd_display(ev: &EventDetail) -> String {
             extra = format!("  (requested by {req})");
         }
     }
-    format!("{cmd}{extra}")
+    (cmd, extra)
 }

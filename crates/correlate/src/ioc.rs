@@ -215,9 +215,15 @@ fn match_event(ev: &EventDetail, ioc: &IocRow) -> Option<(String, String)> {
             {
                 for field in ["peer", "remote_ip", "ip"] {
                     if let Some(ip_str) = v.get(field).and_then(|ip| ip.as_str()) {
-                        let clean_ip = ip_str.split(':').next().unwrap_or(ip_str);
-                        if ip_matches_cidr(target, clean_ip) {
-                            return Some((format!("attrs.{field}"), clean_ip.to_string()));
+                        // keep IPv6 addresses whole; only `ipv4:port` loses its port
+                        let host = ip_str.trim_matches(['[', ']']);
+                        let host = if host.parse::<IpAddr>().is_ok() {
+                            host
+                        } else {
+                            host.split(':').next().unwrap_or(host)
+                        };
+                        if ip_matches_cidr(target, host) {
+                            return Some((format!("attrs.{field}"), host.to_string()));
                         }
                     }
                 }
@@ -490,6 +496,43 @@ mod tests {
         assert!(path_matches("/etc/cron*", "cat /etc/cron.d/malware;"));
         assert!(!path_matches("/tmp/evil.sh", "echo hello world"));
         assert!(!path_matches("evil.sh", "bash other_evil.sh"));
+    }
+
+    #[test]
+    fn ipv6_peer_is_not_split_at_colons() {
+        let ev = fp_store::EventDetail {
+            id: 1,
+            run_id: 1,
+            source_id: 1,
+            ts_utc: 100,
+            ts_precision: "exact".into(),
+            ts_raw: None,
+            ts_raw_format: None,
+            ts_tz_assumed: None,
+            kind: "net.listen".into(),
+            actor_json: None,
+            subject: Some("socket".into()),
+            subject_host: None,
+            summary: None,
+            attrs_json: Some(r#"{"peer":"2001:db8::1:443"}"#.into()),
+            locator: None,
+            prov_file: None,
+            prov_sha256: None,
+            confidence: "direct".into(),
+            source_kind: "live".into(),
+            app: None,
+            profile: None,
+        };
+        let ioc = IocRow {
+            id: 1,
+            ioc_type: "cidr".into(),
+            value: "2001:db8::/32".into(),
+            note: None,
+            added_utc: 0,
+        };
+        let (field, val) = match_event(&ev, &ioc).expect("IPv6 peer should match the CIDR");
+        assert_eq!(field, "attrs.peer");
+        assert_eq!(val, "2001:db8::1:443");
     }
 
     #[test]

@@ -14,12 +14,12 @@ fp-store = { path = "../store" }
 fp-collect = { path = "../collect" }
 fp-correlate = { path = "../correlate" }
 fp-render = { path = "../render" }
+fp-query = { path = "../query" }
+fp-tui = { path = "../tui" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-chrono = "0.4"
-libc = "0.2"
-tempfile = "3"
 serde_json = "1"
 
 [dev-dependencies]
 fp-fixtures = { path = "../fixtures" }
+tempfile = "3"

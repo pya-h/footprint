@@ -40,7 +40,9 @@ impl Collector for DesktopCollector {
     fn discover(&self, env: &Env) -> Vec<SourceInstance> {
         let path = env.home.join(XBEL);
         if !path.is_file() {
-            return Vec::new();
+            let mut inst = SourceInstance::new(self.kind(), "gtk-recent", None, path);
+            inst.status = fp_core::Availability::NotInstalled;
+            return vec![inst];
         }
         vec![SourceInstance::new(self.kind(), "gtk-recent", None, path)]
     }

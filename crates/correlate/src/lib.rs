@@ -11,7 +11,9 @@ use fp_store::Store;
 use std::path::Path;
 
 pub use ioc::{IocHit, check_iocs, correlate_iocs, match_event_iocs};
-pub use trace::render_trace;
+pub use trace::{
+    TraceArrow, TraceHead, TraceRow, TraceTree, render_trace, render_tree, trace_tree,
+};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CorrelateStats {

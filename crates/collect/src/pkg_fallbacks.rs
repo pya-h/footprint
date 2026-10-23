@@ -141,19 +141,12 @@ impl Collector for DnfCollector {
                 .or_else(|| line.find("Erased:"))
             {
                 let (ts_part, action_part) = line.split_at(i);
-                let first_word = ts_part.split_whitespace().next().unwrap_or_default();
-                (first_word, action_part)
+                (ts_part.trim(), action_part)
             } else {
                 continue;
             };
 
-            let Ok(stamp) = Stamp::parse(raw_ts, TimeFormat::Rfc3339, None).or_else(|_| {
-                Stamp::parse(
-                    raw_ts,
-                    TimeFormat::LocalNaive("%Y-%m-%d".into()),
-                    ctx.assume_tz.as_deref(),
-                )
-            }) else {
+            let Some(stamp) = parse_dnf_stamp(raw_ts, ctx.assume_tz.as_deref()) else {
                 continue;
             };
 
@@ -272,6 +265,96 @@ impl Collector for ZypperCollector {
     }
 }
 
+pub struct SnapCollector;
+
+impl Collector for SnapCollector {
+    fn kind(&self) -> &'static str {
+        "pkg.snap"
+    }
+
+    fn discover(&self, env: &Env) -> Vec<SourceInstance> {
+        let path =
+            Probe::tool_path(env, "snap").unwrap_or_else(|| env.system_path("/usr/bin/snap"));
+        let mut inst = SourceInstance::new(self.kind(), "snap", None, path);
+        if !inst.path.is_file() {
+            inst.status = Availability::NotInstalled;
+        }
+        vec![inst]
+    }
+
+    fn collect(&self, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut Sink) -> Result<()> {
+        let output = Command::new(&inst.path)
+            .args(["changes"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let Ok(out) = output else {
+            return Ok(());
+        };
+        if !out.status.success() {
+            return Ok(());
+        }
+
+        let origin = Origin {
+            file: &inst.path,
+            sha256: None,
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        for (idx, line) in text.lines().enumerate() {
+            // 1  Done  2026-10-16T21:08:00+03:30  2026-10-16T21:08:05+03:30  install  Install "zoom-client" snap
+            let mut parts = line.split_whitespace();
+            if parts.next().is_none_or(|id| id.parse::<u64>().is_err()) {
+                continue; // the header row
+            }
+            let _status = parts.next();
+            let Some(spawn) = parts.next() else {
+                continue;
+            };
+            let _ready = parts.next();
+            let Some(kind) = parts.next() else {
+                continue;
+            };
+            let summary = parts.collect::<Vec<_>>().join(" ");
+            let (kind, action) = match kind {
+                "install" => (EventKind::PkgInstall, "install"),
+                "refresh" => (EventKind::PkgUpgrade, "refresh"),
+                "remove" => (EventKind::PkgRemove, "remove"),
+                _ => continue,
+            };
+            let Ok(stamp) = Stamp::parse(spawn, TimeFormat::Rfc3339, None).or_else(|_| {
+                Stamp::parse(
+                    spawn,
+                    TimeFormat::LocalNaive("%Y-%m-%dT%H:%M:%S".into()),
+                    ctx.assume_tz.as_deref(),
+                )
+            }) else {
+                continue;
+            };
+            if !in_window(ctx, stamp.ts_utc) {
+                continue;
+            }
+            sink.event(fp_core::Event {
+                actor: Some(Actor::app("snap")),
+                attrs: json!({
+                    "action": action,
+                    "summary": summary,
+                }),
+                ..new_event(
+                    ctx,
+                    inst,
+                    stamp,
+                    kind,
+                    summary.clone(),
+                    format!("{action}: {summary}"),
+                    origin.at(format!("changes id, line {}", idx + 1)),
+                )
+            });
+        }
+        Ok(())
+    }
+}
+
 pub struct FlatpakCollector;
 
 impl Collector for FlatpakCollector {
@@ -355,9 +438,144 @@ impl Collector for FlatpakCollector {
     }
 }
 
+/// dnf stamps come in three shapes: `2026-10-16T21:08:00+0330` (offset without colon),
+/// `2026-10-16T21:08:00+03:30`, and `2026-10-16 21:08:00 INFO …` (level word follows the time).
+fn parse_dnf_stamp(text: &str, assume_tz: Option<&str>) -> Option<Stamp> {
+    let mut words = text.split_whitespace();
+    let first = words.next()?;
+    let mut candidates = vec![normalize_offset(first)];
+    if let Some(second) = words.next() {
+        candidates.push(format!("{first} {second}"));
+    }
+    for candidate in candidates {
+        if let Ok(stamp) = Stamp::parse(
+            candidate.clone(),
+            TimeFormat::LocalNaive("%Y-%m-%d %H:%M:%S".into()),
+            assume_tz,
+        ) {
+            return Some(stamp);
+        }
+        if let Ok(stamp) = Stamp::parse(candidate, TimeFormat::Rfc3339, None) {
+            return Some(stamp);
+        }
+    }
+    None
+}
+
+/// chrono's RFC 3339 needs `±HH:MM`; dnf writes `±HHMM`.
+fn normalize_offset(ts: &str) -> String {
+    let Some(pos) = ts.rfind(['+', '-']) else {
+        return ts.to_string();
+    };
+    let digits: String = ts[pos + 1..]
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    if digits.len() == 4 {
+        format!(
+            "{}{}{}:{}",
+            &ts[..pos],
+            &ts[pos..pos + 1],
+            &digits[..2],
+            &digits[2..]
+        )
+    } else {
+        ts.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_dnf_log_with_space_separated_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("dnf.log");
+        std::fs::write(
+            &log,
+            "2026-10-16 21:08:00 INFO Installed: zoom-7.2.1.x86_64\n\
+             2026-10-16T21:09:00+0330 SUBDEBUG Upgraded: curl-8.2.0.x86_64\n",
+        )
+        .unwrap();
+
+        let inst = SourceInstance::new("pkg.dnf", "dnf", None, log);
+        let ctx = CollectCtx {
+            run_id: 1,
+            since: None,
+            until: None,
+            assume_tz: Some("+03:30".into()),
+            temp_dir: dir.path().join("tmp"),
+        };
+        let mut sink = Sink::default();
+        DnfCollector.collect(&inst, &ctx, &mut sink).unwrap();
+
+        assert_eq!(sink.events.len(), 2);
+        assert_eq!(sink.events[0].kind, EventKind::PkgInstall);
+        // the time of day must not be dropped: 21:08:00 +03:30
+        assert_eq!(sink.events[0].ts_utc, 1_792_172_280_000_000);
+        // the colon-less `+0330` offset is normalized: 21:09:00 +03:30
+        assert_eq!(sink.events[1].kind, EventKind::PkgUpgrade);
+        assert_eq!(sink.events[1].ts_utc, 1_792_172_340_000_000);
+    }
+
+    #[test]
+    fn parses_snap_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("snap");
+        std::fs::write(
+            &snap,
+            "#!/bin/sh\nprintf '%s\n' \
+             'ID   Status  Spawn                     Ready                     Kind       Summary' \
+             '1    Done    2026-10-16T21:08:00+03:30  2026-10-16T21:08:05+03:30  install    Install \"zoom-client\" snap' \
+             '2    Done    2026-10-16T21:10:00+03:30  2026-10-16T21:10:03+03:30  refresh    Refresh snap \"curl\"' \
+             '3    Error   2026-10-16T21:12:00+03:30  -                         remove     Remove snap \"nano\"'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&snap, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let inst = SourceInstance::new("pkg.snap", "snap", None, snap);
+        let ctx = CollectCtx {
+            run_id: 1,
+            since: None,
+            until: None,
+            assume_tz: None,
+            temp_dir: dir.path().join("tmp"),
+        };
+        let mut sink = Sink::default();
+        SnapCollector.collect(&inst, &ctx, &mut sink).unwrap();
+
+        let got: Vec<_> = sink
+            .events
+            .iter()
+            .map(|e| (e.kind, e.ts_utc, e.summary.as_str()))
+            .collect();
+        assert!(
+            got.contains(&(
+                EventKind::PkgInstall,
+                1_792_172_280_000_000,
+                "install: Install \"zoom-client\" snap"
+            )),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&(
+                EventKind::PkgUpgrade,
+                1_792_172_400_000_000,
+                "refresh: Refresh snap \"curl\""
+            )),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&(
+                EventKind::PkgRemove,
+                1_792_172_520_000_000,
+                "remove: Remove snap \"nano\""
+            )),
+            "{got:?}"
+        );
+    }
 
     #[test]
     fn parses_pacman_log() {
