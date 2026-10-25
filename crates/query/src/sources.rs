@@ -90,7 +90,12 @@ const CATEGORIES: &[(&str, &[&str])] = &[
     ("Shell", &["shell.history"]),
     (
         "Desktop activity",
-        &["desktop.recent", "desktop.kde", "desktop.zeitgeist"],
+        &[
+            "desktop.recent",
+            "desktop.kde",
+            "desktop.kactivity",
+            "desktop.zeitgeist",
+        ],
     ),
 ];
 

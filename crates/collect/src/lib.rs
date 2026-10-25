@@ -42,6 +42,7 @@ pub fn registry() -> Vec<Box<dyn Collector>> {
         Box::new(shell::ShellCollector),
         Box::new(desktop::DesktopCollector),
         Box::new(desktop_fallbacks::KdeRecentCollector),
+        Box::new(desktop_fallbacks::KActivityCollector),
         Box::new(desktop_fallbacks::ZeitgeistCollector),
         Box::new(fs::FilesystemCollector),
         Box::new(persist::PersistCollector),

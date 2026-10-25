@@ -1,8 +1,8 @@
-//! Desktop activity fallbacks: KDE RecentDocuments and Zeitgeist.
+//! Desktop activity fallbacks: KDE RecentDocuments, kactivitymanagerd and Zeitgeist.
 
 use crate::collector::{CollectCtx, Collector, Env, Sink};
 use crate::event::{Origin, Stamp, new_event};
-use crate::utils::{file_uri_to_path, in_window};
+use crate::utils::{file_uri_to_path, in_window, read_evidence};
 use anyhow::Result;
 use fp_core::time::TimeFormat;
 use fp_core::{Actor, Availability, EventKind, SourceInstance};
@@ -11,6 +11,7 @@ use std::fs;
 
 const KDE_RECENT: &str = ".local/share/RecentDocuments";
 const ZEITGEIST_DB: &str = ".local/share/zeitgeist/activity.sqlite";
+const KACTIVITY_DB: &str = ".local/share/kactivitymanagerd/resources/database";
 
 pub struct KdeRecentCollector;
 
@@ -47,9 +48,14 @@ impl Collector for KdeRecentCollector {
             if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("desktop") {
                 continue;
             }
-            let Ok(text) = fs::read_to_string(&path) else {
-                continue;
+            let file = match read_evidence(&path) {
+                Ok(file) => file,
+                Err(e) => {
+                    sink.warn(format!("{}: {e:#}", path.display()));
+                    continue;
+                }
             };
+            let text = String::from_utf8_lossy(&file.bytes);
             let mut target_url = None;
             for line in text.lines() {
                 let line = line.trim();
@@ -82,7 +88,7 @@ impl Collector for KdeRecentCollector {
             let summary = format!("{target_path} [KDE]");
             let origin = Origin {
                 file: &path,
-                sha256: None,
+                sha256: Some(&file.sha256),
             };
 
             sink.event(fp_core::Event {
@@ -103,6 +109,40 @@ impl Collector for KdeRecentCollector {
                 )
             });
         }
+        Ok(())
+    }
+}
+
+/// Detect-only until a parser is verified against a real Plasma database.
+pub struct KActivityCollector;
+
+impl Collector for KActivityCollector {
+    fn kind(&self) -> &'static str {
+        "desktop.kactivity"
+    }
+
+    fn per_user(&self) -> bool {
+        true
+    }
+
+    fn discover(&self, env: &Env) -> Vec<SourceInstance> {
+        let mut inst = SourceInstance::new(
+            self.kind(),
+            "kactivitymanagerd",
+            None,
+            env.home.join(KACTIVITY_DB),
+        );
+        inst.status = if inst.path.exists() {
+            Availability::Unsupported {
+                reason: "kactivitymanagerd detected; parser not yet implemented".into(),
+            }
+        } else {
+            Availability::NotInstalled
+        };
+        vec![inst]
+    }
+
+    fn collect(&self, _inst: &SourceInstance, _ctx: &CollectCtx, _sink: &mut Sink) -> Result<()> {
         Ok(())
     }
 }

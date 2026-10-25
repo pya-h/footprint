@@ -84,7 +84,7 @@ impl Store {
 
     fn open_with(path: &Path, flags: OpenFlags) -> Result<Self, StoreError> {
         let conn = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        // parallel collection writes from several connections; wait briefly instead of failing
+        // a TUI reading while a collect writes: wait briefly for the lock instead of failing
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self {
             conn,
@@ -436,120 +436,27 @@ impl Store {
     }
 
     pub fn get_event(&self, id: u64) -> Result<Option<EventDetail>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT e.id, e.run_id, e.source_id, e.ts_utc, e.ts_precision, e.ts_raw, e.ts_raw_format,
-                    e.ts_tz_assumed, e.kind, e.actor_json, e.subject, e.subject_host, e.summary,
-                    e.attrs_json, e.locator, e.prov_file, e.prov_sha256, e.confidence,
-                    s.kind, s.app, s.profile
-             FROM events e JOIN sources s ON s.id = e.source_id
-             WHERE e.id = ?1",
-        )?;
-        let row = stmt
-            .query_row([id], |row| {
-                Ok(EventDetail {
-                    id: row.get(0)?,
-                    run_id: row.get(1)?,
-                    source_id: row.get(2)?,
-                    ts_utc: row.get(3)?,
-                    ts_precision: row.get(4)?,
-                    ts_raw: row.get(5)?,
-                    ts_raw_format: row.get(6)?,
-                    ts_tz_assumed: row.get(7)?,
-                    kind: row.get(8)?,
-                    actor_json: row.get(9)?,
-                    subject: row.get(10)?,
-                    subject_host: row.get(11)?,
-                    summary: row.get(12)?,
-                    attrs_json: row.get(13)?,
-                    locator: row.get(14)?,
-                    prov_file: row.get(15)?,
-                    prov_sha256: row.get(16)?,
-                    confidence: row.get(17)?,
-                    source_kind: row.get(18)?,
-                    app: row.get(19)?,
-                    profile: row.get(20)?,
-                })
-            })
-            .optional()?;
-        Ok(row)
+        let mut stmt = self
+            .conn
+            .prepare_cached(&format!("{EVENT_DETAIL_SELECT} WHERE e.id = ?1"))?;
+        Ok(stmt.query_row([id], EventDetail::from_row).optional()?)
     }
 
     pub fn get_all_events(&self) -> Result<Vec<EventDetail>, StoreError> {
-        let sql = "SELECT e.id, e.run_id, e.source_id, e.ts_utc, e.ts_precision, e.ts_raw, e.ts_raw_format,
-                    e.ts_tz_assumed, e.kind, e.actor_json, e.subject, e.subject_host, e.summary,
-                    e.attrs_json, e.locator, e.prov_file, e.prov_sha256, e.confidence,
-                    s.kind, s.app, s.profile
-             FROM events e JOIN sources s ON s.id = e.source_id
-             ORDER BY e.ts_utc, e.id";
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([], |row| {
-            Ok(EventDetail {
-                id: row.get(0)?,
-                run_id: row.get(1)?,
-                source_id: row.get(2)?,
-                ts_utc: row.get(3)?,
-                ts_precision: row.get(4)?,
-                ts_raw: row.get(5)?,
-                ts_raw_format: row.get(6)?,
-                ts_tz_assumed: row.get(7)?,
-                kind: row.get(8)?,
-                actor_json: row.get(9)?,
-                subject: row.get(10)?,
-                subject_host: row.get(11)?,
-                summary: row.get(12)?,
-                attrs_json: row.get(13)?,
-                locator: row.get(14)?,
-                prov_file: row.get(15)?,
-                prov_sha256: row.get(16)?,
-                confidence: row.get(17)?,
-                source_kind: row.get(18)?,
-                app: row.get(19)?,
-                profile: row.get(20)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        self.get_events_by_kinds(&[])
     }
 
+    /// Events of these kinds (all events when empty), oldest first.
     pub fn get_events_by_kinds(&self, kinds: &[&str]) -> Result<Vec<EventDetail>, StoreError> {
-        if kinds.is_empty() {
-            return self.get_all_events();
-        }
-        let placeholders = kinds.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!(
-            "SELECT e.id, e.run_id, e.source_id, e.ts_utc, e.ts_precision, e.ts_raw, e.ts_raw_format,
-                    e.ts_tz_assumed, e.kind, e.actor_json, e.subject, e.subject_host, e.summary,
-                    e.attrs_json, e.locator, e.prov_file, e.prov_sha256, e.confidence,
-                    s.kind, s.app, s.profile
-             FROM events e JOIN sources s ON s.id = e.source_id
-             WHERE e.kind IN ({placeholders})
-             ORDER BY e.ts_utc, e.id"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(kinds), |row| {
-            Ok(EventDetail {
-                id: row.get(0)?,
-                run_id: row.get(1)?,
-                source_id: row.get(2)?,
-                ts_utc: row.get(3)?,
-                ts_precision: row.get(4)?,
-                ts_raw: row.get(5)?,
-                ts_raw_format: row.get(6)?,
-                ts_tz_assumed: row.get(7)?,
-                kind: row.get(8)?,
-                actor_json: row.get(9)?,
-                subject: row.get(10)?,
-                subject_host: row.get(11)?,
-                summary: row.get(12)?,
-                attrs_json: row.get(13)?,
-                locator: row.get(14)?,
-                prov_file: row.get(15)?,
-                prov_sha256: row.get(16)?,
-                confidence: row.get(17)?,
-                source_kind: row.get(18)?,
-                app: row.get(19)?,
-                profile: row.get(20)?,
-            })
-        })?;
+        let filter = if kinds.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE e.kind IN ({})", vec!["?"; kinds.len()].join(","))
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "{EVENT_DETAIL_SELECT}{filter} ORDER BY e.ts_utc, e.id"
+        ))?;
+        let rows = stmt.query_map(params_from_iter(kinds), EventDetail::from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 

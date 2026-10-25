@@ -1,13 +1,14 @@
 use crate::collector::{CollectCtx, Collector, Env, Sink};
 use crate::event::{Origin, Stamp, new_event};
 use crate::utils::{
-    copy_db_set, extract_host, human_size, in_window, open_snapshot, stage_dir, table_has_columns,
+    copy_db_set, extract_host, guard, human_size, in_window, open_snapshot, stage_dir,
+    table_has_columns,
 };
 use anyhow::{Result, bail};
 use fp_core::time::TimeFormat;
 use fp_core::{Actor, Artifact, Availability, EventKind, SourceInstance};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const XDM_DB: &str = ".xdm-app-data/downloads.db";
 const XDM_JAVA_DIR: &str = ".xdman";
@@ -24,6 +25,32 @@ const COLUMNS: &[&str] = &[
 ];
 
 pub struct XdmCollector;
+
+/// A schema peek at the live original. `immutable=1` makes SQLite take no lock, read no WAL
+/// and create no `-shm`, so discovery can never touch it; collection still reads a copy.
+fn open_immutable(path: &Path) -> Result<rusqlite::Connection> {
+    guard(path)?;
+    let uri = format!("file:{}?mode=ro&immutable=1", percent_encode_path(path));
+    Ok(rusqlite::Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?)
+}
+
+/// SQLite URIs treat `?` and `#` as delimiters and `%` as an escape.
+fn percent_encode_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '%' => "%25".to_string(),
+            '?' => "%3f".to_string(),
+            '#' => "%23".to_string(),
+            c => c.to_string(),
+        })
+        .collect()
+}
 
 impl Collector for XdmCollector {
     fn per_user(&self) -> bool {
@@ -59,11 +86,7 @@ impl Collector for XdmCollector {
         if meta.as_ref().is_ok_and(|m| m.len() == 0) {
             inst.status = Availability::Empty;
         } else {
-            match rusqlite::Connection::open_with_flags(
-                &path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            ) {
+            match open_immutable(&path) {
                 Ok(conn) => match table_has_columns(&conn, "downloads", COLUMNS) {
                     Ok(true) => inst.status = Availability::Present,
                     Ok(false) => {
