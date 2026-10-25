@@ -122,11 +122,8 @@ fn walk_dir(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if guard(&path).is_err() {
-            continue;
-        }
-
-        if is_noise_dir(&path) {
+        // our own staging copies (browser databases being read right now) are not activity
+        if guard(&path).is_err() || is_noise_dir(&path) || path == ctx.temp_dir {
             continue;
         }
 
@@ -251,6 +248,34 @@ fn inspect_file(path: &Path, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walk_skips_the_runs_own_staging_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let stage = root.path().join("footprint-abc");
+        std::fs::create_dir_all(stage.join("src-1")).unwrap();
+        std::fs::write(stage.join("src-1/History"), b"copy").unwrap();
+        std::fs::write(root.path().join("dropper.sh"), b"x").unwrap();
+        let ctx = CollectCtx {
+            run_id: 1,
+            since: None,
+            until: None,
+            assume_tz: None,
+            temp_dir: stage,
+        };
+        let inst = SourceInstance::new("fs.statx", "tmp", None, root.path().to_path_buf());
+        let mut sink = Sink::default();
+        FilesystemCollector.collect(&inst, &ctx, &mut sink).unwrap();
+        let subjects: Vec<_> = sink.events.iter().map(|e| e.subject.as_str()).collect();
+        assert!(
+            subjects.iter().any(|s| s.ends_with("dropper.sh")),
+            "{subjects:?}"
+        );
+        assert!(
+            !subjects.iter().any(|s| s.contains("footprint-abc")),
+            "{subjects:?}"
+        );
+    }
 
     #[test]
     fn far_future_file_times_saturate() {
