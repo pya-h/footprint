@@ -195,6 +195,8 @@ pub fn run_collect(
     let env = build_env(params)?;
 
     let mut store = Store::open_or_create(case)?;
+    hand_case_to_sudo_uid(case);
+    let _interrupt = crate::interrupt::arm();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let run_id = store.insert_run(&fp_store::NewRun {
         host: &hostname(),
@@ -275,7 +277,12 @@ pub fn run_collect(
         }));
     }
     drop(job_rx);
+    let mut interrupted = false;
     for job in jobs {
+        if crate::interrupt::interrupted() {
+            interrupted = true;
+            break; // jobs not yet sent are dropped; workers finish what they hold
+        }
         let _ = job_tx.send(job);
     }
     drop(job_tx);
@@ -349,6 +356,9 @@ pub fn run_collect(
     for handle in handles {
         let _ = handle.join();
     }
+    if interrupted {
+        errors.push("interrupted by user; some sources were not collected".into());
+    }
 
     if let Err(e) = fp_correlate::correlate(&mut store, &env.root) {
         if let Some(p) = progress {
@@ -368,6 +378,25 @@ pub fn run_collect(
         let _ = p.send(CollectEvent::Finished(summary.clone()));
     }
     Ok(summary)
+}
+
+/// Running under sudo, the case must belong to the user who invoked it.
+fn hand_case_to_sudo_uid(case: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(sudo_uid) = std::env::var("SUDO_UID") else {
+        return;
+    };
+    let Ok(uid) = sudo_uid.parse::<libc::uid_t>() else {
+        return;
+    };
+    // only root can chown; as a regular user this is a no-op
+    if unsafe { libc::geteuid() } != 0 {
+        return;
+    }
+    let path = std::ffi::CString::new(case.as_os_str().as_bytes()).ok();
+    if let Some(path) = path {
+        let _ = unsafe { libc::chown(path.as_ptr(), uid, u32::MAX) };
+    }
 }
 
 #[cfg(test)]

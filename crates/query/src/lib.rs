@@ -7,6 +7,7 @@ mod collect;
 mod detail;
 mod diff;
 mod explain;
+mod interrupt;
 mod sources;
 mod state;
 mod timeline;
