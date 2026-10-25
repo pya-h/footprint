@@ -9,7 +9,7 @@ A local, read-only activity timeline and provenance tool for Linux. It reads the
 
 It never runs in the background, never modifies the files it reads, never opens secrets (cookies, saved passwords, wallets, keys), and never touches the network.
 
-> Status: early development. All planned milestones are done. See [Roadmap](#roadmap).
+> Status: the core feature set and the hardening review that followed are done; new work is picked from a curated backlog. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -21,13 +21,13 @@ Most of what a person does on a Linux desktop is already written down in small S
 
 | | |
 |---|---|
-| **Collectors** | Chromium family (Chrome, Chromium, Brave, Edge, Vivaldi, Opera; native, snap and flatpak; all profiles): visits, server and client redirects, downloads, searches, site permissions (granted and one-time use), extensions · Firefox family (Firefox, Zen, LibreWolf; native + snap): visits, redirects, downloads, site permissions, extensions · XDM download manager · dpkg / apt, including rotated `.gz` logs · rpm/dnf, pacman, zypper, snap, flatpak · journald (`sudo`, `su`, `pkexec`, ssh logins) · auth.log / secure · wtmp/btmp logins · bash / zsh / fish history · python / psql / mysql / sqlite3 / node REPL history · GTK recently used files · KDE recent documents · filesystem timeline (native statx walker) · persistence snapshot (systemd, cron, autostart, rc files, PAM, SUID, git hooks) |
+| **Collectors** | Chromium family (Chrome, Chromium, Brave, Edge, Vivaldi, Opera; native, snap and flatpak; all profiles): visits, server and client redirects, downloads, searches, site permissions (granted and one-time use), extensions · Firefox family (Firefox, Zen, LibreWolf; native, snap and flatpak; profiles named from `profiles.ini`): visits, redirects, downloads, site permissions, extensions · XDM download manager · dpkg / apt, including rotated `.gz` logs · rpm/dnf, pacman, zypper, snap, flatpak · journald (`sudo`, `su`, `pkexec`, ssh logins, `systemd-logind` sessions) · auth.log / secure · wtmp/btmp logins · bash / zsh / fish history · python / psql / mysql / sqlite3 / node REPL history · GTK recently used files · KDE recent documents · filesystem timeline (native statx walker) · persistence snapshot (systemd, cron, autostart, rc files, PAM, SUID, git hooks) |
 | **Opt-in capture** | `--with-live`: processes (flags for binaries in `/tmp`, hidden dirs or deleted), sockets (kernel sockets labeled), kernel modules not owned by a package, the tainted flag · `--with-scanners`: clamscan, rkhunter and chkrootkit findings, with `explain` for their known false positives |
 | **Detected, not parsed yet** | uGet, Motrix/aria2, KGet, JDownloader, older Java XDM, kactivitymanagerd, Zeitgeist (reported as `unsupported` in coverage) |
-| **Fault-tolerant** | Every source is probed first: an app that isn't installed is a coverage note, not an error. A source that fails is recorded as `error` (a crashing parser included) and the run goes on; skipped lines mark it `partial`. Each kind of evidence has a fallback chain (e.g. downloads: browser history → download managers → file xattrs → shell `curl`/`wget` → file times) |
+| **Fault-tolerant** | Every source is probed first: an app that isn't installed is a coverage note, not an error. A source that fails is recorded as `error` (a crashing parser included) and the run goes on; skipped lines mark it `partial`. Each kind of evidence has a fallback chain (e.g. downloads: browser history → download managers → file xattrs in the XDG download dir → shell `curl`/`wget` → file times) |
 | **One time model** | WebKit, PRTime, Unix, journald, .NET binary, local-naive and RFC 3339 timestamps are all normalized to UTC; the raw value is always kept |
 | **Case database** | A single SQLite file (`0600`) with full-text search, idempotent re-runs (a second `collect` adds only what is new), and provenance for every event (source file, its sha256, and the exact row, cursor or line) |
-| **Correlation** | Redirect chains, download → file → install links, untimed shell commands anchored to apt and sudo logs |
+| **Correlation** | Redirect chains, download → file → install links, untimed shell commands anchored to apt and sudo logs (repeated commands placed by history order) |
 | **Trace** | `footprint trace <file>` prints the full provenance chain with a confidence on every edge |
 | **State and diff** | Site permissions, extensions, startup units, cron, rc files, PAM, unowned SUID files, git hooks, with package ownership and integrity (`ok`, `mismatch`, `missing`, `unverified`, `unowned`); diff two runs |
 | **IOCs** | Domains, IPs/CIDRs, hashes, path globs, URL substrings, matched against everything collected |
@@ -93,14 +93,14 @@ It runs as your user. Some sources (the full journal, root's crontab, `/root`) n
 ## Limitations
 
 - **Untimed history** (bash without `HISTTIMEFORMAT`, REPLs) is stored as `(untimed)`. A line is placed in time only
-  when an identical apt or sudo command exists (it then takes that time, `derived`); a command repeated many times
-  is anchored to its earliest occurrence. `list --kind shell.command` shows them all.
+  when an identical apt or sudo command exists (it then takes that time, `derived`). A repeated command is matched
+  newest to newest, in history order, between its timed neighbours; lines older than the journal stay untimed, and a
+  command typed in a shell whose history wasn't saved yet can shift the match by one run. `list --kind shell.command`
+  shows them all.
 - **journald visibility**: outside the `adm`/`systemd-journal` groups you only see your own entries; `sources`
-  notes it. `systemd-logind` sessions are not collected yet.
+  notes it.
 - **Mounted images**: package ownership comes from the image's own dpkg database; integrity (`dpkg --verify`) only
   runs on the live host, so image files say `unverified`. rpm/pacman ownership is live-host only.
-- **Not verified on real data yet**: the flatpak history time format, and Firefox download times (both units are
-  accepted). Downloads with xattrs are looked for in `~/Downloads` only, not a localized `XDG_DOWNLOAD_DIR`.
 - **Symlinks**: the filesystem timeline never follows them, but other collectors read a symlinked source path
   (a history file, a profile dir) through to its target, which may lie outside the home.
 
