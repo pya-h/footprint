@@ -108,6 +108,45 @@ fn build_env(params: &CollectParams) -> Result<Env> {
     Ok(env)
 }
 
+/// What one worker collected; the main thread is the single writer (ingest, status).
+struct Outcome {
+    inst: SourceInstance,
+    label: String,
+    sink: Option<fp_collect::Sink>,
+    error: Option<String>,
+}
+
+/// Collects one source instance on a worker. No store access: the source row was
+/// inserted during discovery, so the id is already assigned for the staging dir.
+fn collect_only(
+    inst: SourceInstance,
+    collector: &dyn fp_collect::Collector,
+    ctx: &fp_collect::CollectCtx,
+    progress: Option<&Sender<CollectEvent>>,
+) -> Outcome {
+    let label = label(&inst);
+    if let Some(p) = progress {
+        let _ = p.send(CollectEvent::InstanceStarted {
+            label: label.clone(),
+        });
+    }
+    let mut sink = fp_collect::Sink::default();
+    match collector.collect(&inst, ctx, &mut sink) {
+        Ok(()) => Outcome {
+            inst,
+            label,
+            sink: Some(sink),
+            error: None,
+        },
+        Err(e) => Outcome {
+            inst,
+            label,
+            sink: None,
+            error: Some(format!("{e:#}")),
+        },
+    }
+}
+
 /// Runs one collection into `case`, reporting per-instance progress when a sender is given.
 pub fn run_collect(
     case: &Path,
@@ -180,80 +219,135 @@ pub fn run_collect(
         temp_dir: temp_dir.path().to_path_buf(),
     };
 
-    let mut errors = Vec::new();
-    let mut totals = IngestTotals::default();
-    let mut read = 0usize;
-    for collector in &collectors {
+    // discovery stays sequential (it is cheap) and assigns every source row up front,
+    // so workers never touch the store; collection of instances runs in parallel and
+    // the main thread is the single writer
+    struct Job {
+        collector: usize,
+        inst: SourceInstance,
+    }
+    let mut jobs = Vec::new();
+    for (ci, collector) in collectors.iter().enumerate() {
         for mut inst in collector.discover(&env) {
             inst.id = store.insert_source(run_id, &inst)?;
             if inst.status != Availability::Present {
                 continue;
             }
-            read += 1;
-            let label = label(&inst);
-            if let Some(p) = progress {
-                let _ = p.send(CollectEvent::InstanceStarted {
-                    label: label.clone(),
-                });
-            }
-            let mut sink = fp_collect::Sink::default();
-            if let Err(e) = collector.collect(&inst, &ctx, &mut sink) {
-                let error = format!("{e:#}");
-                store.update_source_status(inst.id, &Availability::Error(error.clone()), None)?;
-                if let Some(p) = progress {
-                    let _ = p.send(CollectEvent::InstanceError {
-                        label: label.clone(),
-                        error: error.clone(),
-                    });
-                }
-                errors.push(format!("{label}: {error}"));
-                continue;
-            }
-            let stats = store.ingest(
-                run_id,
-                &Batch {
-                    source_identity: &inst.identity(),
-                    events: &sink.events,
-                    states: &sink.states,
-                    artifacts: &sink.artifacts,
-                },
-            )?;
-            let inst_totals = IngestTotals {
-                events_new: stats.events_new,
-                events_known: stats.events_known,
-                states: stats.states,
-                artifacts: stats.artifacts,
-            };
-            totals.events_new += stats.events_new;
-            totals.events_known += stats.events_known;
-            totals.states += stats.states;
-            totals.artifacts += stats.artifacts;
-            let status = if !sink.warnings.is_empty() {
-                store.update_source_status(
-                    inst.id,
-                    &Availability::Partial,
-                    Some(&sink.warnings.join("; ")),
-                )?;
-                Availability::Partial
-            } else if stats.events_new == 0
-                && stats.events_known == 0
-                && stats.states == 0
-                && stats.artifacts == 0
-            {
-                store.update_source_status(inst.id, &Availability::Empty, Some("empty"))?;
-                Availability::Empty
-            } else {
-                Availability::Present
-            };
-            if let Some(p) = progress {
-                let _ = p.send(CollectEvent::InstanceDone {
-                    label,
-                    totals: inst_totals,
-                    warnings: sink.warnings.clone(),
-                    status,
-                });
-            }
+            jobs.push(Job {
+                collector: ci,
+                inst,
+            });
         }
+    }
+    let read = jobs.len();
+
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
+    let (outcome_tx, outcome_rx) = std::sync::mpsc::channel::<Outcome>();
+    let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+    let collectors = std::sync::Arc::new(collectors);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(read.max(1));
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let job_rx = job_rx.clone();
+        let outcome_tx = outcome_tx.clone();
+        let progress_tx = progress.cloned();
+        let ctx = ctx.clone();
+        let collectors = collectors.clone();
+        handles.push(std::thread::spawn(move || {
+            loop {
+                let job = job_rx
+                    .lock()
+                    .map(|rx| rx.recv())
+                    .ok()
+                    .and_then(|received| received.ok());
+                let Some(job) = job else {
+                    break;
+                };
+                let collector = &collectors[job.collector];
+                let outcome =
+                    collect_only(job.inst, collector.as_ref(), &ctx, progress_tx.as_ref());
+                let _ = outcome_tx.send(outcome);
+            }
+        }));
+    }
+    drop(job_rx);
+    for job in jobs {
+        let _ = job_tx.send(job);
+    }
+    drop(job_tx);
+    drop(outcome_tx); // workers hold the only remaining senders; iter() ends when they exit
+
+    let mut errors = Vec::new();
+    let mut totals = IngestTotals::default();
+    for outcome in outcome_rx.iter() {
+        let Outcome {
+            inst,
+            label,
+            sink,
+            error,
+        } = outcome;
+        if let Some(error) = error {
+            store.update_source_status(inst.id, &Availability::Error(error.clone()), None)?;
+            if let Some(p) = progress {
+                let _ = p.send(CollectEvent::InstanceError {
+                    label: label.clone(),
+                    error: error.clone(),
+                });
+            }
+            errors.push(format!("{label}: {error}"));
+            continue;
+        }
+        let Some(sink) = sink else { continue };
+        let stats = store.ingest(
+            run_id,
+            &Batch {
+                source_identity: &inst.identity(),
+                events: &sink.events,
+                states: &sink.states,
+                artifacts: &sink.artifacts,
+            },
+        )?;
+        totals.events_new += stats.events_new;
+        totals.events_known += stats.events_known;
+        totals.states += stats.states;
+        totals.artifacts += stats.artifacts;
+        let status = if !sink.warnings.is_empty() {
+            store.update_source_status(
+                inst.id,
+                &Availability::Partial,
+                Some(&sink.warnings.join("; ")),
+            )?;
+            Availability::Partial
+        } else if stats.events_new == 0
+            && stats.events_known == 0
+            && stats.states == 0
+            && stats.artifacts == 0
+        {
+            store.update_source_status(inst.id, &Availability::Empty, Some("empty"))?;
+            Availability::Empty
+        } else {
+            Availability::Present
+        };
+        if let Some(p) = progress {
+            let _ = p.send(CollectEvent::InstanceDone {
+                label,
+                totals: IngestTotals {
+                    events_new: stats.events_new,
+                    events_known: stats.events_known,
+                    states: stats.states,
+                    artifacts: stats.artifacts,
+                },
+                warnings: sink.warnings,
+                status,
+            });
+        }
+    }
+    for handle in handles {
+        let _ = handle.join();
     }
 
     if let Err(e) = fp_correlate::correlate(&mut store, &env.root) {

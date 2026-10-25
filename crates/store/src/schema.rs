@@ -84,6 +84,8 @@ impl Store {
 
     fn open_with(path: &Path, flags: OpenFlags) -> Result<Self, StoreError> {
         let conn = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        // parallel collection writes from several connections; wait briefly instead of failing
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let store = Self {
             conn,
             path: path.to_path_buf(),

@@ -95,6 +95,7 @@ impl Env {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct CollectCtx {
     pub run_id: u64,
     pub since: Option<i64>,
