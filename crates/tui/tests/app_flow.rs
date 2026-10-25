@@ -169,8 +169,8 @@ fn collect_runs_and_refreshes() {
     let before = app.rows.len();
 
     app.view = View::Collect;
-    // narrow the in-TUI collect to one cheap source so the test stays hermetic
-    app.collect.sources = "auth.wtmp".into();
+    // a detect-only source: it never emits events, whatever the host has installed
+    app.collect.sources = "dlmgr.detect".into();
     app.on_key(Key::Enter).unwrap();
     assert!(app.collect.running);
     for _ in 0..200 {
@@ -206,6 +206,17 @@ fn a_collect_that_cannot_start_reports_and_unblocks() {
     );
     let text = app.collect.summary.as_ref().unwrap();
     assert!(text.contains("collect failed"), "{text}");
+}
+
+#[test]
+fn a_bad_run_id_in_diff_is_a_message_not_an_exit() {
+    let case = setup();
+    let mut app = App::new(&case.db).unwrap();
+    app.view = View::Diff;
+    app.on_key(Key::Char('e')).unwrap();
+    app.on_key(Key::Char('x')).unwrap();
+    assert!(!app.on_key(Key::Enter).unwrap());
+    assert!(app.status.starts_with("diff:"), "{}", app.status);
 }
 
 #[test]

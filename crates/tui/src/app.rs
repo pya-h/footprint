@@ -301,8 +301,10 @@ impl App {
     }
 
     fn reload_state(&mut self) -> Result<()> {
+        // the last run's snapshot, like `footprint state`; older runs are what diff is for
+        let run = self.store.last_run_id()?;
         self.state_rows =
-            fp_query::state_records(&self.store, None, self.state_kind.as_deref(), None)?;
+            fp_query::state_records(&self.store, run, self.state_kind.as_deref(), None)?;
         self.state_selected = self
             .state_selected
             .min(self.state_rows.len().saturating_sub(1));
@@ -748,7 +750,10 @@ impl App {
                 Key::Tab => self.diff_field = 1 - self.diff_field,
                 Key::Enter => {
                     self.diff_editing = false;
-                    self.compute_diff()?;
+                    // a typo in a run id is a message, not the end of the session
+                    if let Err(e) = self.compute_diff() {
+                        self.status = format!("diff: {e:#}");
+                    }
                 }
                 Key::Backspace => {
                     let field = if self.diff_field == 0 {

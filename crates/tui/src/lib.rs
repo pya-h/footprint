@@ -63,13 +63,17 @@ fn event_loop(
             let crossterm::event::Event::Key(key) = crossterm::event::read()? else {
                 continue;
             };
-            if let Some(key) = convert_key(key)
-                && app.on_key(key)?
-            {
-                return Ok(());
+            if let Some(key) = convert_key(key) {
+                match app.on_key(key) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(e) => app.status = format!("error: {e:#}"),
+                }
             }
         }
-        app.poll_collect()?;
+        if let Err(e) = app.poll_collect() {
+            app.status = format!("error: {e:#}");
+        }
     }
 }
 
