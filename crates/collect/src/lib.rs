@@ -8,11 +8,13 @@ pub mod downloads;
 pub mod event;
 pub mod firefox;
 pub mod fs;
+pub mod live;
 pub mod persist;
 pub mod pkg;
 pub mod pkg_fallbacks;
 pub mod probe;
 pub mod redact;
+pub mod scan;
 pub mod shell;
 pub mod utils;
 pub mod xdm;
@@ -43,5 +45,7 @@ pub fn registry() -> Vec<Box<dyn Collector>> {
         Box::new(desktop_fallbacks::ZeitgeistCollector),
         Box::new(fs::FilesystemCollector),
         Box::new(persist::PersistCollector),
+        Box::new(live::LiveCollector),
+        Box::new(scan::ScannerCollector),
     ]
 }

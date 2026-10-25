@@ -21,6 +21,9 @@ pub struct CollectParams {
     pub homes: Vec<PathBuf>,
     pub all_users: bool,
     pub root: PathBuf,
+    /// opt-in collectors: excluded from `--sources all`
+    pub with_live: bool,
+    pub with_scanners: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -132,8 +135,19 @@ pub fn run_collect(
     } else {
         params.sources.clone()
     };
+    let explicit = |kind: &str| {
+        sources
+            .iter()
+            .filter(|s| *s != "all")
+            .any(|s| selected(kind, std::slice::from_ref(s)))
+    };
     let collectors: Vec<Box<dyn Collector>> = fp_collect::registry()
         .into_iter()
+        .filter(|c| match c.kind() {
+            "live.state" => params.with_live || explicit("live.state"),
+            "scan.import" => params.with_scanners || explicit("scan.import"),
+            _ => true,
+        })
         .filter(|c| selected(c.kind(), &sources) && !selected(c.kind(), &params.exclude))
         .collect();
     if collectors.is_empty() {

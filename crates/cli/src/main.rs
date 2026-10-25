@@ -49,6 +49,8 @@ enum Command {
     Ioc(IocArgs),
     /// Export timeline events to JSONL, CSV, or standalone HTML report
     Export(ExportArgs),
+    /// Explain a scanner finding: known false positives and the proof
+    Explain { finding: String },
     /// Interactive terminal UI (default: the case at --case)
     Tui,
 }
@@ -77,6 +79,12 @@ struct CollectArgs {
     /// root for system sources (`/var/log`, the journal), e.g. a mounted disk image
     #[arg(long, default_value = "/")]
     root: PathBuf,
+    /// also capture live state: processes, sockets, kernel modules, tainted flag
+    #[arg(long)]
+    with_live: bool,
+    /// also run clamscan / rkhunter / chkrootkit and import their findings
+    #[arg(long)]
+    with_scanners: bool,
 }
 
 #[derive(Args)]
@@ -240,6 +248,7 @@ fn main() -> Result<()> {
         Command::Diff(args) => diff(&cli.case, args),
         Command::Ioc(args) => ioc(&cli.case, args),
         Command::Export(args) => export(&cli.case, args),
+        Command::Explain { finding } => explain(&finding),
         Command::Tui => fp_tui::run(&cli.case),
     }
 }
@@ -254,6 +263,8 @@ fn collect(case: &Path, args: CollectArgs) -> Result<()> {
         homes: args.home,
         all_users: args.all_users,
         root: args.root,
+        with_live: args.with_live,
+        with_scanners: args.with_scanners,
     };
     let (tx, rx) = channel();
     let case_owned = case.to_path_buf();
@@ -897,6 +908,23 @@ fn export(case: &Path, args: ExportArgs) -> Result<()> {
         args.format,
         if args.redact { ", redacted" } else { "" }
     );
+    Ok(())
+}
+
+fn explain(finding: &str) -> Result<()> {
+    let hits = fp_query::explain(finding);
+    if hits.is_empty() {
+        println!("no known explanation for this finding; treat it as real until proven harmless");
+        return Ok(());
+    }
+    for (i, hit) in hits.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("{}", hit.title);
+        println!("  why:   {}", hit.why);
+        println!("  proof: {}", hit.proof);
+    }
     Ok(())
 }
 

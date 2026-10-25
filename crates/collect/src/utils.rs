@@ -102,7 +102,7 @@ pub fn read_evidence(path: &Path) -> Result<TextFile> {
     Ok(TextFile { bytes, sha256 })
 }
 
-fn read_capped(reader: impl Read) -> Result<Vec<u8>> {
+pub fn read_capped(reader: impl Read) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     reader.take(MAX_TEXT_BYTES + 1).read_to_end(&mut out)?;
     if out.len() as u64 > MAX_TEXT_BYTES {

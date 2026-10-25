@@ -6,6 +6,7 @@ pub mod time;
 mod collect;
 mod detail;
 mod diff;
+mod explain;
 mod sources;
 mod state;
 mod timeline;
@@ -13,6 +14,7 @@ mod timeline;
 pub use collect::{CollectEvent, CollectParams, CollectSummary, run_collect, selected};
 pub use detail::{EventDetailView, LinkDirection, LinkView, event_detail};
 pub use diff::{DiffChange, DiffEntry, diff_runs};
+pub use explain::{EXPLANATIONS, Explanation, explain};
 pub use sources::{CoverageRow, CoverageStatus, SourceView, coverage, sources};
 pub use state::{StateView, state_details, state_records};
 pub use timeline::{
