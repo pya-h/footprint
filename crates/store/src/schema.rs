@@ -285,6 +285,13 @@ impl Store {
         Ok(count)
     }
 
+    /// Drops every link of one relation, for passes that rebuild theirs from scratch.
+    pub fn delete_links(&mut self, rel: &str) -> Result<usize, StoreError> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM links WHERE rel = ?1", [rel])?)
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }

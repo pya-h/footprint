@@ -7,7 +7,8 @@ pub mod permissions;
 pub mod trace;
 
 use anyhow::Result;
-use fp_store::Store;
+use fp_store::{EventDetail, Store};
+use serde_json::Value;
 use std::path::Path;
 
 pub use ioc::{IocHit, check_iocs, correlate_iocs, match_event_iocs};
@@ -52,6 +53,45 @@ pub fn correlate(store: &mut Store, root: &Path) -> Result<CorrelateStats> {
     })
 }
 
+/// The command an event carries: sudo's `COMMAND=`, apt's `Commandline:`, or the subject.
+pub(crate) fn command_text(ev: &EventDetail) -> String {
+    ev.attrs_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|attrs| {
+            attrs
+                .get("command")
+                .or_else(|| attrs.get("commandline"))
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .or_else(|| ev.subject.clone())
+        .unwrap_or_default()
+}
+
+/// A command line as compared across sources: `sudo` and its flags dropped, the program reduced
+/// to its name, so sudo's `/usr/bin/apt install ./x.deb` equals the shell's `sudo apt install ./x.deb`.
+pub(crate) fn normalize_command(cmd: &str) -> String {
+    let mut words = cmd.split_whitespace().peekable();
+    if words
+        .peek()
+        .is_some_and(|w| *w == "sudo" || w.ends_with("/sudo"))
+    {
+        words.next();
+        while words.peek().is_some_and(|w| w.starts_with('-')) {
+            words.next();
+        }
+    }
+    let Some(program) = words.next() else {
+        return String::new();
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+    std::iter::once(program)
+        .chain(words)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +102,19 @@ mod tests {
     use fp_store::{Batch, NewRun};
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[test]
+    fn commands_compare_across_sudo_and_shell() {
+        assert_eq!(
+            normalize_command("/usr/bin/apt install ./zoom_amd64.deb"),
+            "apt install ./zoom_amd64.deb"
+        );
+        assert_eq!(
+            normalize_command("sudo -E apt   install ./zoom_amd64.deb"),
+            "apt install ./zoom_amd64.deb"
+        );
+        assert_eq!(normalize_command("  "), "");
+    }
 
     fn sample_event(
         inst_id: u64,

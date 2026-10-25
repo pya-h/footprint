@@ -139,6 +139,8 @@ pub enum LinkType {
     Event,
     Artifact,
     State,
+    /// an indicator in the case's `iocs` table
+    Ioc,
 }
 
 impl fmt::Display for LinkType {
@@ -147,6 +149,7 @@ impl fmt::Display for LinkType {
             LinkType::Event => "event",
             LinkType::Artifact => "artifact",
             LinkType::State => "state",
+            LinkType::Ioc => "ioc",
         })
     }
 }

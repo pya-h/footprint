@@ -4,7 +4,7 @@ use fp_store::{ArtifactRow, Store};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -17,31 +17,17 @@ pub fn correlate_downloads(store: &mut Store, root: &Path) -> Result<usize> {
 }
 
 fn sha256_file(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
+    io::copy(&mut File::open(path)?, &mut hasher)?;
     Ok(hex::encode(hasher.finalize()))
 }
 
-fn resolve_path(target_path: &str, root: &Path) -> Option<PathBuf> {
-    let p = Path::new(target_path);
-    if p.exists() {
-        return Some(p.to_path_buf());
-    }
-    if let Ok(stripped) = p.strip_prefix("/") {
-        let candidate = root.join(stripped);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+/// Where a recorded path lives now: inside `root` first (a mounted image), then as recorded
+/// (a live `--home` used next to an image `--root`).
+pub(crate) fn resolve_path(recorded: &str, root: &Path) -> Option<PathBuf> {
+    let p = Path::new(recorded);
+    let in_root = root.join(p.strip_prefix("/").unwrap_or(p));
+    [in_root, p.to_path_buf()].into_iter().find(|c| c.exists())
 }
 
 fn link_downloads_to_artifacts(store: &mut Store, root: &Path) -> Result<usize> {
@@ -76,26 +62,24 @@ fn link_downloads_to_artifacts(store: &mut Store, root: &Path) -> Result<usize> 
             }
         };
 
-        // If artifact doesn't have sha256/mtime yet, stat & hash it if present on disk
+        // a download target named like a wallet or key file is hashed by nobody
         if art.sha256.is_none()
+            && !fp_core::deny::is_secret(Path::new(&target))
             && let Some(real_path) = resolve_path(&target, root)
             && let Ok(meta) = std::fs::metadata(&real_path)
         {
-            let size = meta.len() as i64;
-            let mtime_ns = meta.mtime_nsec();
-            let ctime_ns = meta.ctime_nsec();
             let sha256 = sha256_file(&real_path).ok();
-            let _ = store.update_artifact_metadata(
+            store.update_artifact_metadata(
                 art.id,
                 &fp_store::ArtifactMeta {
                     sha256: sha256.as_deref(),
-                    size: Some(size),
-                    mtime_ns: Some(mtime_ns),
-                    ctime_ns: Some(ctime_ns),
+                    size: Some(meta.len() as i64),
+                    mtime_ns: Some(meta.mtime() * 1_000_000_000 + meta.mtime_nsec()),
+                    ctime_ns: Some(meta.ctime() * 1_000_000_000 + meta.ctime_nsec()),
                     btime_ns: None,
                     owner_pkg: None,
                 },
-            );
+            )?;
         }
 
         // Link artifact to download event

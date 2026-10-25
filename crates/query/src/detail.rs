@@ -148,6 +148,12 @@ fn target_label(store: &Store, target_type: &str, target_id: u64) -> Result<Stri
                 .ok();
             Ok(row.unwrap_or_else(|| format!("state {target_id}")))
         }
+        "ioc" => Ok(store
+            .list_iocs()?
+            .into_iter()
+            .find(|i| i.id == target_id)
+            .map(|i| format!("{} {}", i.ioc_type, i.value))
+            .unwrap_or_else(|| format!("ioc {target_id}"))),
         other => Ok(format!("{other} {target_id}")),
     }
 }

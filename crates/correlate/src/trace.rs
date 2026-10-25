@@ -261,13 +261,12 @@ fn artifact_tree(store: &Store, art: &ArtifactRow) -> Result<TraceTree> {
                     && p_link.rel == "pkg.install"
                     && let Some(pkg_ev) = store.get_event(p_link.dst_id)?
                 {
-                    let p_summary = pkg_ev.summary.clone().unwrap_or_default();
                     rows.push(TraceRow {
                         arrow: TraceArrow::Forward,
                         rel: "pkg.install".into(),
                         ts_utc: Some(pkg_ev.ts_utc),
                         source: source_label(&pkg_ev),
-                        text: format!("{p_summary}   dpkg --verify: OK"),
+                        text: pkg_ev.summary.clone().unwrap_or_default(),
                         confidence: Some(p_link.confidence.clone()),
                         event_id: Some(pkg_ev.id),
                     });

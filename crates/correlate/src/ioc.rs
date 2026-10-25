@@ -4,6 +4,8 @@ use fp_core::{Confidence, Link, LinkType};
 use fp_store::{EventDetail, IocRow, Store};
 use std::net::IpAddr;
 
+const IOC_MATCH: &str = "ioc_match";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct IocHit {
     pub ioc_id: u64,
@@ -28,8 +30,9 @@ pub fn check_iocs(store: &Store) -> Result<Vec<IocHit>> {
     // 1. Check Events
     let events = store.get_events_by_kinds(&[])?;
     for ev in &events {
+        let attrs = parse_json(ev.attrs_json.as_deref());
         for ioc in &iocs {
-            if let Some((field, val)) = match_event(ev, ioc) {
+            if let Some((field, val)) = match_event(ev, attrs.as_ref(), ioc) {
                 hits.push(IocHit {
                     ioc_id: ioc.id,
                     ioc_type: ioc.ioc_type.clone(),
@@ -73,8 +76,9 @@ pub fn check_iocs(store: &Store) -> Result<Vec<IocHit>> {
     // 3. Check State Records
     let state_rows = store.list_state(None, None, None)?;
     for st in &state_rows {
+        let value = parse_json(Some(&st.value_json));
         for ioc in &iocs {
-            if let Some((field, val)) = match_state(st, ioc) {
+            if let Some((field, val)) = match_state(st, value.as_ref(), ioc) {
                 hits.push(IocHit {
                     ioc_id: ioc.id,
                     ioc_type: ioc.ioc_type.clone(),
@@ -93,7 +97,9 @@ pub fn check_iocs(store: &Store) -> Result<Vec<IocHit>> {
     Ok(hits)
 }
 
+/// Rebuilt on every pass: an IOC deleted since the last one must not keep its links.
 pub fn correlate_iocs(store: &mut Store) -> Result<usize> {
+    store.delete_links(IOC_MATCH)?;
     let hits = check_iocs(store)?;
     let mut links = Vec::new();
 
@@ -108,8 +114,8 @@ pub fn correlate_iocs(store: &mut Store) -> Result<usize> {
         links.push(Link {
             src_type,
             src_id,
-            rel: "ioc_match".to_string(),
-            dst_type: LinkType::State,
+            rel: IOC_MATCH.to_string(),
+            dst_type: LinkType::Ioc,
             dst_id: hit.ioc_id,
             confidence: Confidence::Direct,
             why: Some(format!(
@@ -178,7 +184,11 @@ pub fn match_event_iocs(
     hits
 }
 
-fn match_event(ev: &EventDetail, ioc: &IocRow) -> Option<(String, String)> {
+fn match_event(
+    ev: &EventDetail,
+    attrs: Option<&serde_json::Value>,
+    ioc: &IocRow,
+) -> Option<(String, String)> {
     let ioc_type = ioc.ioc_type.to_lowercase();
     let target = ioc.value.trim();
 
@@ -195,8 +205,7 @@ fn match_event(ev: &EventDetail, ioc: &IocRow) -> Option<(String, String)> {
             {
                 return Some(("subject.host".to_string(), h));
             }
-            if let Some(ref attrs) = ev.attrs_json
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(attrs)
+            if let Some(v) = attrs
                 && let Some(url_str) = v.get("url").and_then(|u| u.as_str())
                 && let Some(h) = extract_host(url_str)
                 && domain_matches(target, &h)
@@ -210,9 +219,7 @@ fn match_event(ev: &EventDetail, ioc: &IocRow) -> Option<(String, String)> {
             {
                 return Some(("subject_host".to_string(), h.clone()));
             }
-            if let Some(ref attrs) = ev.attrs_json
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(attrs)
-            {
+            if let Some(v) = attrs {
                 for field in ["peer", "remote_ip", "ip"] {
                     if let Some(ip_str) = v.get(field).and_then(|ip| ip.as_str()) {
                         // keep IPv6 addresses whole; only `ipv4:port` loses its port
@@ -235,8 +242,7 @@ fn match_event(ev: &EventDetail, ioc: &IocRow) -> Option<(String, String)> {
             {
                 return Some(("prov_sha256".to_string(), sha.clone()));
             }
-            if let Some(ref attrs) = ev.attrs_json
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(attrs)
+            if let Some(v) = attrs
                 && let Some(sha) = v.get("sha256").and_then(|s| s.as_str())
                 && sha.eq_ignore_ascii_case(target)
             {
@@ -261,8 +267,7 @@ fn match_event(ev: &EventDetail, ioc: &IocRow) -> Option<(String, String)> {
             {
                 return Some(("subject".to_string(), subj.clone()));
             }
-            if let Some(ref attrs) = ev.attrs_json
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(attrs)
+            if let Some(v) = attrs
                 && let Some(url_str) = v.get("url").and_then(|u| u.as_str())
                 && url_str.contains(target)
             {
@@ -300,7 +305,11 @@ fn match_artifact(art: &fp_store::ArtifactRow, ioc: &IocRow) -> Option<(String, 
     None
 }
 
-fn match_state(st: &fp_store::StateRow, ioc: &IocRow) -> Option<(String, String)> {
+fn match_state(
+    st: &fp_store::StateRow,
+    value: Option<&serde_json::Value>,
+    ioc: &IocRow,
+) -> Option<(String, String)> {
     let ioc_type = ioc.ioc_type.to_lowercase();
     let target = ioc.value.trim();
 
@@ -309,7 +318,7 @@ fn match_state(st: &fp_store::StateRow, ioc: &IocRow) -> Option<(String, String)
             if domain_matches(target, &st.key) {
                 return Some(("state.key".to_string(), st.key.clone()));
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&st.value_json)
+            if let Some(v) = value
                 && let Some(origin) = v.get("origin").and_then(|o| o.as_str())
                 && let Some(h) = extract_host(origin)
                 && domain_matches(target, &h)
@@ -321,7 +330,7 @@ fn match_state(st: &fp_store::StateRow, ioc: &IocRow) -> Option<(String, String)
             if path_matches(target, &st.key) {
                 return Some(("state.key".to_string(), st.key.clone()));
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&st.value_json)
+            if let Some(v) = value
                 && let Some(p) = v.get("path").and_then(|p| p.as_str())
                 && path_matches(target, p)
             {
@@ -329,7 +338,7 @@ fn match_state(st: &fp_store::StateRow, ioc: &IocRow) -> Option<(String, String)
             }
         }
         "sha256" => {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&st.value_json)
+            if let Some(v) = value
                 && let Some(sha) = v.get("sha256").and_then(|s| s.as_str())
                 && sha.eq_ignore_ascii_case(target)
             {
@@ -339,6 +348,10 @@ fn match_state(st: &fp_store::StateRow, ioc: &IocRow) -> Option<(String, String)
         _ => {}
     }
     None
+}
+
+fn parse_json(raw: Option<&str>) -> Option<serde_json::Value> {
+    raw.and_then(|r| serde_json::from_str(r).ok())
 }
 
 pub fn domain_matches(ioc_domain: &str, candidate_host: &str) -> bool {
@@ -530,7 +543,9 @@ mod tests {
             note: None,
             added_utc: 0,
         };
-        let (field, val) = match_event(&ev, &ioc).expect("IPv6 peer should match the CIDR");
+        let attrs = parse_json(ev.attrs_json.as_deref());
+        let (field, val) =
+            match_event(&ev, attrs.as_ref(), &ioc).expect("IPv6 peer should match the CIDR");
         assert_eq!(field, "attrs.peer");
         assert_eq!(val, "2001:db8::1:443");
     }
