@@ -87,7 +87,7 @@ impl Collector for FilesystemCollector {
     }
 }
 
-fn is_noise_dir(path: &Path) -> bool {
+pub(crate) fn is_noise_dir(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };

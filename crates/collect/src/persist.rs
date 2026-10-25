@@ -774,25 +774,11 @@ impl<'a> UserPersistSnapshot<'a> {
         if !self.home.is_dir() {
             return;
         }
-        if let Ok(entries) = fs::read_dir(self.home) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let hook_dir = path.join(".git/hooks");
-                    if hook_dir.is_dir()
-                        && let Ok(hooks) = fs::read_dir(&hook_dir)
-                    {
-                        for hook in hooks.flatten() {
-                            let hp = hook.path();
-                            let name = hook.file_name();
-                            let name_str = name.to_string_lossy();
-                            if hp.is_file() && !name_str.ends_with(".sample") {
-                                self.emit_file_state("persist.git_hook", &hp, json!({}), sink);
-                            }
-                        }
-                    }
-                }
-            }
+        // repos live at ~/src/x, ~/work/y/...: find .git/hooks anywhere shallow
+        let mut hooks = Vec::new();
+        find_git_hooks(self.home, 0, &mut hooks);
+        for hook in hooks {
+            self.emit_file_state("persist.git_hook", &hook, json!({}), sink);
         }
     }
 
@@ -823,6 +809,41 @@ impl<'a> UserPersistSnapshot<'a> {
             self.ctx,
             sink,
         );
+    }
+}
+
+fn find_git_hooks(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 5 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == ".git" {
+            let hook_dir = path.join("hooks");
+            if let Ok(hooks) = fs::read_dir(&hook_dir) {
+                for hook in hooks.flatten() {
+                    let hp = hook.path();
+                    let hook_name = hook.file_name();
+                    let hook_name = hook_name.to_string_lossy();
+                    if hp.is_file() && !hook_name.ends_with(".sample") {
+                        out.push(hp);
+                    }
+                }
+            }
+            continue; // never descend into .git itself
+        }
+        if crate::fs::is_noise_dir(&path) {
+            continue;
+        }
+        find_git_hooks(&path, depth + 1, out);
     }
 }
 
