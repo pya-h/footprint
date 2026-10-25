@@ -30,6 +30,7 @@ enum Command {
         /// a run id; defaults to the last run
         #[arg(long, conflicts_with = "all_runs")]
         run: Option<u64>,
+        /// sources of every run, not just one
         #[arg(long)]
         all_runs: bool,
         /// show coverage report across evidence categories
@@ -60,8 +61,10 @@ enum Command {
 
 #[derive(Args)]
 struct CollectArgs {
+    /// start of the window (`2026-10-16T20:40`, `20:40`, `-24h`, `yesterday`, `@epoch`)
     #[arg(short, long, allow_hyphen_values = true)]
     since: Option<String>,
+    /// end of the window, in the same forms as `--since`
     #[arg(short, long, allow_hyphen_values = true)]
     until: Option<String>,
     /// source kinds or families to read (`chromium`, `pkg`, `shell.history`…)
@@ -92,14 +95,16 @@ struct CollectArgs {
 
 #[derive(Args)]
 struct ListArgs {
+    /// start of the window (`2026-10-16T20:40`, `20:40`, `-24h`, `yesterday`, `@epoch`)
     #[arg(short, long, allow_hyphen_values = true)]
     since: Option<String>,
+    /// end of the window, in the same forms as `--since`
     #[arg(short, long, allow_hyphen_values = true)]
     until: Option<String>,
     /// event kinds; `web.*` matches a family
     #[arg(short, long, value_delimiter = ',')]
     kind: Vec<String>,
-    /// source kinds or apps
+    /// source kinds or families, apps, or `app/profile`
     #[arg(long, value_delimiter = ',')]
     source: Vec<String>,
     /// hosts, each also matching its subdomains
@@ -111,6 +116,7 @@ struct ListArgs {
     /// aggregate count of events by dimension
     #[arg(long, value_enum)]
     group_by: Option<GroupBy>,
+    /// at most this many events
     #[arg(short, long)]
     limit: Option<usize>,
     /// newest first
@@ -197,14 +203,16 @@ struct ExportArgs {
     #[arg(long)]
     redact: bool,
 
+    /// start of the window (`2026-10-16T20:40`, `20:40`, `-24h`, `yesterday`, `@epoch`)
     #[arg(short, long, allow_hyphen_values = true)]
     since: Option<String>,
+    /// end of the window, in the same forms as `--since`
     #[arg(short, long, allow_hyphen_values = true)]
     until: Option<String>,
     /// event kinds; `web.*` matches a family
     #[arg(short, long, value_delimiter = ',')]
     kind: Vec<String>,
-    /// source kinds or apps
+    /// source kinds or families, apps, or `app/profile`
     #[arg(long, value_delimiter = ',')]
     source: Vec<String>,
     /// hosts, each also matching its subdomains
@@ -213,6 +221,7 @@ struct ExportArgs {
     /// substring of subject, summary or attributes
     #[arg(short, long)]
     r#match: Option<String>,
+    /// at most this many events
     #[arg(short, long)]
     limit: Option<usize>,
     /// newest first
