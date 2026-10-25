@@ -111,3 +111,14 @@ fn help_overlay_renders() {
     assert!(text.contains("PgUp/PgDn"), "{text}");
     assert!(text.contains("filter bar"), "{text}");
 }
+
+#[test]
+fn rows_render_in_the_zone_given_by_tz() {
+    let (_dir, db) = case_with_data();
+    let mut app = App::new(&db).unwrap();
+    // what `footprint --tz +03:30 tui` sets; the dpkg line was written at 21:08:00 +03:30
+    app.tz = fp_query::parse_tz("+03:30").unwrap();
+    let text = screen(&app, Theme { colors: false }, 160, 60);
+    assert!(text.contains("t:+03:30"), "{text}");
+    assert!(text.contains("21:08:00"), "{text}");
+}

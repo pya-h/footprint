@@ -11,8 +11,8 @@ use std::io::{IsTerminal, stdout};
 use std::path::Path;
 use std::time::Duration;
 
-/// Runs the TUI until the user quits.
-pub fn run(case: &Path) -> Result<()> {
+/// Runs the TUI until the user quits; times start in `tz` (the global `--tz`).
+pub fn run(case: &Path, tz: fp_query::Tz) -> Result<()> {
     if !case.exists() {
         bail!(
             "case file {} not found; run `footprint collect` first",
@@ -24,6 +24,7 @@ pub fn run(case: &Path) -> Result<()> {
     }
 
     let mut app = App::new(case)?;
+    app.tz = tz;
     // NO_COLOR (https://no-color.org): any value disables styling
     let theme = ui::Theme {
         colors: std::env::var_os("NO_COLOR").is_none(),

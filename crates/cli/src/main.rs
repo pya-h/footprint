@@ -270,7 +270,7 @@ fn main() -> Result<()> {
         Command::Ioc(args) => ioc(&cli.case, args, tz),
         Command::Export(args) => export(&cli.case, args),
         Command::Explain { finding } => explain(&finding),
-        Command::Tui => fp_tui::run(&cli.case),
+        Command::Tui => fp_tui::run(&cli.case, tz),
     }
 }
 
