@@ -243,6 +243,7 @@ mod tests {
             until: None,
             assume_tz: None,
             temp_dir: dir.path().into(),
+            own_files: Vec::new(),
         };
         let mut sink = Sink::default();
         DesktopCollector.collect(&inst, &ctx, &mut sink).unwrap();

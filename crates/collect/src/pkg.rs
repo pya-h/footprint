@@ -280,6 +280,7 @@ mod tests {
             until: None,
             assume_tz: Some("+03:30".into()),
             temp_dir: std::env::temp_dir(),
+            own_files: Vec::new(),
         }
     }
 

@@ -185,6 +185,7 @@ mod tests {
             until: None,
             assume_tz: None,
             temp_dir: std::env::temp_dir(),
+            own_files: Vec::new(),
         }
     }
 

@@ -122,8 +122,13 @@ fn walk_dir(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        // our own staging copies (browser databases being read right now) are not activity
-        if guard(&path).is_err() || is_noise_dir(&path) || path == ctx.temp_dir {
+        // our own staging copies (browser databases being read right now) and the case being
+        // written are not activity
+        if guard(&path).is_err()
+            || is_noise_dir(&path)
+            || path == ctx.temp_dir
+            || ctx.own_files.contains(&path)
+        {
             continue;
         }
 
@@ -250,18 +255,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn walk_skips_the_runs_own_staging_dir() {
+    fn walk_skips_the_runs_own_staging_dir_and_case() {
         let root = tempfile::tempdir().unwrap();
         let stage = root.path().join("footprint-abc");
         std::fs::create_dir_all(stage.join("src-1")).unwrap();
         std::fs::write(stage.join("src-1/History"), b"copy").unwrap();
         std::fs::write(root.path().join("dropper.sh"), b"x").unwrap();
+        let case = root.path().join("case.db");
+        std::fs::write(&case, b"db").unwrap();
+        std::fs::write(root.path().join("case.db-wal"), b"wal").unwrap();
         let ctx = CollectCtx {
             run_id: 1,
             since: None,
             until: None,
             assume_tz: None,
             temp_dir: stage,
+            own_files: vec![case.clone(), root.path().join("case.db-wal")],
         };
         let inst = SourceInstance::new("fs.statx", "tmp", None, root.path().to_path_buf());
         let mut sink = Sink::default();
@@ -272,7 +281,9 @@ mod tests {
             "{subjects:?}"
         );
         assert!(
-            !subjects.iter().any(|s| s.contains("footprint-abc")),
+            !subjects
+                .iter()
+                .any(|s| s.contains("footprint-abc") || s.contains("case.db")),
             "{subjects:?}"
         );
     }

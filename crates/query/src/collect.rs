@@ -251,6 +251,14 @@ pub fn run_collect(
         until,
         assume_tz: params.assume_tz.clone(),
         temp_dir: temp_dir.path().to_path_buf(),
+        own_files: ["", "-wal", "-shm", "-journal"]
+            .iter()
+            .map(|side| {
+                let mut name = case.as_os_str().to_owned();
+                name.push(side);
+                std::path::absolute(PathBuf::from(name)).unwrap_or_default()
+            })
+            .collect(),
     };
 
     // discovery stays sequential (it is cheap) and assigns every source row up front,

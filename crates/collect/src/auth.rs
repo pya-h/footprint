@@ -373,6 +373,7 @@ mod tests {
             until: None,
             assume_tz: None,
             temp_dir: "/tmp".into(),
+            own_files: Vec::new(),
         };
         let inst =
             SourceInstance::new("auth.journald", "journald", None, "/var/log/journal".into());

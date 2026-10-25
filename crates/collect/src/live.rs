@@ -427,6 +427,7 @@ mod tests {
             until: None,
             assume_tz: None,
             temp_dir: root.path().join("tmp"),
+            own_files: Vec::new(),
         };
         let mut sink = Sink::default();
         LiveCollector

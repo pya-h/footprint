@@ -391,6 +391,7 @@ mod tests {
             until: None,
             assume_tz: None,
             temp_dir: dir.path().join("tmp"),
+            own_files: Vec::new(),
         };
         let mut sink = Sink::default();
         WtmpCollector.collect(&inst, &ctx, &mut sink).unwrap();
@@ -451,6 +452,7 @@ mod tests {
             until: None,
             assume_tz: None,
             temp_dir: dir.path().join("tmp"),
+            own_files: Vec::new(),
         };
         let mut sink = Sink::default();
         AuthLogCollector.collect(&inst, &ctx, &mut sink).unwrap();
@@ -477,6 +479,7 @@ mod tests {
             until: None,
             assume_tz: None,
             temp_dir: dir.path().join("tmp"),
+            own_files: Vec::new(),
         };
         let mut sink = Sink::default();
         AuthLogCollector.collect(&inst, &ctx, &mut sink).unwrap();

@@ -147,6 +147,8 @@ pub struct CollectCtx {
     pub assume_tz: Option<String>,
     /// private (`0700`) staging dir; each source instance gets its own subdir
     pub temp_dir: PathBuf,
+    /// the case database and its side files: the tool's own writes, never activity
+    pub own_files: Vec<PathBuf>,
 }
 
 /// Everything one source instance produced; drained by the caller after each instance.

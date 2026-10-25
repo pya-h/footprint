@@ -545,6 +545,7 @@ mod tests {
             until: None,
             assume_tz: Some("+03:30".into()),
             temp_dir: dir.path().join("tmp"),
+            own_files: Vec::new(),
         };
         let mut sink = Sink::default();
         DnfCollector.collect(&inst, &ctx, &mut sink).unwrap();
@@ -580,6 +581,7 @@ mod tests {
             until: None,
             assume_tz: None,
             temp_dir: dir.path().join("tmp"),
+            own_files: Vec::new(),
         };
         let mut sink = Sink::default();
         SnapCollector.collect(&inst, &ctx, &mut sink).unwrap();
@@ -629,6 +631,7 @@ mod tests {
             until: None,
             assume_tz: None,
             temp_dir: dir.path().join("tmp"),
+            own_files: Vec::new(),
         };
         let err = SnapCollector
             .collect(&inst, &ctx, &mut Sink::default())
@@ -655,6 +658,7 @@ mod tests {
             until: None,
             assume_tz: Some("UTC".into()),
             temp_dir: dir.path().join("tmp"),
+            own_files: Vec::new(),
         };
         let mut sink = Sink::default();
         FlatpakCollector.collect(&inst, &ctx, &mut sink).unwrap();
@@ -706,6 +710,7 @@ mod tests {
             until: None,
             assume_tz: None,
             temp_dir: dir.path().join("tmp"),
+            own_files: Vec::new(),
         };
         let mut sink = Sink::default();
         PacmanCollector.collect(&inst, &ctx, &mut sink).unwrap();

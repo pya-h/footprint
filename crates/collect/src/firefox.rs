@@ -620,6 +620,7 @@ mod tests {
             until: None,
             assume_tz: None,
             temp_dir: dir.path().join("tmp"),
+            own_files: Vec::new(),
         };
         let mut sink = Sink::default();
         collect_visits(

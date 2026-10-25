@@ -60,6 +60,7 @@ fn ctx(dir: &Path) -> CollectCtx {
         until: None,
         assume_tz: Some("+03:30".into()),
         temp_dir: dir.join("tmp"),
+        own_files: Vec::new(),
     }
 }
 
