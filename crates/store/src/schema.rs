@@ -370,6 +370,22 @@ impl Store {
                 args.push(kind_pattern(kind).into());
             }
         }
+        if !filter.sources.is_empty() {
+            let clause = "(s.kind = ? OR s.kind LIKE ? ESCAPE '\\' OR s.app = ? \
+                 OR s.app || '/' || COALESCE(s.profile, '') = ? OR e.kind LIKE ? ESCAPE '\\')";
+            let clauses = vec![clause; filter.sources.len()];
+            sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
+            for source in &filter.sources {
+                let escaped = escape_like(source);
+                args.extend([
+                    source.clone().into(),
+                    format!("{escaped}.%").into(),
+                    source.clone().into(),
+                    source.clone().into(),
+                    format!("{escaped}%").into(),
+                ]);
+            }
+        }
         if let Some(text) = &filter.match_text {
             sql.push_str(
                 " AND (e.subject LIKE ? ESCAPE '\\' OR e.summary LIKE ? ESCAPE '\\' OR e.attrs_json LIKE ? ESCAPE '\\')",
@@ -723,6 +739,8 @@ pub struct EventFilter {
     pub kinds: Vec<String>,
     /// a host also matches its subdomains (`zoom.us` matches `cdn.zoom.us`)
     pub hosts: Vec<String>,
+    /// a source kind or family (`chromium`), an app, `app/profile`, or an event kind prefix
+    pub sources: Vec<String>,
     pub match_text: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -1337,6 +1355,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(store.list_events(&last).unwrap()[0].ts_utc, 400);
+
+        let by_source = EventFilter {
+            sources: vec!["chromium".into()],
+            limit: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(store.list_events(&by_source).unwrap().len(), 2);
+        let by_profile = EventFilter {
+            sources: vec!["Brave/Default".into()],
+            ..Default::default()
+        };
+        assert_eq!(store.list_events(&by_profile).unwrap().len(), 4);
+        let other_source = EventFilter {
+            sources: vec!["firefox".into()],
+            ..Default::default()
+        };
+        assert!(store.list_events(&other_source).unwrap().is_empty());
 
         let text = EventFilter {
             match_text: Some("us09".into()),

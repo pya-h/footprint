@@ -88,13 +88,14 @@ pub fn timeline(store: &Store, filter: &TimelineFilter) -> Result<Vec<TimelineRo
         until: filter.until,
         kinds: filter.kinds.clone(),
         hosts: filter.hosts.clone(),
+        sources: filter.sources.clone(),
         match_text: filter.match_text.clone(),
         limit: filter.limit,
         offset: filter.offset,
         reverse: filter.reverse,
     };
-    let iocs = store.list_iocs().unwrap_or_default();
-    let mut rows = store
+    let iocs = store.list_iocs()?;
+    let rows = store
         .list_events(&store_filter)?
         .into_iter()
         .map(|r| {
@@ -120,29 +121,13 @@ pub fn timeline(store: &Store, filter: &TimelineFilter) -> Result<Vec<TimelineRo
                 ioc_hits,
             }
         })
-        .collect::<Vec<_>>();
-    if !filter.sources.is_empty() {
-        rows.retain(|r| source_selected(r, &filter.sources));
-    }
+        .collect();
     Ok(rows)
-}
-
-/// A source pattern matches the app, the `app/profile`, the event kind, or a kind family.
-pub fn source_selected(row: &TimelineRow, patterns: &[String]) -> bool {
-    let app = row.app.as_deref().unwrap_or("");
-    let source_str = match (&row.app, &row.profile) {
-        (Some(a), Some(p)) => format!("{a}/{p}"),
-        (Some(a), None) => a.clone(),
-        _ => String::new(),
-    };
-    patterns
-        .iter()
-        .any(|s| s == &row.kind || s == app || s == &source_str || row.kind.starts_with(s.as_str()))
 }
 
 /// Full-text search over subjects, summaries and attributes (FTS5 syntax), with IOC hits.
 pub fn search(store: &Store, query: &str) -> Result<Vec<TimelineRow>> {
-    let iocs = store.list_iocs().unwrap_or_default();
+    let iocs = store.list_iocs()?;
     Ok(store
         .search_events(query)?
         .into_iter()

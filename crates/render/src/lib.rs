@@ -132,28 +132,13 @@ fn format_local_time(ts_utc: i64, precision: &str) -> String {
 pub fn export_case(
     store: &Store,
     filter: &EventFilter,
-    source_filters: &[String],
     format: ExportFormat,
     out_path: &Path,
     redact: bool,
 ) -> Result<usize> {
-    let mut rows = store.list_events_detailed(filter)?;
+    let rows = store.list_events_detailed(filter)?;
 
-    if !source_filters.is_empty() {
-        rows.retain(|r| {
-            let app = r.app.as_deref().unwrap_or("");
-            let source_str = match (&r.app, &r.profile) {
-                (Some(a), Some(p)) => format!("{a}/{p}"),
-                (Some(a), None) => a.clone(),
-                _ => String::new(),
-            };
-            source_filters.iter().any(|s| {
-                s == &r.kind || s == app || s == &source_str || r.kind.starts_with(s.as_str())
-            })
-        });
-    }
-
-    let iocs = store.list_iocs().unwrap_or_default();
+    let iocs = store.list_iocs()?;
 
     let mut events = Vec::with_capacity(rows.len());
     for r in rows {
@@ -324,8 +309,7 @@ mod tests {
 
         // 1. JSONL with redact
         let jsonl_out = dir.path().join("export.jsonl");
-        let count =
-            export_case(&store, &filter, &[], ExportFormat::Jsonl, &jsonl_out, true).unwrap();
+        let count = export_case(&store, &filter, ExportFormat::Jsonl, &jsonl_out, true).unwrap();
         assert_eq!(count, 1);
         let mode = fs::metadata(&jsonl_out).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -338,7 +322,7 @@ mod tests {
 
         // 2. CSV without redact
         let csv_out = dir.path().join("export.csv");
-        let count = export_case(&store, &filter, &[], ExportFormat::Csv, &csv_out, false).unwrap();
+        let count = export_case(&store, &filter, ExportFormat::Csv, &csv_out, false).unwrap();
         assert_eq!(count, 1);
         let csv_content = fs::read_to_string(&csv_out).unwrap();
         assert!(csv_content.starts_with("id,time_utc"));
@@ -347,7 +331,7 @@ mod tests {
 
         // 3. HTML
         let html_out = dir.path().join("export.html");
-        let count = export_case(&store, &filter, &[], ExportFormat::Html, &html_out, true).unwrap();
+        let count = export_case(&store, &filter, ExportFormat::Html, &html_out, true).unwrap();
         assert_eq!(count, 1);
         let html_content = fs::read_to_string(&html_out).unwrap();
         assert!(html_content.contains("<!DOCTYPE html>"));

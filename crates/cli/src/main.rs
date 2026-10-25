@@ -893,6 +893,7 @@ fn export(case: &Path, args: ExportArgs) -> Result<()> {
             .transpose()?,
         kinds: args.kind,
         hosts: args.host,
+        sources: args.source,
         match_text: args.r#match,
         limit: args.limit,
         offset: None,
@@ -905,7 +906,7 @@ fn export(case: &Path, args: ExportArgs) -> Result<()> {
         ExportCliFormat::Html => fp_render::ExportFormat::Html,
     };
 
-    let count = fp_render::export_case(&store, &filter, &args.source, fmt, &args.out, args.redact)?;
+    let count = fp_render::export_case(&store, &filter, fmt, &args.out, args.redact)?;
     println!(
         "exported {count} events to {} ({:?}{})",
         args.out.display(),
