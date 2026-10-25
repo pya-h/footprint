@@ -313,3 +313,29 @@ fn show_displays_provenance_links() {
     assert!(show_out.contains("links:"), "{show_out}");
     assert!(show_out.contains("downloaded_as"), "{show_out}");
 }
+
+#[test]
+fn tz_applies_to_every_read_command() {
+    let case = setup();
+    collect(&case);
+
+    let dpkg = events(&case.db, &["--kind", "pkg.install", "--source", "pkg.dpkg"]);
+    let id = dpkg[0]["id"].as_u64().unwrap().to_string();
+    // the dpkg line was written at 21:08:00 +03:30
+    let utc = footprint(&case.db, &["show", &id, "--tz", "UTC"]);
+    assert!(utc.contains("17:38:00.000000 +00:00"), "{utc}");
+    let local = footprint(&case.db, &["--tz", "+03:30", "show", &id]);
+    assert!(local.contains("21:08:00.000000 +03:30"), "{local}");
+
+    let listed = footprint(&case.db, &["list", "--kind", "pkg.install", "--tz", "UTC"]);
+    assert!(listed.contains("2026-10-16 17:38:00"), "{listed}");
+    let searched = footprint(&case.db, &["search", "zoom", "--tz", "+03:30"]);
+    assert!(searched.contains("2026-10-16 21:08:00"), "{searched}");
+
+    let deb_path = case.scenario.home.join("Downloads/Programs/zoom_amd64.deb");
+    let traced = footprint(
+        &case.db,
+        &["trace", deb_path.to_str().unwrap(), "--tz", "UTC"],
+    );
+    assert!(traced.contains("17:38:00"), "{traced}");
+}

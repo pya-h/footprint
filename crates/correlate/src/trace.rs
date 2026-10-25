@@ -1,5 +1,4 @@
 use anyhow::{Result, bail};
-use chrono::{DateTime, Local};
 use fp_store::{ArtifactRow, EventDetail, Store};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -54,12 +53,6 @@ pub struct TraceTree {
     pub rows: Vec<TraceRow>,
 }
 
-fn local_time_str(ts_utc: i64) -> String {
-    DateTime::from_timestamp_micros(ts_utc)
-        .map(|t| t.with_timezone(&Local).format("%H:%M:%S").to_string())
-        .unwrap_or_else(|| "--:--:--".to_string())
-}
-
 fn format_bytes(bytes: i64) -> String {
     let s = bytes.to_string();
     let mut out = String::new();
@@ -108,7 +101,8 @@ pub fn trace_tree(store: &Store, target: &str) -> Result<TraceTree> {
 }
 
 /// Renders the tree in the text form: `rel time source text`, `◄`/`►` per edge.
-pub fn render_tree(tree: &TraceTree) -> String {
+/// `time` turns a UTC µs instant into the clock text shown (the caller picks the zone).
+pub fn render_tree(tree: &TraceTree, time: &dyn Fn(i64) -> String) -> String {
     let mut out = String::new();
     match &tree.head {
         TraceHead::Artifact {
@@ -132,14 +126,14 @@ pub fn render_tree(tree: &TraceTree) -> String {
         } => {
             out.push_str(&format!(
                 "event {id}  {}  {source}  {kind}  {subject}\n",
-                local_time_str(*ts_utc)
+                time(*ts_utc)
             ));
         }
     }
     for row in &tree.rows {
         let time = row
             .ts_utc
-            .map(local_time_str)
+            .map(time)
             .unwrap_or_else(|| "        ".to_string());
         let arrow = match row.arrow {
             TraceArrow::Back => "◄",
@@ -158,8 +152,8 @@ pub fn render_tree(tree: &TraceTree) -> String {
     out
 }
 
-pub fn render_trace(store: &Store, target: &str) -> Result<String> {
-    Ok(render_tree(&trace_tree(store, target)?))
+pub fn render_trace(store: &Store, target: &str, time: &dyn Fn(i64) -> String) -> Result<String> {
+    Ok(render_tree(&trace_tree(store, target)?, time))
 }
 
 fn find_artifact<'a>(artifacts: &'a [ArtifactRow], target: &str) -> Option<&'a ArtifactRow> {

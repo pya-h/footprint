@@ -14,6 +14,9 @@ struct Cli {
     /// case file
     #[arg(short, long, global = true, default_value = "footprint.db")]
     case: PathBuf,
+    /// render times in this zone (`local`, `UTC`, `+03:30`)
+    #[arg(long, global = true, default_value = "local")]
+    tz: String,
     #[command(subcommand)]
     cmd: Command,
 }
@@ -113,9 +116,6 @@ struct ListArgs {
     /// newest first
     #[arg(short, long)]
     reverse: bool,
-    /// render times in this zone (`local`, `UTC`, `+03:30`)
-    #[arg(long)]
-    tz: Option<String>,
     #[arg(long, value_enum, default_value_t = Format::Table)]
     format: Format,
 }
@@ -244,6 +244,7 @@ fn clean(text: &str) -> String {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let tz = fp_query::parse_tz(&cli.tz)?;
     match cli.cmd {
         Command::Collect(args) => collect(&cli.case, args),
         Command::Sources {
@@ -251,13 +252,13 @@ fn main() -> Result<()> {
             all_runs,
             coverage,
         } => sources(&cli.case, run, all_runs, coverage),
-        Command::List(args) => list(&cli.case, args),
-        Command::Show { id } => show(&cli.case, id),
-        Command::Search { query } => search(&cli.case, &query),
-        Command::Trace { target } => trace(&cli.case, &target),
+        Command::List(args) => list(&cli.case, args, tz),
+        Command::Show { id } => show(&cli.case, id, tz),
+        Command::Search { query } => search(&cli.case, &query, tz),
+        Command::Trace { target } => trace(&cli.case, &target, tz),
         Command::State(args) => state(&cli.case, args),
         Command::Diff(args) => diff(&cli.case, args),
-        Command::Ioc(args) => ioc(&cli.case, args),
+        Command::Ioc(args) => ioc(&cli.case, args, tz),
         Command::Export(args) => export(&cli.case, args),
         Command::Explain { finding } => explain(&finding),
         Command::Tui => fp_tui::run(&cli.case),
@@ -379,7 +380,7 @@ fn sources(case: &Path, run: Option<u64>, all_runs: bool, coverage: bool) -> Res
     Ok(())
 }
 
-fn list(case: &Path, args: ListArgs) -> Result<()> {
+fn list(case: &Path, args: ListArgs, tz: fp_query::Tz) -> Result<()> {
     let store = Store::open(case)?;
     let filter = fp_query::TimelineFilter {
         since: args
@@ -405,12 +406,6 @@ fn list(case: &Path, args: ListArgs) -> Result<()> {
         reverse: args.reverse,
     };
     let rows = fp_query::timeline(&store, &filter)?;
-    let tz = args
-        .tz
-        .as_deref()
-        .map(fp_query::parse_tz)
-        .transpose()?
-        .unwrap_or(fp_query::Tz::Local);
     if let Some(gb) = args.group_by {
         print_grouped(rows, gb, args.format, args.limit, tz)
     } else {
@@ -534,16 +529,12 @@ fn print_rows(rows: Vec<fp_query::TimelineRow>, format: Format, tz: fp_query::Tz
     Ok(())
 }
 
-fn search(case: &Path, query: &str) -> Result<()> {
+fn search(case: &Path, query: &str, tz: fp_query::Tz) -> Result<()> {
     let store = Store::open(case)?;
-    print_rows(
-        fp_query::search(&store, query)?,
-        Format::Table,
-        fp_query::Tz::Local,
-    )
+    print_rows(fp_query::search(&store, query)?, Format::Table, tz)
 }
 
-fn show(case: &Path, id: u64) -> Result<()> {
+fn show(case: &Path, id: u64, tz: fp_query::Tz) -> Result<()> {
     let store = Store::open(case)?;
     let ev =
         fp_query::event_detail(&store, id)?.with_context(|| format!("event {id} not found"))?;
@@ -553,12 +544,7 @@ fn show(case: &Path, id: u64) -> Result<()> {
     field("run", &ev.run_id.to_string());
     field(
         "time",
-        &fp_query::format_time(
-            ev.ts_utc,
-            &ev.ts_precision,
-            fp_query::Tz::Local,
-            "%Y-%m-%d %H:%M:%S%.6f %:z",
-        ),
+        &fp_query::format_time(ev.ts_utc, &ev.ts_precision, tz, "%Y-%m-%d %H:%M:%S%.6f %:z"),
     );
     field("precision", &ev.ts_precision);
     field(
@@ -628,10 +614,14 @@ fn show(case: &Path, id: u64) -> Result<()> {
     Ok(())
 }
 
-fn trace(case: &Path, target: &str) -> Result<()> {
+fn trace(case: &Path, target: &str, tz: fp_query::Tz) -> Result<()> {
     // read-only: links were built by `collect`, which knew the run's --root
     let store = Store::open(case)?;
-    print!("{}", clean(&fp_correlate::render_trace(&store, target)?));
+    let time = |ts| fp_query::format_time(ts, "second", tz, "%H:%M:%S");
+    print!(
+        "{}",
+        clean(&fp_correlate::render_trace(&store, target, &time)?)
+    );
     Ok(())
 }
 
@@ -786,7 +776,7 @@ fn diff(case: &Path, args: DiffArgs) -> Result<()> {
     Ok(())
 }
 
-fn ioc(case: &Path, args: IocArgs) -> Result<()> {
+fn ioc(case: &Path, args: IocArgs, tz: fp_query::Tz) -> Result<()> {
     match args.cmd {
         IocCommand::Add {
             ioc_type,
@@ -889,12 +879,8 @@ fn ioc(case: &Path, args: IocArgs) -> Result<()> {
                     "ID", "TYPE", "VALUE", "ADDED"
                 );
                 for ioc in iocs {
-                    let added = fp_query::format_time(
-                        ioc.added_utc,
-                        "second",
-                        fp_query::Tz::Local,
-                        "%Y-%m-%d %H:%M:%S",
-                    );
+                    let added =
+                        fp_query::format_time(ioc.added_utc, "second", tz, "%Y-%m-%d %H:%M:%S");
                     println!(
                         "{:<6} {:<8} {:<36} {:<20} {}",
                         ioc.id,
