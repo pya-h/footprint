@@ -4,10 +4,11 @@ use crate::collector::{CollectCtx, Collector, Env, Sink};
 use crate::event::{Origin, Stamp, new_event};
 use crate::probe::Probe;
 use crate::utils::{in_window, read_evidence, with_rotations};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use fp_core::time::TimeFormat;
 use fp_core::{Actor, Availability, EventKind, SourceInstance};
 use serde_json::json;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 const PACMAN_LOG: &str = "/var/log/pacman.log";
@@ -283,52 +284,27 @@ impl Collector for SnapCollector {
     }
 
     fn collect(&self, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut Sink) -> Result<()> {
-        let output = Command::new(&inst.path)
-            .args(["changes"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        let Ok(out) = output else {
-            return Ok(());
-        };
-        if !out.status.success() {
-            return Ok(());
-        }
-
+        let text = run_listing(&inst.path, &["changes", "--abs-time"])?;
         let origin = Origin {
             file: &inst.path,
             sha256: None,
         };
-        let text = String::from_utf8_lossy(&out.stdout);
-        for (idx, line) in text.lines().enumerate() {
-            // 1  Done  2026-10-16T21:08:00+03:30  2026-10-16T21:08:05+03:30  install  Install "zoom-client" snap
+        for line in text.lines() {
+            // 771  Done  2026-10-25T03:40:33+03:30  2026-10-25T03:40:34+03:30  Remove "ngrok" snap
             let mut parts = line.split_whitespace();
-            if parts.next().is_none_or(|id| id.parse::<u64>().is_err()) {
+            let Some(id) = parts.next().filter(|id| id.parse::<u64>().is_ok()) else {
                 continue; // the header row
-            }
-            let _status = parts.next();
+            };
+            let status = parts.next().unwrap_or_default();
             let Some(spawn) = parts.next() else {
                 continue;
             };
             let _ready = parts.next();
-            let Some(kind) = parts.next() else {
+            let summary = parts.collect::<Vec<_>>().join(" ");
+            let Some(kind) = snap_change_kind(&summary) else {
                 continue;
             };
-            let summary = parts.collect::<Vec<_>>().join(" ");
-            let (kind, action) = match kind {
-                "install" => (EventKind::PkgInstall, "install"),
-                "refresh" => (EventKind::PkgUpgrade, "refresh"),
-                "remove" => (EventKind::PkgRemove, "remove"),
-                _ => continue,
-            };
-            let Ok(stamp) = Stamp::parse(spawn, TimeFormat::Rfc3339, None).or_else(|_| {
-                Stamp::parse(
-                    spawn,
-                    TimeFormat::LocalNaive("%Y-%m-%dT%H:%M:%S".into()),
-                    ctx.assume_tz.as_deref(),
-                )
-            }) else {
+            let Ok(stamp) = Stamp::parse(spawn, TimeFormat::Rfc3339, None) else {
                 continue;
             };
             if !in_window(ctx, stamp.ts_utc) {
@@ -337,7 +313,8 @@ impl Collector for SnapCollector {
             sink.event(fp_core::Event {
                 actor: Some(Actor::app("snap")),
                 attrs: json!({
-                    "action": action,
+                    "change_id": id,
+                    "status": status,
                     "summary": summary,
                 }),
                 ..new_event(
@@ -346,8 +323,8 @@ impl Collector for SnapCollector {
                     stamp,
                     kind,
                     summary.clone(),
-                    format!("{action}: {summary}"),
-                    origin.at(format!("changes id, line {}", idx + 1)),
+                    format!("{summary} ({status})"),
+                    origin.at(format!("change id={id}")),
                 )
             });
         }
@@ -373,28 +350,16 @@ impl Collector for FlatpakCollector {
     }
 
     fn collect(&self, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut Sink) -> Result<()> {
-        let output = Command::new(&inst.path)
-            .args(["history", "--columns=time,change,application"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-
-        let Ok(out) = output else {
-            return Ok(());
-        };
-        if !out.status.success() {
-            return Ok(());
-        }
-
+        let text = run_listing(
+            &inst.path,
+            &["history", "--columns=time,change,application"],
+        )?;
         let origin = Origin {
             file: &inst.path,
             sha256: None,
         };
-        let text = String::from_utf8_lossy(&out.stdout);
 
-        for (idx, line) in text.lines().enumerate() {
-            let line_no = idx + 1;
+        for line in text.lines() {
             let parts: Vec<&str> = line.split('\t').map(|s| s.trim()).collect();
             if parts.len() < 3 {
                 continue;
@@ -411,10 +376,15 @@ impl Collector for FlatpakCollector {
             }
             let change = parts[1];
             let app = parts[2];
-            let kind = match change {
-                "install" | "update" => EventKind::PkgInstall,
-                "uninstall" => EventKind::PkgRemove,
-                _ => EventKind::PkgInstall,
+            // `deploy install`, `deploy update`, `uninstall`; remote changes are not packages
+            let kind = if change.contains("uninstall") {
+                EventKind::PkgRemove
+            } else if change.contains("update") {
+                EventKind::PkgUpgrade
+            } else if change.contains("install") {
+                EventKind::PkgInstall
+            } else {
+                continue;
             };
             let summary = format!("{change} {app}");
             sink.event(fp_core::Event {
@@ -430,11 +400,43 @@ impl Collector for FlatpakCollector {
                     kind,
                     app.to_string(),
                     summary,
-                    origin.at(format!("row {line_no}")),
+                    origin.at(format!("history {change} {app}")),
                 )
             });
         }
         Ok(())
+    }
+}
+
+/// Runs a package tool's listing with a fixed argv; a failure is an error, never an empty result.
+fn run_listing(tool: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new(tool)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("spawn {}", tool.display()))?;
+    if !out.status.success() {
+        bail!(
+            "{} {} exited {}: {}",
+            tool.display(),
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `snap changes` has no kind column; the summary starts with the verb
+/// (`Install "x" snap`, `Remove "x" snap`, `Refresh "x" snap`, `Auto-refresh snaps "a", "b"`).
+fn snap_change_kind(summary: &str) -> Option<EventKind> {
+    match summary.split_whitespace().next()? {
+        "Install" => Some(EventKind::PkgInstall),
+        "Remove" => Some(EventKind::PkgRemove),
+        "Refresh" | "Auto-refresh" | "Revert" => Some(EventKind::PkgUpgrade),
+        _ => None,
     }
 }
 
@@ -522,18 +524,17 @@ mod tests {
     #[test]
     fn parses_snap_changes() {
         let dir = tempfile::tempdir().unwrap();
-        let snap = dir.path().join("snap");
-        std::fs::write(
-            &snap,
-            "#!/bin/sh\nprintf '%s\n' \
-             'ID   Status  Spawn                     Ready                     Kind       Summary' \
-             '1    Done    2026-10-16T21:08:00+03:30  2026-10-16T21:08:05+03:30  install    Install \"zoom-client\" snap' \
-             '2    Done    2026-10-16T21:10:00+03:30  2026-10-16T21:10:03+03:30  refresh    Refresh snap \"curl\"' \
-             '3    Error   2026-10-16T21:12:00+03:30  -                         remove     Remove snap \"nano\"'\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&snap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // the real `snap changes --abs-time` layout: no kind column, the verb leads the summary
+        let snap = crate::utils::script_tool(
+            dir.path(),
+            "snap",
+            "[ \"$1 $2\" = 'changes --abs-time' ] || exit 1\nprintf '%s\\n' \\\n\
+             'ID   Status  Spawn                      Ready                      Summary' \\\n\
+             '1    Done    2026-10-16T21:08:00+03:30  2026-10-16T21:08:05+03:30  Install \"zoom-client\" snap' \\\n\
+             '2    Done    2026-10-16T21:10:00+03:30  2026-10-16T21:10:03+03:30  Auto-refresh snaps \"curl\", \"core22\"' \\\n\
+             '3    Error   2026-10-16T21:12:00+03:30  -                          Remove \"nano\" snap' \\\n\
+             '4    Done    2026-10-16T21:13:00+03:30  2026-10-16T21:13:01+03:30  Regenerate security profiles'",
+        );
 
         let inst = SourceInstance::new("pkg.snap", "snap", None, snap);
         let ctx = CollectCtx {
@@ -551,11 +552,13 @@ mod tests {
             .iter()
             .map(|e| (e.kind, e.ts_utc, e.summary.as_str()))
             .collect();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(sink.events[0].provenance.locator, "change id=1");
         assert!(
             got.contains(&(
                 EventKind::PkgInstall,
                 1_792_172_280_000_000,
-                "install: Install \"zoom-client\" snap"
+                "Install \"zoom-client\" snap (Done)"
             )),
             "{got:?}"
         );
@@ -563,7 +566,7 @@ mod tests {
             got.contains(&(
                 EventKind::PkgUpgrade,
                 1_792_172_400_000_000,
-                "refresh: Refresh snap \"curl\""
+                "Auto-refresh snaps \"curl\", \"core22\" (Done)"
             )),
             "{got:?}"
         );
@@ -571,10 +574,29 @@ mod tests {
             got.contains(&(
                 EventKind::PkgRemove,
                 1_792_172_520_000_000,
-                "remove: Remove snap \"nano\""
+                "Remove \"nano\" snap (Error)"
             )),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn failing_tool_is_an_error_not_an_empty_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap =
+            crate::utils::script_tool(dir.path(), "snap", "echo 'cannot communicate' >&2; exit 1");
+        let inst = SourceInstance::new("pkg.snap", "snap", None, snap);
+        let ctx = CollectCtx {
+            run_id: 1,
+            since: None,
+            until: None,
+            assume_tz: None,
+            temp_dir: dir.path().join("tmp"),
+        };
+        let err = SnapCollector
+            .collect(&inst, &ctx, &mut Sink::default())
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("cannot communicate"), "{err:#}");
     }
 
     #[test]

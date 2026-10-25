@@ -186,6 +186,26 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Installs an executable `#!/bin/sh` script for tests that spawn a fake tool.
+#[cfg(test)]
+pub(crate) fn script_tool(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let staged = dir.join(format!(".{name}.staged"));
+    fs::write(&staged, format!("#!/bin/sh\n{body}\n")).expect("write script");
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod script");
+    // copied by a child process: a sibling test forking while this process held the write fd
+    // would keep it open in its child and exec would fail with ETXTBSY
+    let path = dir.join(name);
+    let copied = std::process::Command::new("cp")
+        .arg("-p")
+        .arg(&staged)
+        .arg(&path)
+        .status()
+        .expect("spawn cp");
+    assert!(copied.success(), "cp {}", path.display());
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

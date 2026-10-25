@@ -176,14 +176,7 @@ impl Collector for ScannerCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn script_tool(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
+    use crate::utils::script_tool;
 
     fn ctx() -> CollectCtx {
         CollectCtx {
