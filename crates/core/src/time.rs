@@ -55,6 +55,8 @@ pub enum TimeError {
     ParseLocal(String),
     #[error("unsupported time format")]
     Unsupported,
+    #[error("timestamp out of range: {0}")]
+    OutOfRange(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,7 +75,9 @@ pub fn normalize(
         TimeFormat::WebKitMicros => {
             let us = parse_i64(raw)?;
             Ok(NormalizedTime {
-                ts_utc: us - WEBKIT_EPOCH_US,
+                ts_utc: us
+                    .checked_sub(WEBKIT_EPOCH_US)
+                    .ok_or_else(|| out_of_range(raw))?,
                 precision: TimePrecision::Exact,
                 tz_assumed: None,
             })
@@ -86,22 +90,16 @@ pub fn normalize(
                 tz_assumed: None,
             })
         }
-        TimeFormat::UnixSeconds => {
-            let s = parse_i64(raw)?;
-            Ok(NormalizedTime {
-                ts_utc: s * 1_000_000,
-                precision: TimePrecision::Second,
-                tz_assumed: None,
-            })
-        }
-        TimeFormat::UnixMillis => {
-            let ms = parse_i64(raw)?;
-            Ok(NormalizedTime {
-                ts_utc: ms * 1000,
-                precision: TimePrecision::Exact,
-                tz_assumed: None,
-            })
-        }
+        TimeFormat::UnixSeconds => Ok(NormalizedTime {
+            ts_utc: scale(raw, 1_000_000)?,
+            precision: TimePrecision::Second,
+            tz_assumed: None,
+        }),
+        TimeFormat::UnixMillis => Ok(NormalizedTime {
+            ts_utc: scale(raw, 1000)?,
+            precision: TimePrecision::Exact,
+            tz_assumed: None,
+        }),
         TimeFormat::UnixNanos => {
             let ns = parse_i64(raw)?;
             Ok(NormalizedTime {
@@ -145,14 +143,11 @@ pub fn normalize(
             })
         }
         TimeFormat::ZshExtended => parse_zsh_extended(raw),
-        TimeFormat::BashHashEpoch => {
-            let s = parse_i64(raw)?;
-            Ok(NormalizedTime {
-                ts_utc: s * 1_000_000,
-                precision: TimePrecision::Second,
-                tz_assumed: None,
-            })
-        }
+        TimeFormat::BashHashEpoch => Ok(NormalizedTime {
+            ts_utc: scale(raw, 1_000_000)?,
+            precision: TimePrecision::Second,
+            tz_assumed: None,
+        }),
         TimeFormat::FileTime => {
             let ns = parse_i64(raw)?;
             Ok(NormalizedTime {
@@ -167,6 +162,17 @@ pub fn normalize(
             tz_assumed: None,
         }),
     }
+}
+
+fn out_of_range(raw: &str) -> TimeError {
+    TimeError::OutOfRange(raw.to_string())
+}
+
+/// `raw` (an integer) in µs; evidence is hostile, so an overflow is an error, never a wrap.
+fn scale(raw: &str, factor: i64) -> Result<i64, TimeError> {
+    parse_i64(raw)?
+        .checked_mul(factor)
+        .ok_or_else(|| out_of_range(raw))
 }
 
 fn parse_i64(s: &str) -> Result<i64, TimeError> {
@@ -198,9 +204,8 @@ fn parse_zsh_extended(raw: &str) -> Result<NormalizedTime, TimeError> {
         .ok_or_else(|| TimeError::ParseLocal(raw.to_string()))?;
     let rest = raw.get(start..).unwrap_or_default().trim_start();
     let (ts_part, _) = rest.split_once(':').unwrap_or((rest, ""));
-    let s = parse_i64(ts_part)?;
     Ok(NormalizedTime {
-        ts_utc: s * 1_000_000,
+        ts_utc: scale(ts_part, 1_000_000)?,
         precision: TimePrecision::Second,
         tz_assumed: None,
     })
@@ -320,6 +325,22 @@ mod tests {
             TimeFormat::FileTime,
             "2026-10-16T17:48:37+00:00",
         );
+    }
+
+    #[test]
+    fn hostile_values_are_errors_not_overflows() {
+        for (raw, format) in [
+            ("9223372036854775807", TimeFormat::UnixSeconds),
+            ("-9223372036854775808", TimeFormat::WebKitMicros),
+            ("9223372036854775807", TimeFormat::UnixMillis),
+            ("9223372036854775807", TimeFormat::BashHashEpoch),
+            (": 9223372036854775807:0;ls", TimeFormat::ZshExtended),
+        ] {
+            assert!(
+                matches!(normalize(raw, &format, None), Err(TimeError::OutOfRange(_))),
+                "{raw} {format}"
+            );
+        }
     }
 
     #[test]

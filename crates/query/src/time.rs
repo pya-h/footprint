@@ -3,7 +3,9 @@ use chrono::{Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 
 pub fn parse(input: &str) -> Result<i64> {
     if let Some(ts) = parse_at(input) {
-        return Ok(ts * 1_000_000);
+        return ts
+            .checked_mul(1_000_000)
+            .ok_or_else(|| anyhow!("time out of range: {input}"));
     }
     if let Some(ts) = parse_relative(input) {
         return Ok(ts);
@@ -37,19 +39,19 @@ fn parse_relative(input: &str) -> Option<i64> {
     let unit = &rest[digits.len()..];
     let n: i64 = digits.parse().ok()?;
     let dur = match unit {
-        "s" | "sec" | "secs" => Duration::seconds(n),
-        "m" | "min" | "mins" => Duration::minutes(n),
-        "h" | "hr" | "hrs" => Duration::hours(n),
-        "d" | "day" | "days" => Duration::days(n),
-        "w" | "week" | "weeks" => Duration::weeks(n),
+        "s" | "sec" | "secs" => Duration::try_seconds(n)?,
+        "m" | "min" | "mins" => Duration::try_minutes(n)?,
+        "h" | "hr" | "hrs" => Duration::try_hours(n)?,
+        "d" | "day" | "days" => Duration::try_days(n)?,
+        "w" | "week" | "weeks" => Duration::try_weeks(n)?,
         _ => return None,
     };
     let target = if sign == '-' {
-        Local::now() - dur
+        Local::now().checked_sub_signed(dur)
     } else {
-        Local::now() + dur
+        Local::now().checked_add_signed(dur)
     };
-    Some(target.timestamp_micros())
+    Some(target?.timestamp_micros())
 }
 
 fn parse_datetime(input: &str) -> Result<NaiveDateTime> {

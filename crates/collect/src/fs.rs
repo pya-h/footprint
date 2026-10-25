@@ -3,8 +3,7 @@ use crate::event::{Stamp, new_event};
 use crate::utils::{guard, in_window};
 use anyhow::Result;
 use fp_core::{
-    Artifact, Availability, Event, EventKind, Provenance, SourceInstance, TimePrecision,
-    time::TimeFormat,
+    Artifact, Availability, Event, EventKind, Provenance, SourceInstance, time::TimeFormat,
 };
 use serde_json::json;
 use std::ffi::CString;
@@ -150,78 +149,58 @@ fn walk_dir(
 }
 
 struct StatInfo {
-    mtime_us: i64,
-    _ctime_us: i64,
-    btime_us: Option<i64>,
     size: i64,
     mtime_ns: i64,
     ctime_ns: i64,
     btime_ns: Option<i64>,
 }
 
+/// Saturating: a crafted or far-future timestamp (ext4 goes to 2446) must not overflow i64 ns.
+fn file_time_ns(sec: i64, nsec: i64) -> i64 {
+    sec.saturating_mul(1_000_000_000).saturating_add(nsec)
+}
+
 fn stat_entry(path: &Path) -> Option<StatInfo> {
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut statx_buf: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: statx only writes into the zeroed buffer we pass and reads the NUL-terminated path
+    let mut buf: libc::statx = unsafe { std::mem::zeroed() };
     let res = unsafe {
         libc::statx(
             libc::AT_FDCWD,
             c_path.as_ptr(),
             libc::AT_SYMLINK_NOFOLLOW,
             libc::STATX_BASIC_STATS | libc::STATX_BTIME,
-            &mut statx_buf,
+            &mut buf,
         )
     };
-
     if res == 0 {
-        let mtime_ns = (statx_buf.stx_mtime.tv_sec as i64) * 1_000_000_000
-            + (statx_buf.stx_mtime.tv_nsec as i64);
-        let ctime_ns = (statx_buf.stx_ctime.tv_sec as i64) * 1_000_000_000
-            + (statx_buf.stx_ctime.tv_nsec as i64);
-        let btime_ns = if statx_buf.stx_mask & libc::STATX_BTIME != 0 {
-            Some(
-                (statx_buf.stx_btime.tv_sec as i64) * 1_000_000_000
-                    + (statx_buf.stx_btime.tv_nsec as i64),
-            )
-        } else {
-            None
-        };
-        Some(StatInfo {
-            mtime_us: mtime_ns / 1_000,
-            _ctime_us: ctime_ns / 1_000,
-            btime_us: btime_ns.map(|ns| ns / 1_000),
-            size: statx_buf.stx_size as i64,
-            mtime_ns,
-            ctime_ns,
-            btime_ns,
-        })
-    } else {
-        // Fallback to symlink_metadata
-        let meta = fs::symlink_metadata(path).ok()?;
-        let mtime_ns = meta.mtime() * 1_000_000_000 + (meta.mtime_nsec() as i64);
-        let ctime_ns = meta.ctime() * 1_000_000_000 + (meta.ctime_nsec() as i64);
-        Some(StatInfo {
-            mtime_us: mtime_ns / 1_000,
-            _ctime_us: ctime_ns / 1_000,
-            btime_us: None,
-            size: meta.len() as i64,
-            mtime_ns,
-            ctime_ns,
-            btime_ns: None,
-        })
+        let ts = |t: libc::statx_timestamp| file_time_ns(t.tv_sec, i64::from(t.tv_nsec));
+        return Some(StatInfo {
+            size: buf.stx_size as i64,
+            mtime_ns: ts(buf.stx_mtime),
+            ctime_ns: ts(buf.stx_ctime),
+            btime_ns: (buf.stx_mask & libc::STATX_BTIME != 0).then(|| ts(buf.stx_btime)),
+        });
     }
+    let meta = fs::symlink_metadata(path).ok()?;
+    Some(StatInfo {
+        size: meta.len() as i64,
+        mtime_ns: file_time_ns(meta.mtime(), meta.mtime_nsec()),
+        ctime_ns: file_time_ns(meta.ctime(), meta.ctime_nsec()),
+        btime_ns: None,
+    })
 }
 
 fn inspect_file(path: &Path, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut Sink) {
     let Some(info) = stat_entry(path) else {
         return;
     };
-
-    let path_str = path.display().to_string();
-
-    let btime_in_window = info.btime_us.is_some_and(|bt| in_window(ctx, bt));
-    let mtime_in_window = in_window(ctx, info.mtime_us);
-
-    if !btime_in_window && !mtime_in_window {
+    let created = info.btime_ns.filter(|&bt| in_window(ctx, bt / 1_000));
+    // a modification is only news when it came after the creation
+    let modified = Some(info.mtime_ns).filter(|&mt| {
+        in_window(ctx, mt / 1_000) && info.btime_ns.is_none_or(|bt| mt / 1_000 > bt / 1_000)
+    });
+    if created.is_none() && modified.is_none() {
         return;
     }
 
@@ -234,84 +213,18 @@ fn inspect_file(path: &Path, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut
         btime_ns: info.btime_ns,
         owner_pkg: None,
     });
-
-    if let Some(btime_us) = info.btime_us {
-        if btime_in_window {
-            let stamp = Stamp {
-                ts_utc: btime_us,
-                precision: TimePrecision::Exact,
-                raw: btime_us.to_string(),
-                format: TimeFormat::FileTime,
-                tz_assumed: None,
-            };
-            sink.event(Event {
-                actor: None,
-                subject_host: None,
-                attrs: json!({
-                    "size": info.size,
-                    "mtime_ns": info.mtime_ns,
-                    "ctime_ns": info.ctime_ns,
-                    "btime_ns": info.btime_ns,
-                }),
-                ..new_event(
-                    ctx,
-                    inst,
-                    stamp,
-                    EventKind::FileCreated,
-                    path_str.clone(),
-                    format!("{path_str} (created)"),
-                    Provenance {
-                        file: path.to_path_buf(),
-                        file_sha256: None,
-                        locator: format!("statx:btime:{path_str}"),
-                    },
-                )
-            });
-        }
-
-        if info.mtime_us > btime_us && mtime_in_window {
-            let stamp = Stamp {
-                ts_utc: info.mtime_us,
-                precision: TimePrecision::Exact,
-                raw: info.mtime_us.to_string(),
-                format: TimeFormat::FileTime,
-                tz_assumed: None,
-            };
-            sink.event(Event {
-                actor: None,
-                subject_host: None,
-                attrs: json!({
-                    "size": info.size,
-                    "mtime_ns": info.mtime_ns,
-                    "ctime_ns": info.ctime_ns,
-                    "btime_ns": info.btime_ns,
-                }),
-                ..new_event(
-                    ctx,
-                    inst,
-                    stamp,
-                    EventKind::FileModified,
-                    path_str.clone(),
-                    format!("{path_str} (modified)"),
-                    Provenance {
-                        file: path.to_path_buf(),
-                        file_sha256: None,
-                        locator: format!("statx:{path_str}"),
-                    },
-                )
-            });
-        }
-    } else if mtime_in_window {
-        let stamp = Stamp {
-            ts_utc: info.mtime_us,
-            precision: TimePrecision::Exact,
-            raw: info.mtime_us.to_string(),
-            format: TimeFormat::FileTime,
-            tz_assumed: None,
+    let path_str = path.display().to_string();
+    let changes = [
+        (created, EventKind::FileCreated, "created", "statx:btime:"),
+        (modified, EventKind::FileModified, "modified", "statx:"),
+    ];
+    for (ts_ns, kind, verb, locator) in changes {
+        let Some(stamp) =
+            ts_ns.and_then(|ns| Stamp::parse(ns.to_string(), TimeFormat::FileTime, None).ok())
+        else {
+            continue;
         };
         sink.event(Event {
-            actor: None,
-            subject_host: None,
             attrs: json!({
                 "size": info.size,
                 "mtime_ns": info.mtime_ns,
@@ -322,13 +235,13 @@ fn inspect_file(path: &Path, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut
                 ctx,
                 inst,
                 stamp,
-                EventKind::FileModified,
+                kind,
                 path_str.clone(),
-                format!("{path_str} (modified)"),
+                format!("{path_str} ({verb})"),
                 Provenance {
                     file: path.to_path_buf(),
                     file_sha256: None,
-                    locator: format!("statx:{path_str}"),
+                    locator: format!("{locator}{path_str}"),
                 },
             )
         });
@@ -340,6 +253,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn far_future_file_times_saturate() {
+        // year 2300 is valid on ext4 but past i64 nanoseconds
+        assert_eq!(file_time_ns(10_414_285_200, 5), i64::MAX);
+        assert_eq!(file_time_ns(1_792_172_917, 5), 1_792_172_917_000_000_005);
+    }
+
+    #[test]
     fn test_stat_entry_on_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
@@ -347,7 +267,7 @@ mod tests {
 
         let info = stat_entry(&file_path).unwrap();
         assert_eq!(info.size, 5);
-        assert!(info.mtime_us > 0);
+        assert!(info.mtime_ns > 0);
     }
 
     #[test]
