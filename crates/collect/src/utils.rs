@@ -25,6 +25,16 @@ pub fn guard(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Evidence is a regular file; a FIFO planted as `.bash_history` would block the read forever
+/// and a device would never end.
+fn regular_file(path: &Path) -> Result<fs::Metadata> {
+    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    Ok(meta)
+}
+
 /// A private staging subdir per source instance, so side files of two profiles never mix.
 pub fn stage_dir(ctx: &CollectCtx, inst_id: u64) -> Result<PathBuf> {
     let dir = ctx.temp_dir.join(format!("src-{inst_id}"));
@@ -42,7 +52,7 @@ pub struct Snapshot {
 /// Copies a live SQLite DB with its `-wal`/`-journal` (named `<full name>-wal`) into `stage`.
 pub fn copy_db_set(src: &Path, stage: &Path) -> Result<Snapshot> {
     guard(src)?;
-    let meta = fs::metadata(src).with_context(|| format!("stat {}", src.display()))?;
+    let meta = regular_file(src)?;
     if meta.len() > MAX_DB_BYTES {
         bail!(
             "{} is {} bytes, over the {MAX_DB_BYTES}-byte limit",
@@ -58,6 +68,7 @@ pub fn copy_db_set(src: &Path, stage: &Path) -> Result<Snapshot> {
         side_name.push(suffix);
         let side = src.with_file_name(&side_name);
         if side.exists() {
+            regular_file(&side)?;
             fs::copy(&side, stage.join(&side_name))
                 .with_context(|| format!("copy {}", side.display()))?;
         }
@@ -90,6 +101,7 @@ pub struct TextFile {
 /// Reads a small evidence file whole, transparently gunzipping `*.gz`, with a size cap on both sides.
 pub fn read_evidence(path: &Path) -> Result<TextFile> {
     guard(path)?;
+    regular_file(path)?;
     let raw = read_capped(File::open(path).with_context(|| format!("open {}", path.display()))?)
         .with_context(|| path.display().to_string())?;
     let sha256 = hex::encode(Sha256::digest(&raw));
@@ -292,6 +304,19 @@ mod tests {
             .collect();
         assert_eq!(names, ["dpkg.log", "dpkg.log.1", "dpkg.log.2.gz"]);
         assert_eq!(read_evidence(&files[2]).unwrap().bytes, b"oldest\n");
+    }
+
+    #[test]
+    fn a_fifo_is_refused_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join(".bash_history");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let Err(err) = read_evidence(&fifo) else {
+            panic!("a fifo must be refused");
+        };
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+        assert!(copy_db_set(&fifo, dir.path()).is_err());
     }
 
     #[test]
