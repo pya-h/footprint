@@ -114,21 +114,22 @@ fn parse_socket_addr(field: &str, ipv6: bool) -> Option<String> {
     }
 }
 
-/// tcp/tcp6/udp/udp6 states worth naming; others stay hex
+/// `include/net/tcp_states.h`; udp sockets reuse 07 (CLOSE) when unconnected. Others stay hex.
 fn socket_state(hex: &str) -> String {
-    match hex {
-        "01" => "SYN_SENT",
-        "02" => "SYN_RECV",
-        "03" => "FIN_WAIT1",
-        "04" => "FIN_WAIT2",
-        "05" => "TIME_WAIT",
-        "06" => "CLOSE",
-        "07" => "CLOSE_WAIT",
-        "08" => "LAST_ACK",
-        "09" => "LISTEN",
-        "0A" | "0a" => "ESTABLISHED",
-        "0B" | "0b" => "CLOSING",
-        other => other,
+    match hex.to_ascii_uppercase().as_str() {
+        "01" => "ESTABLISHED",
+        "02" => "SYN_SENT",
+        "03" => "SYN_RECV",
+        "04" => "FIN_WAIT1",
+        "05" => "FIN_WAIT2",
+        "06" => "TIME_WAIT",
+        "07" => "CLOSE",
+        "08" => "CLOSE_WAIT",
+        "09" => "LAST_ACK",
+        "0A" => "LISTEN",
+        "0B" => "CLOSING",
+        "0C" => "NEW_SYN_RECV",
+        _ => return hex.to_string(),
     }
     .to_string()
 }
@@ -211,28 +212,27 @@ fn collect_sockets(root: &Path, ctx: &CollectCtx, sink: &mut Sink) {
     }
 }
 
-/// module name -> path under /lib/modules, for the packaged check
+/// module name -> file, from the running kernel's tree only (`/lib/modules/<release>`)
 fn module_paths(root: &Path) -> HashMap<String, PathBuf> {
     let mut map = HashMap::new();
-    let base = root.join("lib/modules");
-    let mut stack = vec![base.clone()];
-    let mut depth = 0;
+    let Ok(release) = fs::read_to_string(root.join("proc/sys/kernel/osrelease")) else {
+        return map;
+    };
+    let mut stack = vec![root.join("lib/modules").join(release.trim())];
     while let Some(dir) = stack.pop() {
-        depth += 1;
-        if depth > 64 {
-            break;
-        }
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let name = entry.file_name().to_string_lossy().into_owned();
-            if path.is_dir() {
-                stack.push(path);
-            } else if name.contains(".ko") {
-                let key = name.split(".ko").next().unwrap_or(&name).to_string();
-                map.entry(key).or_insert(path);
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if let Some((stem, _)) = name.split_once(".ko") {
+                // the kernel names modules with `_`; files often use `-` (snd-hda-intel.ko)
+                map.entry(stem.replace('-', "_")).or_insert(entry.path());
             }
         }
     }
@@ -371,8 +371,9 @@ mod tests {
 
     #[test]
     fn names_socket_states() {
-        assert_eq!(socket_state("0A"), "ESTABLISHED");
-        assert_eq!(socket_state("09"), "LISTEN");
+        assert_eq!(socket_state("01"), "ESTABLISHED");
+        assert_eq!(socket_state("0A"), "LISTEN");
+        assert_eq!(socket_state("0a"), "LISTEN");
         assert_eq!(socket_state("FE"), "FE");
     }
 
@@ -387,41 +388,76 @@ mod tests {
     }
 
     #[test]
-    fn live_state_reads_the_host_proc() {
-        // every Linux has /proc with pid 1; loose assertions, no host specifics
-        let env = Env::current();
-        let instances = LiveCollector.discover(&env);
-        assert_eq!(instances.len(), 1);
-        assert_eq!(instances[0].status, Availability::Present);
+    fn live_state_from_a_synthetic_proc() {
+        let root = tempfile::tempdir().unwrap();
+        let w = |rel: &str, body: &str| {
+            let path = root.path().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        };
+        w("proc/1/cmdline", "/sbin/init\0splash\0");
+        w("proc/1/status", "Name:\tsystemd\nUid:\t0\t0\t0\t0\n");
+        w("proc/1/comm", "systemd\n");
+        w(
+            "proc/net/tcp",
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+             0: 0100007F:0277 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 4242 1\n",
+        );
+        w(
+            "proc/modules",
+            "snd_hda_intel 61440 3 - Live 0x0\nrootkit 16384 0 - Live 0x0\n",
+        );
+        w("proc/sys/kernel/tainted", "4096\n");
+        w("proc/sys/kernel/osrelease", "7.1.5-test\n");
+        w(
+            "lib/modules/7.1.5-test/kernel/sound/snd-hda-intel.ko.zst",
+            "",
+        );
+        w(
+            "var/lib/dpkg/info/linux-image.list",
+            "/lib/modules/7.1.5-test/kernel/sound/snd-hda-intel.ko.zst\n",
+        );
 
+        let env = Env::test(root.path().join("home"), root.path().to_path_buf());
+        let instances = LiveCollector.discover(&env);
+        assert_eq!(instances[0].status, Availability::Present);
         let ctx = CollectCtx {
             run_id: 1,
             since: None,
             until: None,
             assume_tz: None,
-            temp_dir: std::env::temp_dir(),
+            temp_dir: root.path().join("tmp"),
         };
         let mut sink = Sink::default();
         LiveCollector
             .collect(&instances[0], &ctx, &mut sink)
             .unwrap();
-        assert!(
+        let state = |kind: &str, key: &str| {
             sink.states
                 .iter()
-                .any(|s| s.kind == "live.process" && s.key == "1"),
-            "pid 1 should be captured: {:?}",
-            sink.states
-                .iter()
-                .map(|s| (&s.kind, &s.key))
-                .collect::<Vec<_>>()
+                .find(|s| s.kind == kind && s.key == key)
+                .unwrap_or_else(|| panic!("{kind} {key}"))
+        };
+
+        assert_eq!(
+            state("live.process", "1").value["cmdline"],
+            "/sbin/init splash"
+        );
+        // the socket has no owning pid: a kernel socket, labelled rather than alarming
+        let socket = &state("live.socket", "tcp:4242").value;
+        assert_eq!(socket["local"], "127.0.0.1:631");
+        assert_eq!(socket["state"], "LISTEN");
+        assert!(socket["flags"].to_string().contains("kernel_socket"));
+        // `snd_hda_intel` is the file `snd-hda-intel.ko.zst`, owned through the image's dpkg lists
+        assert_eq!(
+            state("live.module", "snd_hda_intel").value["owner_pkg"],
+            "linux-image"
         );
         assert!(
-            sink.states
-                .iter()
-                .any(|s| s.kind == "live.kernel" && s.key == "tainted")
+            state("live.module", "rootkit").value["flags"]
+                .to_string()
+                .contains("unowned_module")
         );
-        for record in &sink.states {
-            assert!(record.value.get("flags").is_some());
-        }
+        assert_eq!(state("live.kernel", "tainted").value["nonzero"], true);
     }
 }

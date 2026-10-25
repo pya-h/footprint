@@ -19,6 +19,14 @@ fn setup() -> Case {
     fs::create_dir_all(root.join("etc/cron.d")).unwrap();
     fs::create_dir_all(root.join("etc/systemd/system")).unwrap();
     fs::create_dir_all(root.join("etc/sudoers.d")).unwrap();
+    // the image's own package database: ownership is read from it, not from the host
+    let dpkg_info = root.join("var/lib/dpkg/info");
+    fs::create_dir_all(&dpkg_info).unwrap();
+    fs::write(
+        dpkg_info.join("cron.list"),
+        "/.\n/etc/crontab\n/etc/cron.d\n",
+    )
+    .unwrap();
 
     let db = dir.path().join("case.db");
     Case {
