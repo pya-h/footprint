@@ -238,6 +238,8 @@ fn test_ioc_check_inline_list_and_export() {
     let (ok, stdout, _) = run_footprint(&[
         "-c",
         case.to_str().unwrap(),
+        "--tz",
+        "UTC",
         "export",
         "--format",
         "html",
@@ -252,4 +254,6 @@ fn test_ioc_check_inline_list_and_export() {
     assert!(html_data.contains("footprint"));
     assert!(html_data.contains("us09-web-zoom.com"));
     assert!(html_data.contains("IOC Detections"));
+    // the global --tz names the zone of the time column
+    assert!(html_data.contains("Time (UTC)"));
 }

@@ -326,7 +326,7 @@ footer {{
   <thead>
     <tr>
       <th style="width: 70px;">ID</th>
-      <th style="width: 170px;">Time (Local)</th>
+      <th style="width: 170px;">Time ({})</th>
       <th style="width: 150px;">Source</th>
       <th style="width: 130px;">Kind</th>
       <th>Subject / Summary</th>
@@ -334,7 +334,9 @@ footer {{
     </tr>
   </thead>
   <tbody>"#,
-        total_events, events_with_iocs
+        total_events,
+        events_with_iocs,
+        escape_html(&report.zone)
     )?;
 
     for ev in &report.events {
@@ -536,6 +538,7 @@ mod tests {
 
         let report = ExportReport {
             case_path: "/tmp/case.db".into(),
+            zone: "+03:30".into(),
             runs: vec![],
             ioc_hits: vec![],
             events,
@@ -548,5 +551,6 @@ mod tests {
         assert!(s.contains("footprint Forensic Report"));
         assert!(s.contains("IOC: zoom.us"));
         assert!(s.contains("visit_id"));
+        assert!(s.contains("Time (+03:30)"));
     }
 }

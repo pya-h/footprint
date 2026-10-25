@@ -64,7 +64,6 @@ mod sanitize_tests {
 }
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Local};
 use fp_correlate::{IocHit, check_iocs, match_event_iocs};
 use fp_store::{EventFilter, RunRow, Store};
 use serde::{Deserialize, Serialize};
@@ -97,6 +96,8 @@ pub struct ExportEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportReport {
     pub case_path: String,
+    /// the zone `ts_local` is rendered in (`local`, `UTC`, `+03:30`)
+    pub zone: String,
     pub runs: Vec<RunRow>,
     pub ioc_hits: Vec<IocHit>,
     pub events: Vec<ExportEvent>,
@@ -122,17 +123,10 @@ impl std::str::FromStr for ExportFormat {
     }
 }
 
-fn format_local_time(ts_utc: i64, precision: &str) -> String {
-    if precision == "order_only" {
-        return "(untimed)".to_string();
-    }
-    DateTime::from_timestamp_micros(ts_utc)
-        .map(|t| {
-            t.with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        })
-        .unwrap_or_else(|| format!("@{ts_utc}µs"))
+/// How an export renders times: the zone's name for headers, and the instant in that zone.
+pub struct ExportTime<'a> {
+    pub zone: &'a str,
+    pub format: &'a dyn Fn(i64, &str) -> String,
 }
 
 pub fn export_case(
@@ -141,6 +135,7 @@ pub fn export_case(
     format: ExportFormat,
     out_path: &Path,
     redact: bool,
+    time: &ExportTime,
 ) -> Result<usize> {
     let rows = store.list_events_detailed(filter)?;
 
@@ -148,7 +143,7 @@ pub fn export_case(
 
     let mut events = Vec::with_capacity(rows.len());
     for r in rows {
-        let ts_local = format_local_time(r.ts_utc, &r.ts_precision);
+        let ts_local = (time.format)(r.ts_utc, &r.ts_precision);
         let ioc_hits = match_event_iocs(
             r.subject_host.as_deref(),
             r.subject.as_deref(),
@@ -213,16 +208,17 @@ pub fn export_case(
             render_csv(&mut writer, &events)?;
         }
         ExportFormat::Html => {
-            let mut ioc_hits = check_iocs(store).unwrap_or_default();
+            let mut ioc_hits = check_iocs(store)?;
             if redact {
                 for hit in &mut ioc_hits {
                     hit.target_desc = redact_text(&hit.target_desc);
                     hit.matched_value = redact_text(&hit.matched_value);
                 }
             }
-            let runs = store.list_runs().unwrap_or_default();
+            let runs = store.list_runs()?;
             let report = ExportReport {
                 case_path: store.path().display().to_string(),
+                zone: time.zone.to_string(),
                 runs,
                 ioc_hits,
                 events: events.clone(),
@@ -254,6 +250,7 @@ mod tests {
         assert_eq!(csv::escape_csv("-cmd"), "'-cmd");
         assert_eq!(csv::escape_csv("plain"), "plain");
     }
+    use chrono::DateTime;
     use fp_core::{
         Actor, Confidence, Event, EventKind, Provenance, SourceInstance, TimePrecision,
         time::TimeFormat,
@@ -329,10 +326,27 @@ mod tests {
             .unwrap();
 
         let filter = EventFilter::default();
+        let utc = |ts: i64, _: &str| {
+            DateTime::from_timestamp_micros(ts)
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default()
+        };
+        let time = ExportTime {
+            zone: "UTC",
+            format: &utc,
+        };
 
         // 1. JSONL with redact
         let jsonl_out = dir.path().join("export.jsonl");
-        let count = export_case(&store, &filter, ExportFormat::Jsonl, &jsonl_out, true).unwrap();
+        let count = export_case(
+            &store,
+            &filter,
+            ExportFormat::Jsonl,
+            &jsonl_out,
+            true,
+            &time,
+        )
+        .unwrap();
         assert_eq!(count, 1);
         let mode = fs::metadata(&jsonl_out).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -345,16 +359,20 @@ mod tests {
 
         // 2. CSV without redact
         let csv_out = dir.path().join("export.csv");
-        let count = export_case(&store, &filter, ExportFormat::Csv, &csv_out, false).unwrap();
+        let count =
+            export_case(&store, &filter, ExportFormat::Csv, &csv_out, false, &time).unwrap();
         assert_eq!(count, 1);
         let csv_content = fs::read_to_string(&csv_out).unwrap();
         assert!(csv_content.starts_with("id,time_utc"));
+        // the time column follows the renderer it was given, not the host zone
+        assert!(csv_content.contains("1970-01-01 00:00:00"), "{csv_content}");
         assert!(csv_content.contains("supersecret123"));
         assert!(csv_content.contains("zoom.us"));
 
         // 3. HTML
         let html_out = dir.path().join("export.html");
-        let count = export_case(&store, &filter, ExportFormat::Html, &html_out, true).unwrap();
+        let count =
+            export_case(&store, &filter, ExportFormat::Html, &html_out, true, &time).unwrap();
         assert_eq!(count, 1);
         let html_content = fs::read_to_string(&html_out).unwrap();
         assert!(html_content.contains("<!DOCTYPE html>"));

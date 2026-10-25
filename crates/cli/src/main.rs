@@ -268,7 +268,7 @@ fn main() -> Result<()> {
         Command::State(args) => state(&cli.case, args),
         Command::Diff(args) => diff(&cli.case, args),
         Command::Ioc(args) => ioc(&cli.case, args, tz),
-        Command::Export(args) => export(&cli.case, args),
+        Command::Export(args) => export(&cli.case, args, tz),
         Command::Explain { finding } => explain(&finding),
         Command::Tui => fp_tui::run(&cli.case, tz),
     }
@@ -905,7 +905,7 @@ fn ioc(case: &Path, args: IocArgs, tz: fp_query::Tz) -> Result<()> {
     Ok(())
 }
 
-fn export(case: &Path, args: ExportArgs) -> Result<()> {
+fn export(case: &Path, args: ExportArgs, tz: fp_query::Tz) -> Result<()> {
     let store = Store::open(case)?;
     let filter = fp_store::EventFilter {
         since: args
@@ -933,7 +933,18 @@ fn export(case: &Path, args: ExportArgs) -> Result<()> {
         ExportCliFormat::Html => fp_render::ExportFormat::Html,
     };
 
-    let count = fp_render::export_case(&store, &filter, fmt, &args.out, args.redact)?;
+    let zone = match tz {
+        fp_query::Tz::Local => "local".to_string(),
+        fp_query::Tz::Utc => "UTC".to_string(),
+        fp_query::Tz::Fixed(offset) => offset.to_string(),
+    };
+    let render =
+        |ts: i64, precision: &str| fp_query::format_time(ts, precision, tz, "%Y-%m-%d %H:%M:%S");
+    let time = fp_render::ExportTime {
+        zone: &zone,
+        format: &render,
+    };
+    let count = fp_render::export_case(&store, &filter, fmt, &args.out, args.redact, &time)?;
     println!(
         "exported {count} events to {} ({:?}{})",
         args.out.display(),
