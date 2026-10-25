@@ -112,20 +112,7 @@ impl Collector for AuthCollector {
             file: &inst.path,
             sha256: None,
         };
-        for line in BufReader::new(stdout).lines() {
-            let line = line?;
-            let Ok(entry) = serde_json::from_str::<JournalEntry>(&line) else {
-                sink.warn("journalctl: unparsable JSON entry");
-                continue;
-            };
-            // journalctl's window is whole seconds; the exact bounds are applied here
-            if let Some(event) = entry
-                .into_event(ctx, inst, &origin)?
-                .filter(|e| in_window(ctx, e.ts_utc))
-            {
-                sink.event(event);
-            }
-        }
+        read_entries(BufReader::new(stdout), ctx, inst, &origin, sink)?;
 
         let status = child.wait()?;
         let stderr = stderr_reader.join().unwrap_or_default();
@@ -138,6 +125,37 @@ impl Collector for AuthCollector {
         }
         Ok(())
     }
+}
+
+/// journalctl's JSON lines; a bad entry is skipped and counted like a bad log line, and never
+/// fails the source.
+fn read_entries(
+    reader: impl BufRead,
+    ctx: &CollectCtx,
+    inst: &SourceInstance,
+    origin: &Origin,
+    sink: &mut Sink,
+) -> Result<()> {
+    let mut skipped = 0usize;
+    for line in reader.lines() {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<JournalEntry>(&line) else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(event) = entry.into_event(ctx, inst, origin) else {
+            skipped += 1;
+            continue;
+        };
+        // journalctl's window is whole seconds; the exact bounds are applied here
+        if let Some(event) = event.filter(|e| in_window(ctx, e.ts_utc)) {
+            sink.event(event);
+        }
+    }
+    if skipped > 0 {
+        sink.warn(format!("journalctl: {skipped} unreadable entries skipped"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,6 +452,34 @@ mod tests {
             .unwrap()
             .into_event(&ctx, &inst, &origin)
             .unwrap()
+    }
+
+    #[test]
+    fn bad_journal_entries_are_skipped_not_fatal() {
+        let ctx = CollectCtx {
+            run_id: 1,
+            since: None,
+            until: None,
+            assume_tz: None,
+            temp_dir: "/tmp".into(),
+            own_files: Vec::new(),
+        };
+        let inst =
+            SourceInstance::new("auth.journald", "journald", None, "/var/log/journal".into());
+        let origin = Origin {
+            file: &inst.path,
+            sha256: None,
+        };
+        let lines = concat!(
+            r#"{"__REALTIME_TIMESTAMP":"not a time","__CURSOR":"a","_COMM":"sudo","MESSAGE":"x"}"#,
+            "\n{ not json\n",
+            r#"{"__REALTIME_TIMESTAMP":"1792172276000000","__CURSOR":"b","_COMM":"sudo","MESSAGE":"paya : USER=root ; COMMAND=/usr/bin/id"}"#,
+            "\n",
+        );
+        let mut sink = Sink::default();
+        read_entries(lines.as_bytes(), &ctx, &inst, &origin, &mut sink).unwrap();
+        assert_eq!(sink.events.len(), 1);
+        assert_eq!(sink.warnings, ["journalctl: 2 unreadable entries skipped"]);
     }
 
     #[test]
