@@ -238,13 +238,46 @@ pub(crate) fn ssh_peer(message: &str) -> Option<String> {
     Some(after.split_whitespace().next()?.to_string())
 }
 
-/// `New session 3 of user paya.` -> the user; logouts are not events
-fn parse_logind_session(message: &str) -> Option<&str> {
-    let after = message
+/// One `New session …` line from systemd-logind.
+struct LogindSession<'a> {
+    id: &'a str,
+    user: &'a str,
+    class: Option<&'a str>,
+    kind: Option<&'a str>,
+}
+
+/// `New session 3 of user paya.` (older systemd) or
+/// `New session '3' of user 'paya' with class 'user' and type 'tty'.` (255+); logouts are not
+/// events, and `manager` sessions (the per-user service manager every login also starts) are
+/// a shadow of the real login, not one of their own.
+fn parse_logind_session(message: &str) -> Option<LogindSession<'_>> {
+    fn unquote(s: &str) -> &str {
+        s.trim().trim_end_matches('.').trim_matches('\'')
+    }
+    let (id, rest) = message
         .strip_prefix("New session ")?
-        .split_once(" of user ")?
-        .1;
-    Some(after.trim_end_matches('.').trim())
+        .split_once(" of user ")?;
+    let (user, rest) = match rest.split_once(" with class ") {
+        Some((user, rest)) => (user, Some(rest)),
+        None => (rest, None),
+    };
+    let (class, kind) = match rest {
+        Some(rest) => match rest.split_once(" and type ") {
+            Some((class, kind)) => (Some(unquote(class)), Some(unquote(kind))),
+            None => (Some(unquote(rest)), None),
+        },
+        None => (None, None),
+    };
+    let user = unquote(user);
+    if user.is_empty() || class.is_some_and(|c| c.starts_with("manager")) {
+        return None;
+    }
+    Some(LogindSession {
+        id: unquote(id),
+        user,
+        class,
+        kind,
+    })
 }
 
 impl JournalEntry {
@@ -288,11 +321,27 @@ impl JournalEntry {
                 message.to_string(),
             )
         } else if comm == "systemd-logind" {
-            let Some(user) = parse_logind_session(message) else {
+            let Some(session) = parse_logind_session(message) else {
                 return Ok(None);
             };
-            actor.user = Some(user.to_string());
-            (EventKind::AuthLogin, user.to_string(), message.to_string())
+            actor.user = Some(session.user.to_string());
+            attrs = json!({
+                "comm": comm,
+                "message": message,
+                "session": session.id,
+                "class": session.class,
+                "type": session.kind,
+            });
+            let summary = match (session.class, session.kind) {
+                (Some(class), Some(kind)) => {
+                    format!(
+                        "{} logged in (session {}, {class}, {kind})",
+                        session.user, session.id
+                    )
+                }
+                _ => format!("{} logged in (session {})", session.user, session.id),
+            };
+            (EventKind::AuthLogin, session.user.to_string(), summary)
         } else if comm == "sudo" {
             let Some(sudo) = parse_sudo(message) else {
                 return Ok(None);
@@ -394,6 +443,19 @@ mod tests {
         assert_eq!(e.kind, EventKind::AuthLogin);
         assert_eq!(e.subject, "paya");
         assert!(e.actor.as_ref().unwrap().user.as_deref() == Some("paya"));
+        // systemd 255+ quotes the fields and adds the class and type
+        let e = entry(r#"{"__REALTIME_TIMESTAMP":"1","__CURSOR":"c","_COMM":"systemd-logind","MESSAGE":"New session '2' of user 'paya' with class 'user' and type 'wayland'."}"#)
+        .unwrap();
+        assert_eq!(e.subject, "paya");
+        assert_eq!(e.attrs["session"], "2");
+        assert_eq!(e.attrs["class"], "user");
+        assert_eq!(e.attrs["type"], "wayland");
+        assert_eq!(e.summary, "paya logged in (session 2, user, wayland)");
+        // the service manager session every login also opens is not a second login
+        assert!(
+            entry(r#"{"__REALTIME_TIMESTAMP":"1","__CURSOR":"c","_COMM":"systemd-logind","MESSAGE":"New session '3' of user 'paya' with class 'manager' and type 'unspecified'."}"#)
+            .is_none()
+        );
         // logouts and unrelated logind chatter are not events
         assert!(
             entry(r#"{"__REALTIME_TIMESTAMP":"1","__CURSOR":"c","_COMM":"systemd-logind","MESSAGE":"Removed session 3."}"#)
