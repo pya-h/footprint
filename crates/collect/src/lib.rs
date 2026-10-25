@@ -16,6 +16,8 @@ pub mod probe;
 pub mod redact;
 pub mod scan;
 pub mod shell;
+#[cfg(test)]
+mod smoke;
 pub mod utils;
 pub mod xdm;
 
