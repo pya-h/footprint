@@ -8,6 +8,12 @@ pub use html::render_html;
 pub use jsonl::render_jsonl;
 pub use redact::{hash_secret, redact_json, redact_text, redact_url};
 
+/// Directional overrides and isolates reorder what follows them: `evil\u{202e}fdp.exe`
+/// displays as `evilexe.pdf`.
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// Evidence is untrusted: strip control and ANSI escape characters
 /// before printing to a terminal. Printable text, newline and tab survive.
 pub fn sanitize(s: &str) -> String {
@@ -36,7 +42,7 @@ pub fn sanitize(s: &str) -> String {
         match c {
             '\n' => out.push('\n'),
             '\t' => out.push('\t'),
-            c if c.is_control() => continue,
+            c if c.is_control() || is_bidi_control(c) => continue,
             c => out.push(c),
         }
     }
@@ -231,6 +237,23 @@ pub fn export_case(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_strips_escapes_and_bidi_overrides() {
+        assert_eq!(sanitize("a\u{1b}[31mred\u{1b}[0m\u{7}b"), "aredb");
+        assert_eq!(sanitize("evil\u{202e}fdp.exe"), "evilfdp.exe");
+        assert_eq!(sanitize("line\nnext\ttab"), "line\nnext\ttab");
+    }
+
+    #[test]
+    fn csv_cells_never_start_a_formula() {
+        assert_eq!(
+            csv::escape_csv("=HYPERLINK(\"x\")"),
+            "\"'=HYPERLINK(\"\"x\"\")\""
+        );
+        assert_eq!(csv::escape_csv("-cmd"), "'-cmd");
+        assert_eq!(csv::escape_csv("plain"), "plain");
+    }
     use fp_core::{
         Actor, Confidence, Event, EventKind, Provenance, SourceInstance, TimePrecision,
         time::TimeFormat,

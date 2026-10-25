@@ -3,10 +3,16 @@ use anyhow::Result;
 use std::io::Write;
 
 pub fn escape_csv(val: &str) -> String {
+    // a cell starting with = + - @ is a formula to spreadsheets; evidence must not run as one
+    let val = if val.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{val}")
+    } else {
+        val.to_string()
+    };
     if val.contains(',') || val.contains('"') || val.contains('\n') || val.contains('\r') {
         format!("\"{}\"", val.replace('"', "\"\""))
     } else {
-        val.to_string()
+        val
     }
 }
 

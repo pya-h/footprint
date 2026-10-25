@@ -234,6 +234,14 @@ enum Format {
     Csv,
 }
 
+/// Indicator types the matcher understands.
+const IOC_TYPES: &[&str] = &["domain", "ip", "cidr", "sha256", "path", "url"];
+
+/// Evidence is untrusted: nothing from it reaches the terminal unsanitized.
+fn clean(text: &str) -> String {
+    fp_render::sanitize(text)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -335,12 +343,12 @@ fn sources(case: &Path, run: Option<u64>, all_runs: bool, coverage: bool) -> Res
                 if row.answering.is_empty() {
                     "none".to_string()
                 } else {
-                    row.answering.join(", ")
+                    clean(&row.answering.join(", "))
                 },
                 if row.notes.is_empty() {
                     "-".to_string()
                 } else {
-                    row.notes.join("; ")
+                    clean(&row.notes.join("; "))
                 }
             );
         }
@@ -358,13 +366,13 @@ fn sources(case: &Path, run: Option<u64>, all_runs: bool, coverage: bool) -> Res
             s.id,
             s.run_id,
             s.kind,
-            s.label(),
-            s.status_display(),
+            clean(&s.label()),
+            clean(&s.status_display()),
             count_str,
-            s.path.as_deref().unwrap_or("-"),
+            clean(s.path.as_deref().unwrap_or("-")),
             s.note
                 .as_ref()
-                .map(|n| format!("  ({n})"))
+                .map(|n| format!("  ({})", clean(n)))
                 .unwrap_or_default()
         );
     }
@@ -569,18 +577,20 @@ fn show(case: &Path, id: u64) -> Result<()> {
         ),
     );
     field("subject", &fp_render::sanitize(&dash(&ev.subject)));
-    field("host", &dash(&ev.subject_host));
+    field("host", &clean(&dash(&ev.subject_host)));
     field("summary", &fp_render::sanitize(&dash(&ev.summary)));
     field("confidence", &ev.confidence);
-    field("file", &dash(&ev.prov_file));
+    field("file", &clean(&dash(&ev.prov_file)));
     field("sha256", &dash(&ev.prov_sha256));
-    field("locator", &dash(&ev.locator));
+    field("locator", &clean(&dash(&ev.locator)));
     field(
         "actor",
-        &ev.actor
-            .as_ref()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "-".into()),
+        &clean(
+            &ev.actor
+                .as_ref()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "-".into()),
+        ),
     );
     field(
         "attrs",
@@ -606,7 +616,12 @@ fn show(case: &Path, id: u64) -> Result<()> {
                 .unwrap_or_default();
             println!(
                 "  - {:<16} {} {} {} [{}]{}",
-                l.rel, arrow, l.target_type, l.target_label, l.confidence, why_str
+                l.rel,
+                arrow,
+                l.target_type,
+                clean(&l.target_label),
+                l.confidence,
+                clean(&why_str)
             );
         }
     }
@@ -614,10 +629,9 @@ fn show(case: &Path, id: u64) -> Result<()> {
 }
 
 fn trace(case: &Path, target: &str) -> Result<()> {
-    let mut store = Store::open(case)?;
-    let _ = fp_correlate::correlate(&mut store, std::path::Path::new("/"));
-    let rendered = fp_correlate::render_trace(&store, target)?;
-    print!("{rendered}");
+    // read-only: links were built by `collect`, which knew the run's --root
+    let store = Store::open(case)?;
+    print!("{}", clean(&fp_correlate::render_trace(&store, target)?));
     Ok(())
 }
 
@@ -665,7 +679,10 @@ fn state(case: &Path, args: StateArgs) -> Result<()> {
                 };
                 println!(
                     "{:>5}  {:<24} {:<42} {}",
-                    row.run_id, row.kind, row.key, details
+                    row.run_id,
+                    row.kind,
+                    clean(&row.key),
+                    clean(&details)
                 );
             }
         }
@@ -736,7 +753,13 @@ fn diff(case: &Path, args: DiffArgs) -> Result<()> {
                     fp_query::DiffChange::Removed => "-",
                     fp_query::DiffChange::Changed => "~",
                 };
-                println!("{:<4} {:<24} {:<42} {}", sign, e.kind, e.key, e.detail);
+                println!(
+                    "{:<4} {:<24} {:<42} {}",
+                    sign,
+                    e.kind,
+                    clean(&e.key),
+                    clean(&e.detail)
+                );
             }
             if entries.is_empty() {
                 println!("no differences between run {run_a} and run {run_b}");
@@ -770,8 +793,16 @@ fn ioc(case: &Path, args: IocArgs) -> Result<()> {
             value,
             note,
         } => {
+            let ioc_type = ioc_type.to_lowercase();
+            if !IOC_TYPES.contains(&ioc_type.as_str()) {
+                bail!(
+                    "unknown ioc type `{ioc_type}`; expected one of {}",
+                    IOC_TYPES.join(", ")
+                );
+            }
             let mut store = Store::open_or_create(case)?;
             let id = store.insert_ioc(&ioc_type, &value, note.as_deref())?;
+            fp_correlate::correlate_iocs(&mut store)?;
             println!(
                 "added IOC #{id}: {ioc_type} {value}{}",
                 note.map(|n| format!(" ({n})")).unwrap_or_default()
@@ -793,6 +824,7 @@ fn ioc(case: &Path, args: IocArgs) -> Result<()> {
                     count += 1;
                 }
             }
+            fp_correlate::correlate_iocs(&mut store)?;
             println!("imported {count} IOCs from {}", file.display());
         }
         IocCommand::Check { format } => {
@@ -948,12 +980,7 @@ fn parse_ioc_line(line: &str) -> (String, String, Option<String>) {
         body.split_whitespace().collect()
     };
 
-    if parts.len() >= 2
-        && matches!(
-            parts[0].to_lowercase().as_str(),
-            "domain" | "ip" | "cidr" | "sha256" | "path" | "url"
-        )
-    {
+    if parts.len() >= 2 && IOC_TYPES.contains(&parts[0].to_lowercase().as_str()) {
         let ioc_type = parts[0].to_lowercase();
         let val = parts[1].to_string();
         let note = if parts.len() > 2 {

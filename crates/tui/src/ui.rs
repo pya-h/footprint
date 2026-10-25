@@ -266,14 +266,17 @@ fn draw_detail(frame: &mut Frame, app: &App, theme: Theme, area: ratatui::layout
             };
             let label = format!(
                 " {:<18} {} {} {}",
-                link.rel, arrow, link.target_type, link.target_label
+                link.rel,
+                arrow,
+                link.target_type,
+                truncate(&link.target_label, 160)
             );
             let item = ListItem::new(Line::from(vec![
                 Span::styled(label, confidence_style(theme, Some(&link.confidence))),
                 Span::styled(
                     link.why
                         .as_ref()
-                        .map(|w| format!("  ({w})"))
+                        .map(|w| format!("  ({})", truncate(w, 120)))
                         .unwrap_or_default(),
                     theme.dim(),
                 ),
@@ -337,7 +340,7 @@ fn draw_trace(frame: &mut Frame, app: &App, theme: Theme, area: ratatui::layout:
             let line = if row.arrow == TraceArrow::Note {
                 Line::from(vec![
                     Span::raw(format!(" {arrow} ")),
-                    Span::styled(row.text.clone(), theme.dim()),
+                    Span::styled(truncate(&row.text, 160), theme.dim()),
                 ])
             } else {
                 let time = row
@@ -372,7 +375,7 @@ fn draw_trace(frame: &mut Frame, app: &App, theme: Theme, area: ratatui::layout:
         .collect();
     let list = List::new(items).block(
         Block::default()
-            .title(format!("trace — {head}"))
+            .title(format!("trace — {}", truncate(&head, 160)))
             .borders(Borders::NONE),
     );
     let mut state = ratatui::widgets::ListState::default();
@@ -574,12 +577,12 @@ fn draw_sources(frame: &mut Frame, app: &App, theme: Theme, area: ratatui::layou
                 Cell::from(if row.answering.is_empty() {
                     "none".to_string()
                 } else {
-                    row.answering.join(", ")
+                    truncate(&row.answering.join(", "), 200)
                 }),
                 Cell::from(if row.notes.is_empty() {
                     "-".to_string()
                 } else {
-                    row.notes.join("; ")
+                    truncate(&row.notes.join("; "), 200)
                 }),
             ])
         })
@@ -606,7 +609,7 @@ fn draw_sources(frame: &mut Frame, app: &App, theme: Theme, area: ratatui::layou
                 Cell::from(format!("{:>5}", s.id)),
                 Cell::from(s.kind.clone()),
                 Cell::from(truncate(&s.label(), 24)),
-                Cell::from(s.status_display()),
+                Cell::from(truncate(&s.status_display(), 40)),
                 Cell::from(format!("{:>6}", s.event_count)),
                 Cell::from(truncate(s.path.as_deref().unwrap_or("-"), 60)),
                 Cell::from(s.note.as_ref().map(|n| truncate(n, 60)).unwrap_or_default()),
@@ -695,8 +698,8 @@ fn draw_collect(frame: &mut Frame, app: &App, theme: Theme, area: ratatui::layou
         .iter()
         .map(|CollectLine { label, outcome }| {
             ListItem::new(Line::from(vec![
-                Span::raw(format!("{label}  ")),
-                Span::styled(outcome.clone(), theme.dim()),
+                Span::raw(format!("{}  ", truncate(label, 120))),
+                Span::styled(truncate(outcome, 200), theme.dim()),
             ]))
         })
         .collect();
