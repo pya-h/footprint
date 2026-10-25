@@ -368,7 +368,7 @@ impl Collector for FlatpakCollector {
             }
             let Some(stamp) = parse_flatpak_time(parts[0], ctx.assume_tz.as_deref()) else {
                 // a history row we could not date; counted below rather than silently dropped
-                if parts[1].contains("install") || parts[1].contains("uninstall") {
+                if ["install", "update"].iter().any(|v| parts[1].contains(v)) {
                     unparsed += 1;
                 }
                 continue;
@@ -408,16 +408,16 @@ impl Collector for FlatpakCollector {
         }
         if unparsed > 0 {
             sink.warn(format!(
-                "flatpak history: {unparsed} row(s) with an unrecognized time format \
-                 (localized month names are not parseable; set LANG=C for flatpak)"
+                "flatpak history: {unparsed} row(s) with an unrecognized time format"
             ));
         }
         Ok(())
     }
 }
 
-/// `flatpak history` prints `Jun 28 14:14:12` (syslog style: month, day, time, no year,
-/// localized) or an ISO stamp in some versions; the year rolls over like auth logs.
+/// `flatpak history` prints `Jun 28 14:14:12` (syslog style: month, day, time, no year; English
+/// under the C locale `run_listing` sets) or an ISO stamp in some versions; the year rolls over
+/// like auth logs.
 fn parse_flatpak_time(raw: &str, assume_tz: Option<&str>) -> Option<Stamp> {
     if let Ok(stamp) = Stamp::parse(
         raw,
@@ -446,9 +446,11 @@ fn parse_flatpak_time(raw: &str, assume_tz: Option<&str>) -> Option<Stamp> {
 }
 
 /// Runs a package tool's listing with a fixed argv; a failure is an error, never an empty result.
+/// The C locale keeps month names and verbs in the English the parsers read.
 fn run_listing(tool: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new(tool)
         .args(args)
+        .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
