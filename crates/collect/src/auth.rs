@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 const JOURNALCTL: &str = "/usr/bin/journalctl";
 const PERSISTENT_JOURNAL: &str = "/var/log/journal";
 const VOLATILE_JOURNAL: &str = "/run/log/journal";
-/// sudo, su and pkexec by process name, plus both names the ssh daemon unit has across distros.
+/// sudo, su and pkexec by process name, the ssh daemon (both unit names), and logind sessions.
 const MATCHES: &[&str] = &[
     "_COMM=sudo",
     "_COMM=su",
@@ -23,6 +23,8 @@ const MATCHES: &[&str] = &[
     "_SYSTEMD_UNIT=ssh.service",
     "+",
     "_SYSTEMD_UNIT=sshd.service",
+    "+",
+    "_COMM=systemd-logind",
 ];
 pub(crate) const SSH_KEPT_PREFIXES: &[&str] = &[
     "Accepted ",
@@ -236,6 +238,15 @@ pub(crate) fn ssh_peer(message: &str) -> Option<String> {
     Some(after.split_whitespace().next()?.to_string())
 }
 
+/// `New session 3 of user paya.` -> the user; logouts are not events
+fn parse_logind_session(message: &str) -> Option<&str> {
+    let after = message
+        .strip_prefix("New session ")?
+        .split_once(" of user ")?
+        .1;
+    Some(after.trim_end_matches('.').trim())
+}
+
 impl JournalEntry {
     fn into_event(
         self,
@@ -276,6 +287,12 @@ impl JournalEntry {
                 subject_host.clone().unwrap_or_default(),
                 message.to_string(),
             )
+        } else if comm == "systemd-logind" {
+            let Some(user) = parse_logind_session(message) else {
+                return Ok(None);
+            };
+            actor.user = Some(user.to_string());
+            (EventKind::AuthLogin, user.to_string(), message.to_string())
         } else if comm == "sudo" {
             let Some(sudo) = parse_sudo(message) else {
                 return Ok(None);
@@ -367,6 +384,24 @@ mod tests {
             .unwrap()
             .into_event(&ctx, &inst, &origin)
             .unwrap()
+    }
+
+    #[test]
+    fn journald_logind_session() {
+        let e = entry(r#"{"__REALTIME_TIMESTAMP":"1","__CURSOR":"c","_COMM":"systemd-logind","MESSAGE":"New session 3 of user paya."}"#)
+        .unwrap();
+        assert_eq!(e.kind, EventKind::AuthLogin);
+        assert_eq!(e.subject, "paya");
+        assert!(e.actor.as_ref().unwrap().user.as_deref() == Some("paya"));
+        // logouts and unrelated logind chatter are not events
+        assert!(
+            entry(r#"{"__REALTIME_TIMESTAMP":"1","__CURSOR":"c","_COMM":"systemd-logind","MESSAGE":"Removed session 3."}"#)
+            .is_none()
+        );
+        assert!(
+            entry(r#"{"__REALTIME_TIMESTAMP":"1","__CURSOR":"c","_COMM":"systemd-logind","MESSAGE":"Watching system buttons on /dev/input/event0"}"#)
+            .is_none()
+        );
     }
 
     #[test]

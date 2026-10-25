@@ -22,6 +22,31 @@ const KNOWN_MANAGERS: &[(&str, &str)] = &[
 
 pub struct XattrDownloadCollector;
 
+/// Download directories: `XDG_DOWNLOAD_DIR` from `user-dirs.dirs` (localized names land
+/// there), falling back to `~/Downloads`. `$HOME` in the value expands to the user's home.
+fn download_dirs(env: &Env) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let config = env.home.join(".config/user-dirs.dirs");
+    if let Ok(text) = std::fs::read_to_string(&config) {
+        for line in text.lines() {
+            let Some(value) = line.trim().strip_prefix("XDG_DOWNLOAD_DIR=") else {
+                continue;
+            };
+            let value = value.trim().trim_matches('"');
+            let expanded = value.replacen("$HOME", &env.home.to_string_lossy(), 1);
+            let path = std::path::PathBuf::from(expanded);
+            if !dirs.contains(&path) {
+                dirs.push(path);
+            }
+        }
+    }
+    let default = env.home.join("Downloads");
+    if !dirs.contains(&default) {
+        dirs.push(default);
+    }
+    dirs
+}
+
 impl Collector for XattrDownloadCollector {
     fn per_user(&self) -> bool {
         true
@@ -32,13 +57,17 @@ impl Collector for XattrDownloadCollector {
     }
 
     fn discover(&self, env: &Env) -> Vec<SourceInstance> {
-        let downloads = env.home.join("Downloads");
-        if !downloads.is_dir() {
-            let mut inst = SourceInstance::new(self.kind(), "xattr", None, downloads);
+        let dirs = download_dirs(env);
+        let present: Vec<_> = dirs.iter().filter(|d| d.is_dir()).collect();
+        if present.is_empty() {
+            let mut inst = SourceInstance::new(self.kind(), "xattr", None, dirs[0].clone());
             inst.status = Availability::NotInstalled;
             return vec![inst];
         }
-        vec![SourceInstance::new(self.kind(), "xattr", None, downloads)]
+        present
+            .into_iter()
+            .map(|d| SourceInstance::new(self.kind(), "xattr", None, d.clone()))
+            .collect()
     }
 
     fn collect(&self, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut Sink) -> Result<()> {
@@ -154,6 +183,31 @@ impl Collector for DlmgrDetectCollector {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn honors_xdg_download_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home/u");
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::create_dir_all(home.join("Descargas")).unwrap();
+        // localized download dir via XDG: the fallback name differs from the default
+        std::fs::write(
+            home.join(".config/user-dirs.dirs"),
+            "XDG_DOWNLOAD_DIR=\"$HOME/Descargas\"\nXDG_DESKTOP_DIR=\"$HOME/Desktop\"\n",
+        )
+        .unwrap();
+
+        let env = Env::test(home.clone(), PathBuf::from("/"));
+        let instances = XattrDownloadCollector.discover(&env);
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].path, home.join("Descargas"));
+
+        // without a config the default ~/Downloads is used
+        std::fs::remove_file(home.join(".config/user-dirs.dirs")).unwrap();
+        let instances = XattrDownloadCollector.discover(&env);
+        assert_eq!(instances[0].path, home.join("Downloads"));
+        assert_eq!(instances[0].status, Availability::NotInstalled);
+    }
 
     #[test]
     fn discovers_detect_managers() {

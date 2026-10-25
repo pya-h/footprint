@@ -5,6 +5,7 @@ use crate::event::{Origin, Stamp, new_event};
 use crate::probe::Probe;
 use crate::utils::{in_window, read_evidence, with_rotations};
 use anyhow::{Context, Result, bail};
+use chrono::Datelike;
 use fp_core::time::TimeFormat;
 use fp_core::{Actor, Availability, EventKind, SourceInstance};
 use serde_json::json;
@@ -359,16 +360,17 @@ impl Collector for FlatpakCollector {
             sha256: None,
         };
 
+        let mut unparsed = 0usize;
         for line in text.lines() {
             let parts: Vec<&str> = line.split('\t').map(|s| s.trim()).collect();
             if parts.len() < 3 {
                 continue;
             }
-            let Ok(stamp) = Stamp::parse(
-                parts[0],
-                TimeFormat::LocalNaive("%Y-%m-%d %H:%M:%S".into()),
-                ctx.assume_tz.as_deref(),
-            ) else {
+            let Some(stamp) = parse_flatpak_time(parts[0], ctx.assume_tz.as_deref()) else {
+                // a history row we could not date; counted below rather than silently dropped
+                if parts[1].contains("install") || parts[1].contains("uninstall") {
+                    unparsed += 1;
+                }
                 continue;
             };
             if !in_window(ctx, stamp.ts_utc) {
@@ -404,8 +406,43 @@ impl Collector for FlatpakCollector {
                 )
             });
         }
+        if unparsed > 0 {
+            sink.warn(format!(
+                "flatpak history: {unparsed} row(s) with an unrecognized time format \
+                 (localized month names are not parseable; set LANG=C for flatpak)"
+            ));
+        }
         Ok(())
     }
+}
+
+/// `flatpak history` prints `Jun 28 14:14:12` (syslog style: month, day, time, no year,
+/// localized) or an ISO stamp in some versions; the year rolls over like auth logs.
+fn parse_flatpak_time(raw: &str, assume_tz: Option<&str>) -> Option<Stamp> {
+    if let Ok(stamp) = Stamp::parse(
+        raw,
+        TimeFormat::LocalNaive("%Y-%m-%d %H:%M:%S".into()),
+        assume_tz,
+    ) {
+        return Some(stamp);
+    }
+    if let Ok(stamp) = Stamp::parse(raw, TimeFormat::Rfc3339, None) {
+        return Some(stamp);
+    }
+    let now = chrono::Local::now().naive_local();
+    let at_year = |year: i32| {
+        chrono::NaiveDateTime::parse_from_str(&format!("{year} {raw}"), "%Y %b %e %H:%M:%S").ok()
+    };
+    let mut dt = at_year(now.year())?;
+    if dt > now + chrono::Duration::days(1) {
+        dt = at_year(now.year() - 1)?;
+    }
+    Stamp::parse(
+        dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        TimeFormat::LocalNaive("%Y-%m-%d %H:%M:%S".into()),
+        assume_tz,
+    )
+    .ok()
 }
 
 /// Runs a package tool's listing with a fixed argv; a failure is an error, never an empty result.
@@ -597,6 +634,57 @@ mod tests {
             .collect(&inst, &ctx, &mut Sink::default())
             .unwrap_err();
         assert!(format!("{err:#}").contains("cannot communicate"), "{err:#}");
+    }
+
+    #[test]
+    fn parses_real_flatpak_history_format() {
+        // what `flatpak history --columns=time,change,application` prints on a real host
+        let dir = tempfile::tempdir().unwrap();
+        let tool = crate::utils::script_tool(
+            dir.path(),
+            "flatpak",
+            "printf '%s\t%s\t%s\n' \
+             'Jun 28 14:14:12' 'deploy install' 'org.freedesktop.Platform.openh264' \
+             'Jun 28 15:21:24' 'deploy update' 'com.visualstudio.code' \
+             'Jul  8 18:34:55' 'uninstall' 'org.old.App'",
+        );
+        let inst = SourceInstance::new("pkg.flatpak", "flatpak", None, tool);
+        let ctx = CollectCtx {
+            run_id: 1,
+            since: None,
+            until: None,
+            assume_tz: Some("UTC".into()),
+            temp_dir: dir.path().join("tmp"),
+        };
+        let mut sink = Sink::default();
+        FlatpakCollector.collect(&inst, &ctx, &mut sink).unwrap();
+
+        let kinds: Vec<_> = sink
+            .events
+            .iter()
+            .map(|e| (e.kind, e.subject.as_str()))
+            .collect();
+        assert!(
+            kinds.contains(&(EventKind::PkgInstall, "org.freedesktop.Platform.openh264")),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&(EventKind::PkgUpgrade, "com.visualstudio.code")),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&(EventKind::PkgRemove, "org.old.App")),
+            "{kinds:?}"
+        );
+        // the month/day/time survive, whatever year rollover did
+        let shown = fp_query_free_time(&sink.events[0]);
+        assert!(shown.contains("Jun 28 14:14:12"), "{shown}");
+
+        fn fp_query_free_time(event: &fp_core::Event) -> String {
+            chrono::DateTime::from_timestamp_micros(event.ts_utc)
+                .map(|d| d.format("%b %e %H:%M:%S").to_string())
+                .unwrap_or_default()
+        }
     }
 
     #[test]
