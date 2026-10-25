@@ -6,6 +6,7 @@ pub mod desktop;
 pub mod desktop_fallbacks;
 pub mod downloads;
 pub mod event;
+pub mod firefox;
 pub mod fs;
 pub mod persist;
 pub mod pkg;
@@ -22,6 +23,7 @@ pub use probe::{DistroFamily, Probe};
 pub fn registry() -> Vec<Box<dyn Collector>> {
     vec![
         Box::new(chromium::ChromiumCollector),
+        Box::new(firefox::FirefoxCollector),
         Box::new(xdm::XdmCollector),
         Box::new(downloads::XattrDownloadCollector),
         Box::new(downloads::DlmgrDetectCollector),

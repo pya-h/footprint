@@ -412,6 +412,80 @@ pub fn fake_zoom(base: &Path) -> io::Result<Scenario> {
     })
 }
 
+/// A Firefox profile next to the fake-Zoom scenario: a redirect chain, a download with
+/// annos, a camera permission, and one extension. Returns the profile directory.
+pub fn firefox_profile(base: &Path) -> io::Result<PathBuf> {
+    let home = base.join("home/u");
+    let profile = home.join(".mozilla/firefox/fake.default-release");
+    fs::create_dir_all(&profile)?;
+    let sqlite = |e: rusqlite::Error| io::Error::other(e);
+
+    let places = profile.join("places.sqlite");
+    let conn = Connection::open(&places).map_err(sqlite)?;
+    conn.execute_batch(
+        "CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT, title TEXT, rev_host TEXT,
+            visit_count INTEGER, hidden INTEGER, typed INTEGER, frecency INTEGER, last_visit_date INTEGER);
+        CREATE TABLE moz_historyvisits (id INTEGER PRIMARY KEY, from_visit INTEGER, place_id INTEGER NOT NULL,
+            visit_date INTEGER NOT NULL, visit_type INTEGER NOT NULL, session INTEGER);
+        CREATE TABLE moz_anno_attributes (id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+        CREATE TABLE moz_annos (id INTEGER PRIMARY KEY, place_id INTEGER, anno_attribute_id INTEGER,
+            content TEXT, flags INTEGER, expiration INTEGER, type INTEGER, dateAdded INTEGER, lastModified INTEGER);
+        INSERT INTO moz_places (id, url, title) VALUES
+            (1, 'https://mail.google.com/mail/u/0/#msg', 'Gmail'),
+            (2, 'https://site-redirect.com/r/abc', ''),
+            (3, 'https://us09-web-zoom.com/j/999', 'Zoom Meeting'),
+            (4, 'https://cdn.zoom.us/prod/7.2.1.5760/zoom_amd64.deb', '');
+        INSERT INTO moz_historyvisits (id, from_visit, place_id, visit_date, visit_type) VALUES
+            (1, 0, 1, 1792170890000000, 1),
+            (2, 1, 2, 1792170891000000, 5),
+            (3, 2, 3, 1792170892000000, 6);
+        INSERT INTO moz_anno_attributes (id, name) VALUES
+            (1, 'downloads/destinationFileURI'),
+            (2, 'downloads/metaData');
+        INSERT INTO moz_annos (place_id, anno_attribute_id, content, dateAdded, lastModified) VALUES
+            (4, 1, 'file:///home/u/Downloads/zoom_amd64.deb', 1792170893000000, 1792170893000000),
+            (4, 2, '{\"fileSize\":317514752,\"endTime\":1792170893000000,\"state\":1}', 1792170893000000, 1792170893000000);
+        ",
+    )
+    .map_err(sqlite)?;
+    conn.close().map_err(|(_, e)| io::Error::other(e))?;
+
+    let perms = profile.join("permissions.sqlite");
+    let conn = Connection::open(&perms).map_err(sqlite)?;
+    conn.execute_batch(
+        "CREATE TABLE moz_perms (id INTEGER PRIMARY KEY, origin TEXT, type TEXT, permission INTEGER,
+            expireType INTEGER, expireTime INTEGER, modificationTime INTEGER);
+        INSERT INTO moz_perms (origin, type, permission, modificationTime) VALUES
+            ('https://us09-web-zoom.com', 'camera', 1, 1792170900000000),
+            ('https://us09-web-zoom.com', 'desktop-notification', 2, 1792170901000000);
+        ",
+    )
+    .map_err(sqlite)?;
+    conn.close().map_err(|(_, e)| io::Error::other(e))?;
+
+    json_file(
+        &profile.join("extensions.json"),
+        &json!({ "addons": [
+            {
+                "id": "uBlock0@raymondhill.net",
+                "version": "1.60.0",
+                "location": "app-profile",
+                "active": true,
+                "installDate": 1792174710000i64,
+                "defaultLocale": { "name": "uBlock Origin" }
+            },
+            {
+                "id": "screenshot@mozilla.org",
+                "location": "app-system-defaults",
+                "active": true,
+                "installDate": 1792174710000i64,
+                "defaultLocale": { "name": "Firefox Screenshots" }
+            }
+        ] }),
+    )?;
+    Ok(profile)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
