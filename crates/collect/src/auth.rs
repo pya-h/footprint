@@ -24,7 +24,7 @@ const MATCHES: &[&str] = &[
     "+",
     "_SYSTEMD_UNIT=sshd.service",
 ];
-const SSH_KEPT_PREFIXES: &[&str] = &[
+pub(crate) const SSH_KEPT_PREFIXES: &[&str] = &[
     "Accepted ",
     "Failed ",
     "Invalid user ",
@@ -176,17 +176,34 @@ fn message_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Err
 
 /// A parsed sudo `MESSAGE`: `paya : TTY=/dev/pts/1 ; PWD=/home/paya ; USER=root ; COMMAND=/usr/bin/apt install ./x.deb`
 #[derive(Debug, Default, PartialEq)]
-struct SudoLine<'a> {
-    invoker: &'a str,
-    target: Option<&'a str>,
-    tty: Option<&'a str>,
-    pwd: Option<&'a str>,
-    command: Option<&'a str>,
+pub(crate) struct SudoLine<'a> {
+    pub(crate) invoker: &'a str,
+    pub(crate) target: Option<&'a str>,
+    pub(crate) tty: Option<&'a str>,
+    pub(crate) pwd: Option<&'a str>,
+    pub(crate) command: Option<&'a str>,
     /// `3 incorrect password attempts`, `user NOT in sudoers`, …
-    problem: Option<&'a str>,
+    pub(crate) problem: Option<&'a str>,
 }
 
-fn parse_sudo(message: &str) -> Option<SudoLine<'_>> {
+impl SudoLine<'_> {
+    /// `paya: /usr/bin/apt install ./x.deb (as bob) (pts/1) [3 incorrect password attempts]`
+    pub(crate) fn summary(&self) -> String {
+        let mut summary = format!("{}: {}", self.invoker, self.command.unwrap_or("?"));
+        if let Some(target) = self.target.filter(|t| *t != "root") {
+            summary.push_str(&format!(" (as {target})"));
+        }
+        if let Some(tty) = self.tty {
+            summary.push_str(&format!(" ({tty})"));
+        }
+        if let Some(problem) = self.problem {
+            summary.push_str(&format!(" [{problem}]"));
+        }
+        summary
+    }
+}
+
+pub(crate) fn parse_sudo(message: &str) -> Option<SudoLine<'_>> {
     let (invoker, rest) = message.split_once(" : ")?;
     let (fields, command) = match rest.split_once("COMMAND=") {
         Some((fields, cmd)) => (fields, Some(cmd.trim())),
@@ -214,7 +231,7 @@ fn parse_sudo(message: &str) -> Option<SudoLine<'_>> {
 }
 
 /// `from 203.0.113.7 port 51234`
-fn ssh_peer(message: &str) -> Option<String> {
+pub(crate) fn ssh_peer(message: &str) -> Option<String> {
     let after = message.split_once(" from ")?.1;
     Some(after.split_whitespace().next()?.to_string())
 }
@@ -264,16 +281,7 @@ impl JournalEntry {
                 return Ok(None);
             };
             actor.user = Some(sudo.invoker.to_string());
-            let mut summary = format!("{}: {}", sudo.invoker, sudo.command.unwrap_or("?"));
-            if let Some(target) = sudo.target.filter(|t| *t != "root") {
-                summary.push_str(&format!(" (as {target})"));
-            }
-            if let Some(tty) = sudo.tty {
-                summary.push_str(&format!(" ({tty})"));
-            }
-            if let Some(problem) = sudo.problem {
-                summary.push_str(&format!(" [{problem}]"));
-            }
+            let summary = sudo.summary();
             attrs = json!({
                 "comm": comm,
                 "message": message,

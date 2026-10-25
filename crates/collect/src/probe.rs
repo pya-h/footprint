@@ -16,6 +16,17 @@ pub enum DistroFamily {
 
 pub struct Probe;
 
+/// The effective and supplementary groups of this process.
+fn process_groups() -> Vec<u32> {
+    // SAFETY: a zero-sized call only returns the count; the second fills at most `n` entries
+    let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups = vec![0; n.max(0) as usize];
+    let filled = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+    groups.truncate(filled.max(0) as usize);
+    groups.push(unsafe { libc::getegid() });
+    groups
+}
+
 impl Probe {
     /// Resolves a tool by absolute path within `env.root` (/usr/bin, /bin, /usr/sbin, /sbin, /usr/local/bin).
     pub fn tool_path(env: &Env, name: &str) -> Option<PathBuf> {
@@ -78,57 +89,51 @@ impl Probe {
         DistroFamily::Unknown
     }
 
-    /// Checks if the invoking or effective user can read system journal entries.
-    /// Returns true if running as root (euid == 0) or user is a member of `adm` or `systemd-journal`.
+    /// Root, or a process that holds `adm` or `systemd-journal`. The process's own groups
+    /// count, not `/etc/group`'s member list: a user added there but not logged in again
+    /// still can't read the journal.
     pub fn can_read_system_journal(env: &Env) -> bool {
         if env.euid == 0 || env.uid == 0 {
             return true;
         }
-        let user = std::env::var("USER").unwrap_or_default();
-        Self::user_in_any_group(env, &user, env.uid, &["adm", "systemd-journal"])
+        let wanted = Self::group_ids(env, &["adm", "systemd-journal"]);
+        process_groups().iter().any(|g| wanted.contains(g))
     }
 
-    /// Checks `/etc/group` within `env.root` to see if `user` or `uid` belongs to any of `target_groups`.
-    pub fn user_in_any_group(env: &Env, user: &str, uid: u32, target_groups: &[&str]) -> bool {
-        let group_path = env.system_path("/etc/group");
-        let Ok(contents) = fs::read_to_string(group_path) else {
-            return false;
+    /// The gids `/etc/group` (under `env.root`) gives the named groups.
+    pub fn group_ids(env: &Env, names: &[&str]) -> Vec<u32> {
+        let Ok(contents) = fs::read_to_string(env.system_path("/etc/group")) else {
+            return Vec::new();
         };
-        for line in contents.lines() {
-            let mut parts = line.split(':');
-            let (Some(grp_name), _, Some(gid_str), Some(members)) =
-                (parts.next(), parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            if !target_groups.contains(&grp_name) {
-                continue;
-            }
-            if gid_str.parse::<u32>().is_ok_and(|g| g == uid) {
-                return true;
-            }
-            if !user.is_empty() && members.split(',').any(|m| m.trim() == user) {
-                return true;
-            }
-        }
-        false
+        contents
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split(':');
+                let name = parts.next()?;
+                let gid = parts.nth(1)?.parse().ok()?;
+                names.contains(&name).then_some(gid)
+            })
+            .collect()
     }
 
-    /// Reads an extended attribute from a file on Linux. Returns None if not supported or not present.
+    /// Reads an extended attribute of the path itself (a symlink is not followed).
+    /// `None` when absent or unsupported.
     pub fn get_xattr(path: &std::path::Path, name: &str) -> Option<String> {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
 
         let path_c = CString::new(path.as_os_str().as_bytes()).ok()?;
         let name_c = CString::new(name.as_bytes()).ok()?;
+        // SAFETY: NUL-terminated strings; a null buffer with size 0 only asks for the length
         let len =
-            unsafe { libc::getxattr(path_c.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0) };
+            unsafe { libc::lgetxattr(path_c.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0) };
         if len <= 0 {
             return None;
         }
         let mut buf = vec![0u8; len as usize];
+        // SAFETY: the kernel writes at most `buf.len()` bytes into `buf`
         let read = unsafe {
-            libc::getxattr(
+            libc::lgetxattr(
                 path_c.as_ptr(),
                 name_c.as_ptr(),
                 buf.as_mut_ptr() as *mut libc::c_void,
@@ -138,6 +143,8 @@ impl Probe {
         if read <= 0 {
             return None;
         }
+        // the value may have shrunk between the two calls
+        buf.truncate(read as usize);
         String::from_utf8(buf).ok()
     }
 }
@@ -181,9 +188,12 @@ mod tests {
         )
         .unwrap();
 
-        let mut env = Env::current();
-        env.root = dir.path().to_path_buf();
-        assert!(Probe::user_in_any_group(&env, "paya", 1000, &["adm"]));
-        assert!(!Probe::user_in_any_group(&env, "other", 1001, &["adm"]));
+        let env = Env::test(dir.path().join("home"), dir.path().to_path_buf());
+        assert_eq!(Probe::group_ids(&env, &["adm"]), [4]);
+        assert_eq!(
+            Probe::group_ids(&env, &["adm", "systemd-journal"]),
+            [4, 101]
+        );
+        assert!(Probe::group_ids(&env, &["wheel"]).is_empty());
     }
 }

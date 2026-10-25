@@ -1,11 +1,12 @@
 //! Privilege and login fallbacks: syslog auth logs (/var/log/auth.log* and /var/log/secure*).
 
+use crate::auth::{SSH_KEPT_PREFIXES, parse_sudo, ssh_peer};
 use crate::collector::{CollectCtx, Collector, Env, Sink};
 use crate::event::{Origin, Stamp, new_event};
 use crate::redact::redact_secrets;
 use crate::utils::{in_window, read_evidence, with_rotations};
 use anyhow::Result;
-use chrono::{Datelike, Local};
+use chrono::{Datelike, Local, NaiveDateTime};
 use fp_core::time::TimeFormat;
 use fp_core::{Actor, Availability, EventKind, SourceInstance};
 use serde_json::json;
@@ -54,11 +55,11 @@ impl Collector for AuthLogCollector {
             sha256: Some(&file.sha256),
         };
         let text = String::from_utf8_lossy(&file.bytes);
-        let year = Local::now().year();
+        let now = Local::now().naive_local();
 
         for (idx, line) in text.lines().enumerate() {
             let line_no = idx + 1;
-            let (raw_ts, after_ts) = match parse_log_timestamp(line, year) {
+            let (raw_ts, after_ts) = match parse_log_timestamp(line, now) {
                 Some(pair) => pair,
                 None => continue,
             };
@@ -93,24 +94,25 @@ impl Collector for AuthLogCollector {
     }
 }
 
-fn parse_log_timestamp(line: &str, current_year: i32) -> Option<(String, &str)> {
-    // 1. ISO format: 2026-10-16T21:07:56.123456+03:30 ...
-    if line.len() > 19 && line.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        let (ts, rest) = line.split_once(' ')?;
-        return Some((ts.to_string(), rest));
+/// The line's timestamp and the rest. Syslog's `Oct 16 21:07:56` has no year: the current
+/// one is assumed, and a date that would lie in the future belongs to last year (a December
+/// log read in January).
+fn parse_log_timestamp(line: &str, now: NaiveDateTime) -> Option<(String, &str)> {
+    if line.len() > 19 && line.starts_with(|c: char| c.is_ascii_digit()) {
+        return line
+            .split_once(' ')
+            .map(|(ts, rest)| (ts.to_string(), rest));
     }
-    // 2. Syslog format: Oct 16 21:07:56 ...
-    if let Some(ts_part) = line.get(..15) {
-        let rest = &line[15..].trim_start();
-        // convert "Oct 16 21:07:56" with year
-        let dt = chrono::NaiveDateTime::parse_from_str(
-            &format!("{current_year} {ts_part}"),
-            "%Y %b %e %H:%M:%S",
-        )
-        .ok()?;
-        return Some((dt.format("%Y-%m-%d %H:%M:%S").to_string(), rest));
+    let ts_part = line.get(..15)?;
+    let rest = line[15..].trim_start();
+    let at_year = |year: i32| {
+        NaiveDateTime::parse_from_str(&format!("{year} {ts_part}"), "%Y %b %e %H:%M:%S").ok()
+    };
+    let mut dt = at_year(now.year())?;
+    if dt > now + chrono::Duration::days(1) {
+        dt = at_year(now.year() - 1)?;
     }
-    None
+    Some((dt.format("%Y-%m-%d %H:%M:%S").to_string(), rest))
 }
 
 fn parse_sudo_line(
@@ -122,55 +124,30 @@ fn parse_sudo_line(
     msg: &str,
     sink: &mut Sink,
 ) {
-    // format: invoker : TTY=pts/1 ; PWD=... ; USER=root ; COMMAND=/usr/bin/apt ...
-    let Some((invoker, rest)) = msg.split_once(':') else {
+    let msg = redact_secrets(msg);
+    let Some(sudo) = parse_sudo(&msg) else {
         return;
     };
-    let invoker = invoker.trim();
-    let mut target_user = "root";
-    let mut command = "";
-    let mut pwd = "";
-    let mut tty = "";
-
-    for part in rest.split(';') {
-        let part = part.trim();
-        if let Some(u) = part.strip_prefix("USER=") {
-            target_user = u;
-        } else if let Some(cmd) = part.strip_prefix("COMMAND=") {
-            command = cmd;
-        } else if let Some(p) = part.strip_prefix("PWD=") {
-            pwd = p;
-        } else if let Some(t) = part.strip_prefix("TTY=") {
-            tty = t;
-        }
-    }
-
-    if command.is_empty() {
-        return;
-    }
-
-    let redacted_cmd = redact_secrets(command);
-    let summary = format!("{invoker}: {redacted_cmd} ({tty})");
-
     sink.event(fp_core::Event {
         actor: Some(Actor {
-            user: Some(invoker.to_string()),
-            ..Actor::default()
+            user: Some(sudo.invoker.to_string()),
+            ..Actor::app("sudo")
         }),
         attrs: json!({
-            "invoker": invoker,
-            "target_user": target_user,
-            "command": redacted_cmd,
-            "pwd": pwd,
-            "tty": tty,
+            "invoker": sudo.invoker,
+            "target_user": sudo.target,
+            "command": sudo.command,
+            "pwd": sudo.pwd,
+            "tty": sudo.tty,
+            "problem": sudo.problem,
         }),
         ..new_event(
             ctx,
             inst,
             stamp,
             EventKind::PrivSudo,
-            redacted_cmd.into_owned(),
-            summary,
+            sudo.command.unwrap_or_default().to_string(),
+            sudo.summary(),
             origin.at(format!("line {line_no}")),
         )
     });
@@ -185,25 +162,25 @@ fn parse_ssh_line(
     msg: &str,
     sink: &mut Sink,
 ) {
-    if !msg.starts_with("Accepted ") && !msg.starts_with("Failed ") {
+    if !SSH_KEPT_PREFIXES.iter().any(|p| msg.starts_with(p)) {
         return;
     }
-    let is_accepted = msg.starts_with("Accepted ");
-    let summary = msg.to_string();
-
+    let peer = ssh_peer(msg);
     sink.event(fp_core::Event {
         actor: Some(Actor::app("sshd")),
+        subject_host: peer.clone(),
         attrs: json!({
-            "accepted": is_accepted,
+            "accepted": msg.starts_with("Accepted "),
             "message": msg,
+            "peer": peer,
         }),
         ..new_event(
             ctx,
             inst,
             stamp,
             EventKind::AuthSsh,
+            peer.clone().unwrap_or_default(),
             msg.to_string(),
-            summary,
             origin.at(format!("line {line_no}")),
         )
     });
@@ -487,7 +464,9 @@ mod tests {
         std::fs::write(
             &log,
             "2026-10-16T21:07:56.000000+03:30 host sudo: paya : TTY=pts/1 ; PWD=/home/paya ; USER=root ; COMMAND=/usr/bin/apt install ./zoom_amd64.deb\n\
-             2026-10-16T21:05:00.000000+03:30 host sshd[1234]: Accepted publickey for paya from 192.168.1.1 port 22 ssh2\n",
+             2026-10-16T21:06:00.000000+03:30 host sudo:     paya : TTY=pts/1 ; PWD=/home/paya ; USER=root ; COMMAND=/bin/sh -c echo a; echo b\n\
+             2026-10-16T21:05:00.000000+03:30 host sshd[1234]: Accepted publickey for paya from 192.168.1.1 port 22 ssh2\n\
+             2026-10-16T21:05:01.000000+03:30 host sshd[1235]: Invalid user admin from 203.0.113.7 port 4242\n",
         )
         .unwrap();
 
@@ -502,12 +481,26 @@ mod tests {
         let mut sink = Sink::default();
         AuthLogCollector.collect(&inst, &ctx, &mut sink).unwrap();
 
-        assert_eq!(sink.events.len(), 2);
+        assert_eq!(sink.events.len(), 4);
         assert_eq!(sink.events[0].kind, EventKind::PrivSudo);
         assert_eq!(
             sink.events[0].subject,
             "/usr/bin/apt install ./zoom_amd64.deb"
         );
-        assert_eq!(sink.events[1].kind, EventKind::AuthSsh);
+        // COMMAND= runs to the end of the line, `;` included
+        assert_eq!(sink.events[1].subject, "/bin/sh -c echo a; echo b");
+        assert_eq!(sink.events[2].kind, EventKind::AuthSsh);
+        assert_eq!(sink.events[2].subject, "192.168.1.1");
+        assert_eq!(sink.events[3].subject_host.as_deref(), Some("203.0.113.7"));
+    }
+
+    #[test]
+    fn yearless_syslog_dates_never_land_in_the_future() {
+        let jan =
+            NaiveDateTime::parse_from_str("2027-01-02 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let (dec, _) = parse_log_timestamp("Dec 31 23:59:00 host sshd[1]: x", jan).unwrap();
+        assert_eq!(dec, "2026-12-31 23:59:00");
+        let (same, _) = parse_log_timestamp("Jan  2 09:00:00 host sshd[1]: x", jan).unwrap();
+        assert_eq!(same, "2027-01-02 09:00:00");
     }
 }

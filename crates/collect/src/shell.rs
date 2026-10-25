@@ -82,7 +82,8 @@ impl Collector for ShellCollector {
                 && (histfile.starts_with(&env.home)
                     || std::env::var_os("HOME").map(PathBuf::from).as_ref() == Some(&env.home))
             {
-                candidates.push(("bash", histfile, Format::Bash));
+                let (app, format) = histfile_kind(&histfile, std::env::var_os("SHELL").as_deref());
+                candidates.push((app, histfile, format));
             }
 
             // 2. Check $ZDOTDIR if set and belongs to target home
@@ -181,6 +182,24 @@ impl Collector for ShellCollector {
             });
         }
         Ok(())
+    }
+}
+
+/// Bash and zsh both honour `$HISTFILE`; the name says which (`.zsh_history`, `.histfile`),
+/// else the login shell does.
+fn histfile_kind(
+    path: &std::path::Path,
+    shell: Option<&std::ffi::OsStr>,
+) -> (&'static str, Format) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let zsh_shell = shell.is_some_and(|s| s.to_string_lossy().ends_with("zsh"));
+    if name.contains("zsh") || name == ".histfile" || (zsh_shell && !name.contains("bash")) {
+        ("zsh", Format::Zsh)
+    } else {
+        ("bash", Format::Bash)
     }
 }
 
@@ -388,6 +407,19 @@ fn libedit_unescape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn histfile_format_follows_name_then_shell() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+        let bash = Some(OsStr::new("/bin/bash"));
+        let zsh = Some(OsStr::new("/usr/bin/zsh"));
+        assert_eq!(histfile_kind(Path::new("/h/.zsh_history"), bash).0, "zsh");
+        assert_eq!(histfile_kind(Path::new("/h/.histfile"), bash).0, "zsh");
+        assert_eq!(histfile_kind(Path::new("/h/.my_history"), zsh).0, "zsh");
+        assert_eq!(histfile_kind(Path::new("/h/.bash_history"), zsh).0, "bash");
+        assert_eq!(histfile_kind(Path::new("/h/.my_history"), bash).0, "bash");
+    }
+
     fn commands(entries: &[Entry]) -> Vec<(&str, Option<i64>)> {
         entries
             .iter()
@@ -502,10 +534,8 @@ mod tests {
         unsafe {
             std::env::remove_var("HISTFILE");
         }
-        assert!(
-            instances
-                .iter()
-                .any(|i| i.path == custom && i.app == "bash")
-        );
+        // the format follows the login shell for a neutral name like this one
+        let (app, _) = histfile_kind(&custom, std::env::var_os("SHELL").as_deref());
+        assert!(instances.iter().any(|i| i.path == custom && i.app == app));
     }
 }
