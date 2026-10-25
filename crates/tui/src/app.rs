@@ -510,7 +510,7 @@ impl App {
         if matches!(key, Key::Char('t')) && !self.editing && self.view == View::Timeline {
             self.tz = match self.tz {
                 Tz::Local => Tz::Utc,
-                Tz::Utc => Tz::Local,
+                Tz::Utc | Tz::Fixed(_) => Tz::Local,
             };
             return Ok(false);
         }

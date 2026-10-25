@@ -113,6 +113,9 @@ struct ListArgs {
     /// newest first
     #[arg(short, long)]
     reverse: bool,
+    /// render times in this zone (`local`, `UTC`, `+03:30`)
+    #[arg(long)]
+    tz: Option<String>,
     #[arg(long, value_enum, default_value_t = Format::Table)]
     format: Format,
 }
@@ -394,10 +397,16 @@ fn list(case: &Path, args: ListArgs) -> Result<()> {
         reverse: args.reverse,
     };
     let rows = fp_query::timeline(&store, &filter)?;
+    let tz = args
+        .tz
+        .as_deref()
+        .map(fp_query::parse_tz)
+        .transpose()?
+        .unwrap_or(fp_query::Tz::Local);
     if let Some(gb) = args.group_by {
-        print_grouped(rows, gb, args.format, args.limit)
+        print_grouped(rows, gb, args.format, args.limit, tz)
     } else {
-        print_rows(rows, args.format)
+        print_rows(rows, args.format, tz)
     }
 }
 
@@ -406,6 +415,7 @@ fn print_grouped(
     group_by: GroupBy,
     format: Format,
     limit: Option<usize>,
+    tz: fp_query::Tz,
 ) -> Result<()> {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
@@ -424,12 +434,9 @@ fn print_grouped(
             }
             GroupBy::Host => r.subject_host.clone().unwrap_or_else(|| "-".into()),
             GroupBy::Source => r.source_label(),
-            GroupBy::Minute => fp_query::format_time(
-                r.ts_utc,
-                &r.ts_precision,
-                fp_query::Tz::Local,
-                "%Y-%m-%d %H:%M",
-            ),
+            GroupBy::Minute => {
+                fp_query::format_time(r.ts_utc, &r.ts_precision, tz, "%Y-%m-%d %H:%M")
+            }
         };
         *counts.entry(key).or_insert(0) += 1;
     }
@@ -469,7 +476,7 @@ fn print_grouped(
     Ok(())
 }
 
-fn print_rows(rows: Vec<fp_query::TimelineRow>, format: Format) -> Result<()> {
+fn print_rows(rows: Vec<fp_query::TimelineRow>, format: Format, tz: fp_query::Tz) -> Result<()> {
     if matches!(format, Format::Csv) {
         println!("id,time,source,kind,summary,ioc_hits");
     }
@@ -494,12 +501,7 @@ fn print_rows(rows: Vec<fp_query::TimelineRow>, format: Format) -> Result<()> {
                 println!(
                     "{:>6}  {:<19}  {:<18} {:<21} {}{}",
                     row.id,
-                    fp_query::format_time(
-                        row.ts_utc,
-                        &row.ts_precision,
-                        fp_query::Tz::Local,
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
+                    fp_query::format_time(row.ts_utc, &row.ts_precision, tz, "%Y-%m-%d %H:%M:%S"),
                     row.source_label(),
                     row.kind,
                     fp_render::sanitize(&row.display_text()),
@@ -507,12 +509,8 @@ fn print_rows(rows: Vec<fp_query::TimelineRow>, format: Format) -> Result<()> {
                 );
             }
             Format::Csv => {
-                let time_str = fp_query::format_time(
-                    row.ts_utc,
-                    &row.ts_precision,
-                    fp_query::Tz::Local,
-                    "%Y-%m-%d %H:%M:%S",
-                );
+                let time_str =
+                    fp_query::format_time(row.ts_utc, &row.ts_precision, tz, "%Y-%m-%d %H:%M:%S");
                 println!(
                     "{},{},{},{},{},{}",
                     row.id,
@@ -530,7 +528,11 @@ fn print_rows(rows: Vec<fp_query::TimelineRow>, format: Format) -> Result<()> {
 
 fn search(case: &Path, query: &str) -> Result<()> {
     let store = Store::open(case)?;
-    print_rows(fp_query::search(&store, query)?, Format::Table)
+    print_rows(
+        fp_query::search(&store, query)?,
+        Format::Table,
+        fp_query::Tz::Local,
+    )
 }
 
 fn show(case: &Path, id: u64) -> Result<()> {

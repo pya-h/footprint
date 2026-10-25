@@ -102,8 +102,9 @@ fn title_line(app: &App, theme: Theme) -> Line<'static> {
         tabs.push(Span::styled(name, style));
     }
     let tz = match app.tz {
-        Tz::Local => "local",
-        Tz::Utc => "UTC",
+        Tz::Local => "local".to_string(),
+        Tz::Utc => "UTC".to_string(),
+        Tz::Fixed(offset) => offset.to_string(),
     };
     tabs.push(Span::styled(
         format!("  t:{tz}  ? help  q quit"),

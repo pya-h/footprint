@@ -30,6 +30,20 @@ use chrono::{DateTime, Local, Utc};
 pub enum Tz {
     Local,
     Utc,
+    /// a fixed offset like `+03:30` (chronos FixedOffset)
+    Fixed(chrono::FixedOffset),
+}
+
+/// Parses `--tz`: `local`, `UTC`/`Z`, or a `±HH:MM` / `±HHMM` offset.
+pub fn parse_tz(s: &str) -> anyhow::Result<Tz> {
+    match s.to_ascii_lowercase().as_str() {
+        "local" => Ok(Tz::Local),
+        "utc" | "z" => Ok(Tz::Utc),
+        offset => offset
+            .parse::<chrono::FixedOffset>()
+            .map(Tz::Fixed)
+            .map_err(|_| anyhow::anyhow!("unknown time zone `{s}` (use local, UTC, or ±HH:MM)")),
+    }
 }
 
 /// Renders an event timestamp; `order_only` events have no instant to show.
@@ -41,6 +55,7 @@ pub fn format_time(ts_utc: i64, precision: &str, tz: Tz, pattern: &str) -> Strin
         .map(|t| match tz {
             Tz::Local => t.with_timezone(&Local).format(pattern).to_string(),
             Tz::Utc => t.with_timezone(&Utc).format(pattern).to_string(),
+            Tz::Fixed(offset) => t.with_timezone(&offset).format(pattern).to_string(),
         })
         .unwrap_or_else(|| format!("@{ts_utc}µs"))
 }
