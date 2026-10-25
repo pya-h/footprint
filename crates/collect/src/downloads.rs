@@ -4,7 +4,7 @@
 use crate::collector::{CollectCtx, Collector, Env, Sink};
 use crate::event::{Origin, Stamp, new_event};
 use crate::probe::Probe;
-use crate::utils::{extract_host, human_size, in_window};
+use crate::utils::{extract_host, human_size, in_window, read_evidence};
 use anyhow::Result;
 use fp_core::time::TimeFormat;
 use fp_core::{Actor, Artifact, Availability, EventKind, SourceInstance};
@@ -23,18 +23,22 @@ const KNOWN_MANAGERS: &[(&str, &str)] = &[
 pub struct XattrDownloadCollector;
 
 /// Download directories: `XDG_DOWNLOAD_DIR` from `user-dirs.dirs` (localized names land
-/// there), falling back to `~/Downloads`. `$HOME` in the value expands to the user's home.
+/// there), falling back to `~/Downloads`. `$HOME` in the value expands to the user's home; an
+/// absolute value resolves under the environment's root, never the host's.
 fn download_dirs(env: &Env) -> Vec<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     let config = env.home.join(".config/user-dirs.dirs");
-    if let Ok(text) = std::fs::read_to_string(&config) {
-        for line in text.lines() {
+    if let Ok(file) = read_evidence(&config) {
+        for line in String::from_utf8_lossy(&file.bytes).lines() {
             let Some(value) = line.trim().strip_prefix("XDG_DOWNLOAD_DIR=") else {
                 continue;
             };
             let value = value.trim().trim_matches('"');
-            let expanded = value.replacen("$HOME", &env.home.to_string_lossy(), 1);
-            let path = std::path::PathBuf::from(expanded);
+            let path = match value.strip_prefix("$HOME") {
+                Some(rest) => env.home.join(rest.trim_start_matches('/')),
+                None if value.starts_with('/') => env.system_path(value),
+                None => continue,
+            };
             if !dirs.contains(&path) {
                 dirs.push(path);
             }
@@ -88,7 +92,10 @@ impl Collector for XattrDownloadCollector {
                 continue;
             };
             let referrer_url = Probe::get_xattr(&path, "user.xdg.referrer.url");
-            let meta = fs::metadata(&path)?;
+            // a file removed between the listing and the stat is gone, not an error
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
             let size = meta.len() as i64;
             let mtime_ns = meta
                 .modified()
@@ -201,6 +208,18 @@ mod tests {
         let instances = XattrDownloadCollector.discover(&env);
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].path, home.join("Descargas"));
+
+        // an absolute value is read inside the environment's root, not on the host
+        let root = dir.path().join("image");
+        std::fs::create_dir_all(root.join("data/dl")).unwrap();
+        std::fs::write(
+            home.join(".config/user-dirs.dirs"),
+            "XDG_DOWNLOAD_DIR=\"/data/dl\"\n",
+        )
+        .unwrap();
+        let instances = XattrDownloadCollector.discover(&Env::test(home.clone(), root.clone()));
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].path, root.join("data/dl"));
 
         // without a config the default ~/Downloads is used
         std::fs::remove_file(home.join(".config/user-dirs.dirs")).unwrap();

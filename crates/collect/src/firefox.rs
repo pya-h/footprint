@@ -74,7 +74,7 @@ impl FirefoxCollector {
             // directory is a random prefix. Anything on disk but not in the ini (or with no
             // ini at all) falls back to the prefix.
             let mut seen: Vec<PathBuf> = Vec::new();
-            for (name, path) in parse_profiles_ini(&root) {
+            for (name, path) in parse_profiles_ini(env, &root) {
                 if has_evidence(&path) && !seen.contains(&path) {
                     seen.push(path.clone());
                     out.push((browser, name, path));
@@ -109,11 +109,13 @@ fn has_evidence(path: &std::path::Path) -> bool {
         .any(|f| path.join(f).exists())
 }
 
-/// `[Profile0] Name=… Path=… IsRelative=…` entries, in file order.
-fn parse_profiles_ini(root: &std::path::Path) -> Vec<(String, PathBuf)> {
-    let Ok(text) = std::fs::read_to_string(root.join("profiles.ini")) else {
+/// `[Profile0] Name=… Path=… IsRelative=…` entries, in file order. An absolute `Path` is
+/// resolved under the environment's root, so a mounted image never points at the host.
+fn parse_profiles_ini(env: &Env, root: &std::path::Path) -> Vec<(String, PathBuf)> {
+    let Ok(file) = read_evidence(&root.join("profiles.ini")) else {
         return Vec::new();
     };
+    let text = String::from_utf8_lossy(&file.bytes);
     let mut out = Vec::new();
     let mut name: Option<String> = None;
     let mut path: Option<PathBuf> = None;
@@ -123,7 +125,12 @@ fn parse_profiles_ini(root: &std::path::Path) -> Vec<(String, PathBuf)> {
                  relative: bool,
                  out: &mut Vec<(String, PathBuf)>| {
         if let (Some(n), Some(p)) = (name.take(), path.take()) {
-            out.push((n, if relative { root.join(&p) } else { p }));
+            let path = if relative {
+                root.join(&p)
+            } else {
+                env.system_path(&p.to_string_lossy())
+            };
+            out.push((n, path));
         }
     };
     for line in text.lines() {
@@ -561,6 +568,39 @@ mod tests {
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].app, "Firefox");
         assert_eq!(instances[0].profile.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn profiles_ini_names_profiles_and_absolute_paths_stay_in_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home/u");
+        let root = dir.path().join("image");
+        let ff = home.join(".mozilla/firefox");
+        std::fs::create_dir_all(ff.join("r4nd0m.default-esr")).unwrap();
+        std::fs::write(ff.join("r4nd0m.default-esr/places.sqlite"), b"").unwrap();
+        let elsewhere = root.join("data/ffprofile");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("places.sqlite"), b"").unwrap();
+        std::fs::write(
+            ff.join("profiles.ini"),
+            "[Profile0]\nName=default-esr\nIsRelative=1\nPath=r4nd0m.default-esr\n\n\
+             [Profile1]\nName=work\nIsRelative=0\nPath=/data/ffprofile\n",
+        )
+        .unwrap();
+
+        let env = Env::test(home, root);
+        let mut found: Vec<_> = FirefoxCollector::profiles(&env)
+            .into_iter()
+            .map(|(_, name, path)| (name, path))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                ("default-esr".to_string(), ff.join("r4nd0m.default-esr")),
+                ("work".to_string(), elsewhere),
+            ]
+        );
     }
 
     #[test]
