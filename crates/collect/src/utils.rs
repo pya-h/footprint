@@ -5,7 +5,7 @@ use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, Read};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// Text evidence (logs, histories, prefs) above this size is refused rather than read into memory.
@@ -33,6 +33,22 @@ fn regular_file(path: &Path) -> Result<fs::Metadata> {
         bail!("{} is not a regular file", path.display());
     }
     Ok(meta)
+}
+
+/// Opens evidence for reading only if it is a regular file. The open itself never blocks (a
+/// FIFO opened for reading waits for a writer otherwise) and the type is checked on the open
+/// descriptor, so a swap between check and open can't slip a FIFO or a device through.
+pub fn open_regular(path: &Path) -> Result<File> {
+    guard(path)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    if !file.metadata()?.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    Ok(file)
 }
 
 /// A private staging subdir per source instance, so side files of two profiles never mix.
@@ -100,10 +116,7 @@ pub struct TextFile {
 
 /// Reads a small evidence file whole, transparently gunzipping `*.gz`, with a size cap on both sides.
 pub fn read_evidence(path: &Path) -> Result<TextFile> {
-    guard(path)?;
-    regular_file(path)?;
-    let raw = read_capped(File::open(path).with_context(|| format!("open {}", path.display()))?)
-        .with_context(|| path.display().to_string())?;
+    let raw = read_capped(open_regular(path)?).with_context(|| path.display().to_string())?;
     let sha256 = hex::encode(Sha256::digest(&raw));
     let bytes = if path.extension().is_some_and(|e| e == "gz") {
         read_capped(GzDecoder::new(raw.as_slice()))
@@ -125,7 +138,7 @@ pub fn read_capped(reader: impl Read) -> Result<Vec<u8>> {
 
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
-    io::copy(&mut File::open(path)?, &mut hasher)?;
+    io::copy(&mut open_regular(path)?, &mut hasher)?;
     Ok(hex::encode(hasher.finalize()))
 }
 

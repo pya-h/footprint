@@ -723,6 +723,7 @@ dependencies = [
  "fp-core",
  "fp-store",
  "hex",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

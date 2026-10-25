@@ -22,6 +22,11 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// File times are set by whoever wrote the file: saturate rather than overflow i64 ns.
+fn file_time_ns(sec: i64, nsec: i64) -> i64 {
+    sec.saturating_mul(1_000_000_000).saturating_add(nsec)
+}
+
 /// Where a recorded path lives now: inside `root` first (a mounted image), then as recorded
 /// (a live `--home` used next to an image `--root`).
 pub(crate) fn resolve_path(recorded: &str, root: &Path) -> Option<PathBuf> {
@@ -63,10 +68,12 @@ fn link_downloads_to_artifacts(store: &mut Store, root: &Path) -> Result<usize> 
         };
 
         // a download target named like a wallet or key file is hashed by nobody
+        // only a regular file is opened: a FIFO planted at a download's path would block
         if art.sha256.is_none()
             && !fp_core::deny::is_secret(Path::new(&target))
             && let Some(real_path) = resolve_path(&target, root)
             && let Ok(meta) = std::fs::metadata(&real_path)
+            && meta.is_file()
         {
             let sha256 = sha256_file(&real_path).ok();
             store.update_artifact_metadata(
@@ -74,8 +81,8 @@ fn link_downloads_to_artifacts(store: &mut Store, root: &Path) -> Result<usize> 
                 &fp_store::ArtifactMeta {
                     sha256: sha256.as_deref(),
                     size: Some(meta.len() as i64),
-                    mtime_ns: Some(meta.mtime() * 1_000_000_000 + meta.mtime_nsec()),
-                    ctime_ns: Some(meta.ctime() * 1_000_000_000 + meta.ctime_nsec()),
+                    mtime_ns: Some(file_time_ns(meta.mtime(), meta.mtime_nsec())),
+                    ctime_ns: Some(file_time_ns(meta.ctime(), meta.ctime_nsec())),
                     btime_ns: None,
                     owner_pkg: None,
                 },
@@ -201,4 +208,78 @@ fn link_download_manager_to_browser(store: &mut Store) -> Result<usize> {
     }
 
     Ok(store.insert_links(&links)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fp_core::time::TimeFormat;
+    use fp_core::{Actor, Confidence, Event, EventKind, Provenance, SourceInstance, TimePrecision};
+    use fp_store::{Batch, NewRun};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_fifo_at_a_download_path_is_never_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("zoom_amd64.deb");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+        let mut store = Store::open_or_create(dir.path().join("case.db")).unwrap();
+        let run = store
+            .insert_run(&NewRun {
+                host: "h",
+                user: "u",
+                uid: 1000,
+                euid: 1000,
+                version: "0",
+                tz: "UTC",
+                args: "",
+            })
+            .unwrap();
+        let inst = SourceInstance::new("dlmgr.xdm", "xdm", None, PathBuf::from("/x"));
+        let id = store.insert_source(run, &inst).unwrap();
+        let event = Event {
+            run_id: run,
+            source_kind: inst.kind.clone(),
+            ts_utc: 1,
+            ts_precision: TimePrecision::Exact,
+            ts_raw: "1".into(),
+            ts_raw_format: TimeFormat::UnixSeconds,
+            ts_tz_assumed: None,
+            source_inst: id,
+            kind: EventKind::DlManagerDownload,
+            actor: Some(Actor::app("xdm")),
+            subject: "https://example.com/zoom_amd64.deb".into(),
+            subject_host: Some("example.com".into()),
+            summary: String::new(),
+            attrs: json!({ "target_path": fifo.to_str().unwrap() }),
+            provenance: Provenance {
+                file: PathBuf::from("/x"),
+                file_sha256: None,
+                locator: "downloads.id=1".into(),
+            },
+            confidence: Confidence::Direct,
+        };
+        store
+            .ingest(
+                run,
+                &Batch {
+                    source_identity: &inst.identity(),
+                    events: &[event],
+                    states: &[],
+                    artifacts: &[],
+                },
+            )
+            .unwrap();
+
+        // returns instead of blocking on the FIFO; the artifact stays unhashed
+        correlate_downloads(&mut store, Path::new("/")).unwrap();
+        let artifact = store
+            .get_artifact_by_path(fifo.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(artifact.sha256, None);
+    }
 }

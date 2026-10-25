@@ -2,7 +2,6 @@
 //! and privilege/group inspection.
 
 use crate::collector::Env;
-use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +54,10 @@ impl Probe {
         let paths = ["/etc/os-release", "/usr/lib/os-release"];
         for rel in paths {
             let p = env.system_path(rel);
-            let Ok(text) = fs::read_to_string(&p) else {
+            let Ok(file) = crate::utils::read_evidence(&p) else {
                 continue;
             };
+            let text = String::from_utf8_lossy(&file.bytes);
             return Self::parse_os_release(&text);
         }
         DistroFamily::Unknown
@@ -102,10 +102,10 @@ impl Probe {
 
     /// The gids `/etc/group` (under `env.root`) gives the named groups.
     pub fn group_ids(env: &Env, names: &[&str]) -> Vec<u32> {
-        let Ok(contents) = fs::read_to_string(env.system_path("/etc/group")) else {
+        let Ok(file) = crate::utils::read_evidence(&env.system_path("/etc/group")) else {
             return Vec::new();
         };
-        contents
+        String::from_utf8_lossy(&file.bytes)
             .lines()
             .filter_map(|line| {
                 let mut parts = line.split(':');
@@ -152,6 +152,7 @@ impl Probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn parses_distro_families() {

@@ -21,7 +21,9 @@ pub struct Env {
 
 /// One `/etc/passwd` line: (user, uid, home, shell).
 fn passwd_entries(passwd: &Path) -> Result<Vec<(String, u32, PathBuf, String)>> {
-    let contents = std::fs::read_to_string(passwd)?;
+    // an image's passwd is evidence like any other: guarded, regular, size-capped
+    let file = crate::utils::read_evidence(passwd)?;
+    let contents = String::from_utf8_lossy(&file.bytes);
     Ok(contents
         .lines()
         .filter_map(|line| {

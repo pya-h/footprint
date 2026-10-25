@@ -101,7 +101,10 @@ fn mentions_file(cmd: &str, name: &str) -> bool {
 /// `Package` of a `.deb` artifact, read with the host's `dpkg-deb -f` (fixed argv, no shell).
 fn inspect_deb(recorded: &str, root: &Path) -> Option<String> {
     let candidate = resolve_path(recorded, root)?;
-    if !candidate.extension().is_some_and(|e| e == "deb") {
+    // dpkg-deb would block on a FIFO named like a package
+    if !candidate.extension().is_some_and(|e| e == "deb")
+        || !std::fs::metadata(&candidate).is_ok_and(|m| m.is_file())
+    {
         return None;
     }
     let out = Command::new(DPKG_DEB)

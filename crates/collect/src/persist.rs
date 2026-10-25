@@ -1,12 +1,12 @@
 use crate::collector::{CollectCtx, Collector, Env, Sink};
 use crate::probe::{DistroFamily, Probe};
-use crate::utils::{guard, in_window, sha256_file};
+use crate::utils::{guard, in_window, open_regular, sha256_file};
 use anyhow::Result;
 use fp_core::{Availability, Provenance, SourceInstance, StateRecord};
 use serde_json::json;
 use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -236,7 +236,7 @@ fn read_dpkg_index(info: &Path) -> Option<HashMap<PathBuf, String>> {
             continue;
         };
         let package = stem.split(':').next().unwrap_or(stem);
-        let Ok(file) = File::open(entry.path()) else {
+        let Ok(file) = open_regular(&entry.path()) else {
             continue;
         };
         for line in BufReader::new(file).lines().map_while(Result::ok) {
@@ -403,7 +403,7 @@ impl<'a> SystemPersistSnapshot<'a> {
             let mut uid0_users = Vec::new();
             let mut login_shells = Vec::new();
 
-            if let Ok(file) = File::open(&passwd_path) {
+            if let Ok(file) = open_regular(&passwd_path) {
                 let reader = BufReader::new(file);
                 for line in reader.lines().map_while(Result::ok) {
                     let parts: Vec<&str> = line.split(':').collect();
@@ -447,7 +447,7 @@ impl<'a> SystemPersistSnapshot<'a> {
         let group_path = self.root.join("etc/group");
         if group_path.exists() {
             let mut priv_groups = HashMap::new();
-            if let Ok(file) = File::open(&group_path) {
+            if let Ok(file) = open_regular(&group_path) {
                 let reader = BufReader::new(file);
                 for line in reader.lines().map_while(Result::ok) {
                     let parts: Vec<&str> = line.split(':').collect();
@@ -605,7 +605,7 @@ impl<'a> SystemPersistSnapshot<'a> {
                 continue;
             }
             let mut referenced = Vec::new();
-            if let Ok(file) = File::open(&path) {
+            if let Ok(file) = open_regular(&path) {
                 for line in BufReader::new(file).lines().map_while(Result::ok) {
                     let line = line.trim();
                     if line.starts_with('#') {
@@ -843,7 +843,7 @@ impl<'a> UserPersistSnapshot<'a> {
         for name in [".ssh/authorized_keys", ".ssh/authorized_keys2"] {
             let path = self.home.join(name);
             if path.is_file() {
-                let key_count = if let Ok(file) = File::open(&path) {
+                let key_count = if let Ok(file) = open_regular(&path) {
                     BufReader::new(file)
                         .lines()
                         .map_while(Result::ok)
@@ -986,7 +986,7 @@ fn find_git_hooks(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 
 fn inspect_shell_rc_file(path: &Path) -> (serde_json::Value, Vec<String>) {
     let mut world_writable_paths = Vec::new();
-    if let Ok(file) = File::open(path) {
+    if let Ok(file) = open_regular(path) {
         let reader = BufReader::new(file);
         let mut var_bindings: HashMap<String, String> = HashMap::new();
 
@@ -1075,9 +1075,18 @@ fn emit_state_entry(
         return;
     };
 
-    let sha256 = sha256_file(path).ok();
-    let mtime_us = meta.mtime() * 1_000_000 + meta.mtime_nsec() / 1_000;
-    let ctime_us = meta.ctime() * 1_000_000 + meta.ctime_nsec() / 1_000;
+    let mut flags: HashSet<String> = flags.into_iter().collect();
+    // a FIFO or device where a config file belongs is itself worth a flag; it is never opened
+    let sha256 = if meta.is_file() {
+        sha256_file(path).ok()
+    } else {
+        flags.insert("not_regular_file".to_string());
+        None
+    };
+    // file times are set by whoever wrote the file: saturate rather than overflow
+    let time_us = |sec: i64, nsec: i64| sec.saturating_mul(1_000_000).saturating_add(nsec / 1_000);
+    let mtime_us = time_us(meta.mtime(), meta.mtime_nsec());
+    let ctime_us = time_us(meta.ctime(), meta.ctime_nsec());
     let size = meta.len() as i64;
 
     let integrity = match &owner_pkg {
@@ -1086,7 +1095,6 @@ fn emit_state_entry(
         None => "unverified",
     };
 
-    let mut flags: HashSet<String> = flags.into_iter().collect();
     if integrity == "unowned" {
         flags.insert("unowned".to_string());
     }
@@ -1156,7 +1164,7 @@ fn walk_recurse(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<PathBu
 }
 
 fn read_desktop_exec(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
+    let file = open_regular(path).ok()?;
     let reader = BufReader::new(file);
     for line in reader.lines().map_while(Result::ok) {
         let trimmed = line.trim();
@@ -1248,6 +1256,42 @@ mod tests {
         let owners = verifier.lookup_owners(&[&module, &stray]);
         assert_eq!(owners[&module].as_deref(), Some("libpam-modules"));
         assert_eq!(owners[&stray], None);
+    }
+
+    #[test]
+    fn a_fifo_where_a_config_belongs_is_flagged_never_opened() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("etc")).unwrap();
+        // opened for reading, either would block the snapshot forever
+        for name in ["etc/crontab", "etc/passwd"] {
+            let path = std::ffi::CString::new(root.path().join(name).to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+        let ctx = CollectCtx {
+            run_id: 1,
+            since: None,
+            until: None,
+            assume_tz: None,
+            temp_dir: root.path().join("tmp"),
+            own_files: Vec::new(),
+        };
+        let mut sink = Sink::default();
+        let verifier = PkgVerifier::new(root.path());
+        SystemPersistSnapshot::new(root.path(), &ctx, verifier).run(&mut sink);
+        let crontab = sink
+            .states
+            .iter()
+            .find(|s| s.kind == "persist.cron")
+            .unwrap();
+        assert_eq!(crontab.value["sha256"], serde_json::Value::Null);
+        assert!(
+            crontab.value["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "not_regular_file"),
+            "{crontab:?}"
+        );
     }
 
     #[test]
