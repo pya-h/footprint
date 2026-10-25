@@ -14,3 +14,7 @@ crossterm = "0.29"
 chrono = "0.4"
 anyhow = "1"
 serde_json = "1"
+
+[dev-dependencies]
+fp-fixtures = { path = "../fixtures" }
+tempfile = "3"

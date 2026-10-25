@@ -1,8 +1,7 @@
 //! ratatui widgets for each view. Colors come from [`Theme`] so `NO_COLOR` renders plain.
 
-use crate::app::{App, CollectLine, FILTER_FIELDS, Key, View};
-use fp_correlate::{TraceArrow, TraceHead};
-use fp_query::{CoverageStatus, DiffChange, Tz};
+use crate::app::{App, CollectLine, FILTER_FIELDS, View};
+use fp_query::{CoverageStatus, DiffChange, TraceArrow, TraceHead, Tz};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -136,14 +135,14 @@ fn draw_timeline(frame: &mut Frame, app: &App, theme: Theme, area: ratatui::layo
                 ),
                 Span::raw(format!("{:<20}", truncate(&row.kind, 20))),
             ];
+            if !row.ioc_hits.is_empty() {
+                spans.push(Span::styled("⚑ ", theme.danger()));
+            }
             let mut text = truncate(&row.display_text(), 120);
             if !row.ioc_hits.is_empty() {
                 text = format!("{text}  [IOC: {}]", row.ioc_hits.join(", "));
             }
             spans.push(Span::raw(truncate(&text, 140)));
-            if !row.ioc_hits.is_empty() {
-                spans.push(Span::styled(" ⚑", theme.danger()));
-            }
             let item = ListItem::new(Line::from(spans));
             if i == app.selected {
                 item.style(theme.highlight())
@@ -169,7 +168,7 @@ fn draw_timeline(frame: &mut Frame, app: &App, theme: Theme, area: ratatui::layo
 fn filter_bar(app: &App, theme: Theme) -> Line<'static> {
     let mut spans = vec![Span::styled("filter ", theme.dim())];
     for (i, field) in FILTER_FIELDS.iter().enumerate() {
-        let value = app.draft.get_pub(i);
+        let value = app.draft.get(i);
         let editing = app.editing && app.draft.active == i;
         let label = format!("{field}:");
         spans.push(Span::styled(label, theme.dim()));

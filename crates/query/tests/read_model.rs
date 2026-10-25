@@ -137,16 +137,11 @@ fn state_and_sources_and_coverage() {
 }
 
 #[test]
-fn diff_same_run_only_changes_volatile() {
+fn diff_against_itself_is_empty() {
     let case = setup();
     let store = fp_store::Store::open(&case.db).unwrap();
     let entries = fp_query::diff_runs(&store, 1, 1).unwrap();
-    // same run: only volatile metadata (mtime/ctime) can differ, flags aside
-    assert!(
-        entries
-            .iter()
-            .all(|e| e.change == fp_query::DiffChange::Changed)
-    );
+    assert!(entries.is_empty(), "a run equals itself");
 }
 
 #[test]

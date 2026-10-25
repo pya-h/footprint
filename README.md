@@ -9,7 +9,7 @@ A local, read-only activity timeline and provenance tool for Linux. It reads the
 
 It never runs in the background, never modifies the files it reads, never opens secrets (cookies, saved passwords, wallets, keys), and never touches the network.
 
-> Status: early development. Everything through the IOC and export milestones is done; the interactive TUI is next. See [Roadmap](#roadmap).
+> Status: early development. Everything through the interactive TUI is done. See [Roadmap](#roadmap).
 
 ## Why
 
@@ -57,7 +57,10 @@ footprint show 1832
 | `list [--since T] [--until T] [--kind K,..] [--host H,..] [--match TEXT] [--limit N] [--reverse] [--format table\|jsonl]` | merged timeline; `--kind web.*` matches a family, `--host zoom.us` also matches its subdomains |
 | `show <id>` | one event with provenance and raw timestamp |
 | `search <query>` | full-text search over subjects, summaries and attributes |
-| `trace`, `state`, `diff`, `ioc`, `export`, `explain` | upcoming, see the roadmap |
+| `trace <path\|url\|event-id>` | provenance chain with a confidence on every edge |
+| `state [--kind K] [--run R]`, `diff <runA> <runB>` | captured state and its changes between runs |
+| `ioc add\|import\|check`, `export --format jsonl\|csv\|html [--redact]` | indicators of compromise and reports |
+| `tui` | interactive terminal UI: timeline with live filters, detail, trace tree, state/diff, IOC hits, sources/coverage, collect with per-source progress (`NO_COLOR` respected) |
 
 Times accept `2026-10-16T20:40`, `20:40` (today), `-24h`, `-30d`, `yesterday`, `@1792172917`.
 The case file defaults to `./footprint.db`; pass `-c PATH` to use another. Read commands never create one.
@@ -98,6 +101,10 @@ crates/
   core      Event, StateRecord, Artifact, Provenance, time normalization
   store     SQLite case schema, dedup, queries, FTS5
   collect   Collector trait + one module per source family
+  correlate links (redirect chains, download→install, anchoring), IOC matching, trace tree
+  render    jsonl / csv / html export with redaction
+  query     the read model + collect runner the CLI and TUI call; the only place with SQL
+  tui       interactive terminal UI (ratatui); terminal-independent state machine, tested headless
   cli       footprint binary (clap)
   fixtures  synthetic evidence in the real formats, for tests (never real data)
 ```
@@ -112,7 +119,7 @@ crates/
 - correlation and `trace`
 - filesystem timeline, persistence snapshot, `state`, `diff`
 - IOCs and `export`
-- interactive TUI (`footprint tui`) — planned
+- interactive TUI (`footprint tui`)
 - Firefox family, live state, scanner import, polish — planned
 
 Linux only for now. The collector interface keeps Windows and macOS open, but they aren't being built.

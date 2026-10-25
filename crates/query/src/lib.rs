@@ -19,7 +19,7 @@ pub use timeline::{
     PAGE_SIZE, TimelineFilter, TimelinePage, TimelineRow, search, timeline, timeline_page,
 };
 
-pub use fp_correlate::{IocHit, TraceTree, check_iocs, trace_tree};
+pub use fp_correlate::{IocHit, TraceArrow, TraceHead, TraceTree, check_iocs, trace_tree};
 
 use chrono::{DateTime, Local, Utc};
 

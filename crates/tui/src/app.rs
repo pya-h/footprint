@@ -8,7 +8,7 @@ use fp_query::{
 };
 use fp_store::{IocRow, Store};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -83,7 +83,7 @@ pub struct FilterDraft {
 }
 
 impl FilterDraft {
-    fn get(&self, field: usize) -> &str {
+    pub fn get(&self, field: usize) -> &str {
         match field {
             0 => &self.since,
             1 => &self.until,
@@ -315,7 +315,7 @@ impl App {
         Ok(())
     }
 
-    fn reload_ioc(&mut self) -> Result<()> {
+    pub fn reload_ioc(&mut self) -> Result<()> {
         self.iocs = self.store.list_iocs()?;
         self.ioc_hits = fp_query::check_iocs(&self.store)?;
         self.ioc_selected = self.ioc_selected.min(self.ioc_hits.len().saturating_sub(1));
@@ -428,9 +428,7 @@ impl App {
                 } => {
                     let outcome = format!(
                         "{} new / {} known, {}",
-                        totals.events_new,
-                        totals.events_known,
-                        status.to_string()
+                        totals.events_new, totals.events_known, status
                     );
                     if let Some(line) = self
                         .collect
@@ -502,7 +500,7 @@ impl App {
             }
             return Ok(false);
         }
-        if matches!(key, Key::Char('?')) {
+        if matches!(key, Key::Char('?')) && !self.editing {
             self.help = true;
             return Ok(false);
         }
@@ -706,7 +704,7 @@ impl App {
                 Key::Enter => {
                     self.state_editing = false;
                     let draft = self.state_kind_draft.trim().to_string();
-                    self.state_kind = (!draft.is_empty()).then(|| draft);
+                    self.state_kind = (!draft.is_empty()).then_some(draft);
                     self.reload_state()?;
                     self.status = format!("{} state record(s)", self.state_rows.len());
                 }
@@ -840,10 +838,8 @@ impl App {
                     self.collect.field_mut(self.collect.active_field).pop();
                 }
             }
-            Key::Char(c) => {
-                if self.collect.editing {
-                    self.collect.field_mut(self.collect.active_field).push(c);
-                }
+            Key::Char(c) if self.collect.editing => {
+                self.collect.field_mut(self.collect.active_field).push(c);
             }
             _ => {}
         }

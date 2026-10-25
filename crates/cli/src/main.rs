@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use fp_core::Availability;
 use fp_store::Store;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 
 #[derive(Parser)]
@@ -245,7 +244,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn collect(case: &PathBuf, args: CollectArgs) -> Result<()> {
+fn collect(case: &Path, args: CollectArgs) -> Result<()> {
     let params = fp_query::CollectParams {
         since: args.since,
         until: args.until,
@@ -257,7 +256,7 @@ fn collect(case: &PathBuf, args: CollectArgs) -> Result<()> {
         root: args.root,
     };
     let (tx, rx) = channel();
-    let case_owned = case.clone();
+    let case_owned = case.to_path_buf();
     let handle = std::thread::spawn(move || fp_query::run_collect(&case_owned, &params, Some(&tx)));
     while let Ok(event) = rx.recv() {
         match event {
@@ -295,19 +294,7 @@ fn collect(case: &PathBuf, args: CollectArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn ioc_type_detection() {
-        use super::detect_ioc_type;
-        assert_eq!(detect_ioc_type("us09-web-zoom.com"), "domain");
-        assert_eq!(detect_ioc_type("192.168.1.1"), "ip");
-        assert_eq!(detect_ioc_type("192.168.1.0/24"), "cidr");
-        assert_eq!(detect_ioc_type("/tmp/evil.sh"), "path");
-    }
-}
-
-fn sources(case: &PathBuf, run: Option<u64>, all_runs: bool, coverage: bool) -> Result<()> {
+fn sources(case: &Path, run: Option<u64>, all_runs: bool, coverage: bool) -> Result<()> {
     let store = Store::open(case)?;
     let run = match (run, all_runs) {
         (_, true) => None,
@@ -370,7 +357,7 @@ fn sources(case: &PathBuf, run: Option<u64>, all_runs: bool, coverage: bool) -> 
     Ok(())
 }
 
-fn list(case: &PathBuf, args: ListArgs) -> Result<()> {
+fn list(case: &Path, args: ListArgs) -> Result<()> {
     let store = Store::open(case)?;
     let filter = fp_query::TimelineFilter {
         since: args
@@ -392,6 +379,7 @@ fn list(case: &PathBuf, args: ListArgs) -> Result<()> {
         } else {
             args.limit
         },
+        offset: None,
         reverse: args.reverse,
     };
     let rows = fp_query::timeline(&store, &filter)?;
@@ -529,12 +517,12 @@ fn print_rows(rows: Vec<fp_query::TimelineRow>, format: Format) -> Result<()> {
     Ok(())
 }
 
-fn search(case: &PathBuf, query: &str) -> Result<()> {
+fn search(case: &Path, query: &str) -> Result<()> {
     let store = Store::open(case)?;
     print_rows(fp_query::search(&store, query)?, Format::Table)
 }
 
-fn show(case: &PathBuf, id: u64) -> Result<()> {
+fn show(case: &Path, id: u64) -> Result<()> {
     let store = Store::open(case)?;
     let ev =
         fp_query::event_detail(&store, id)?.with_context(|| format!("event {id} not found"))?;
@@ -610,7 +598,7 @@ fn show(case: &PathBuf, id: u64) -> Result<()> {
     Ok(())
 }
 
-fn trace(case: &PathBuf, target: &str) -> Result<()> {
+fn trace(case: &Path, target: &str) -> Result<()> {
     let mut store = Store::open(case)?;
     let _ = fp_correlate::correlate(&mut store, std::path::Path::new("/"));
     let rendered = fp_correlate::render_trace(&store, target)?;
@@ -618,7 +606,7 @@ fn trace(case: &PathBuf, target: &str) -> Result<()> {
     Ok(())
 }
 
-fn state(case: &PathBuf, args: StateArgs) -> Result<()> {
+fn state(case: &Path, args: StateArgs) -> Result<()> {
     let store = Store::open(case)?;
     let run_id = match args.run {
         Some(r) => Some(r),
@@ -699,7 +687,7 @@ fn resolve_run_id(store: &Store, s: &str) -> Result<u64> {
     }
 }
 
-fn diff(case: &PathBuf, args: DiffArgs) -> Result<()> {
+fn diff(case: &Path, args: DiffArgs) -> Result<()> {
     let store = Store::open(case)?;
     let run_a = resolve_run_id(&store, &args.run_a)?;
     let run_b = resolve_run_id(&store, &args.run_b)?;
@@ -760,7 +748,7 @@ fn diff(case: &PathBuf, args: DiffArgs) -> Result<()> {
     Ok(())
 }
 
-fn ioc(case: &PathBuf, args: IocArgs) -> Result<()> {
+fn ioc(case: &Path, args: IocArgs) -> Result<()> {
     match args.cmd {
         IocCommand::Add {
             ioc_type,
@@ -875,7 +863,7 @@ fn ioc(case: &PathBuf, args: IocArgs) -> Result<()> {
     Ok(())
 }
 
-fn export(case: &PathBuf, args: ExportArgs) -> Result<()> {
+fn export(case: &Path, args: ExportArgs) -> Result<()> {
     let store = Store::open(case)?;
     let filter = fp_store::EventFilter {
         since: args
@@ -892,6 +880,7 @@ fn export(case: &PathBuf, args: ExportArgs) -> Result<()> {
         hosts: args.host,
         match_text: args.r#match,
         limit: args.limit,
+        offset: None,
         reverse: args.reverse,
     };
 
@@ -980,5 +969,17 @@ fn detect_ioc_type(val: &str) -> String {
         "path".to_string()
     } else {
         "domain".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ioc_type_detection() {
+        use super::detect_ioc_type;
+        assert_eq!(detect_ioc_type("us09-web-zoom.com"), "domain");
+        assert_eq!(detect_ioc_type("192.168.1.1"), "ip");
+        assert_eq!(detect_ioc_type("192.168.1.0/24"), "cidr");
+        assert_eq!(detect_ioc_type("/tmp/evil.sh"), "path");
     }
 }

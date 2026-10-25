@@ -796,10 +796,12 @@ dependencies = [
  "chrono",
  "crossterm",
  "fp-core",
+ "fp-fixtures",
  "fp-query",
  "fp-store",
  "ratatui",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

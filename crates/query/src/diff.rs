@@ -35,14 +35,16 @@ pub fn diff_runs(store: &Store, run_a: u64, run_b: u64) -> Result<Vec<DiffEntry>
         map_b.insert((row.kind.clone(), row.key.clone()), row.value_json.clone());
     }
 
-    let mut keys: std::collections::BTreeSet<(String, String)> =
-        std::collections::BTreeSet::new();
+    let mut keys: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
     keys.extend(map_a.keys().cloned());
     keys.extend(map_b.keys().cloned());
 
     let mut out = Vec::new();
     for (kind, key) in keys {
-        match (map_a.get(&(kind.clone(), key.clone())), map_b.get(&(kind.clone(), key.clone()))) {
+        match (
+            map_a.get(&(kind.clone(), key.clone())),
+            map_b.get(&(kind.clone(), key.clone())),
+        ) {
             (None, Some(b)) => out.push(DiffEntry {
                 change: DiffChange::Added,
                 detail: added_summary(b),
