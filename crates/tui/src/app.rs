@@ -396,7 +396,9 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let case = self.case.clone();
         std::thread::spawn(move || {
-            let _ = fp_query::run_collect(&case, &params, Some(&tx));
+            if let Err(e) = fp_query::run_collect(&case, &params, Some(&tx)) {
+                let _ = tx.send(CollectEvent::Failed(format!("{e:#}")));
+            }
         });
         self.collect.running = true;
         self.collect.summary = None;
@@ -460,6 +462,13 @@ impl App {
                     label: "correlate".into(),
                     outcome: format!("error: {e}"),
                 }),
+                CollectEvent::Failed(error) => {
+                    self.collect.running = false;
+                    self.collect.summary = Some(format!("collect failed: {error}"));
+                    self.status = format!("collect failed: {error}");
+                    self.collect_rx = None;
+                    return Ok(());
+                }
                 CollectEvent::Finished(summary) => {
                     finished = Some(format!(
                         "run {}: {} new events ({} known), {} states, {} artifacts from {} sources{}",

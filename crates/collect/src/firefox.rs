@@ -95,6 +95,10 @@ impl FirefoxCollector {
 }
 
 impl Collector for FirefoxCollector {
+    fn per_user(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "firefox.history"
     }

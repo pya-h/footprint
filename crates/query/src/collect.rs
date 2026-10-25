@@ -2,6 +2,7 @@
 //! Both the CLI and the TUI drive it, optionally receiving progress events.
 
 use anyhow::{Context, Result, bail};
+use fp_collect::collector::UserTarget;
 use fp_collect::{CollectCtx, Collector, Env};
 use fp_core::{Availability, SourceInstance};
 use fp_store::{Batch, Store};
@@ -59,6 +60,8 @@ pub enum CollectEvent {
     },
     CorrelateFailed(String),
     Finished(CollectSummary),
+    /// the run itself failed (bad arguments, an unusable case); no `Finished` follows
+    Failed(String),
 }
 
 /// `chromium` selects `chromium.history`; `all` selects everything.
@@ -87,6 +90,10 @@ fn hostname() -> String {
 
 fn build_env(params: &CollectParams) -> Result<Env> {
     let mut env = Env::current();
+    // first: homes are named through the root's own /etc/passwd
+    if !params.root.as_os_str().is_empty() {
+        env.root = params.root.clone();
+    }
     if !params.homes.is_empty() {
         env.home = params.homes[0].clone();
         env.user_targets.clear();
@@ -100,50 +107,75 @@ fn build_env(params: &CollectParams) -> Result<Env> {
         }
         env.load_all_users()?;
     }
-    env.root = if params.root.as_os_str().is_empty() {
-        PathBuf::from("/")
-    } else {
-        params.root.clone()
-    };
     Ok(env)
+}
+
+/// One source instance to collect; `owner` is the user whose home it was found in.
+struct Job {
+    collector: usize,
+    inst: SourceInstance,
+    owner: Option<UserTarget>,
 }
 
 /// What one worker collected; the main thread is the single writer (ingest, status).
 struct Outcome {
     inst: SourceInstance,
+    owner: Option<UserTarget>,
     label: String,
-    sink: Option<fp_collect::Sink>,
-    error: Option<String>,
+    result: std::result::Result<fp_collect::Sink, String>,
 }
 
 /// Collects one source instance on a worker. No store access: the source row was
 /// inserted during discovery, so the id is already assigned for the staging dir.
 fn collect_only(
-    inst: SourceInstance,
-    collector: &dyn fp_collect::Collector,
-    ctx: &fp_collect::CollectCtx,
+    job: Job,
+    collector: &dyn Collector,
+    ctx: &CollectCtx,
     progress: Option<&Sender<CollectEvent>>,
 ) -> Outcome {
-    let label = label(&inst);
-    if let Some(p) = progress {
-        let _ = p.send(CollectEvent::InstanceStarted {
-            label: label.clone(),
-        });
+    let label = label(&job.inst);
+    let result = if crate::interrupt::interrupted() {
+        Err(NOT_COLLECTED.to_string())
+    } else {
+        if let Some(p) = progress {
+            let _ = p.send(CollectEvent::InstanceStarted {
+                label: label.clone(),
+            });
+        }
+        let mut sink = fp_collect::Sink::default();
+        // evidence is hostile: a parser panic fails this source, not the run
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            collector.collect(&job.inst, ctx, &mut sink)
+        })) {
+            Ok(Ok(())) => Ok(sink),
+            Ok(Err(e)) => Err(format!("{e:#}")),
+            Err(panic) => Err(format!("collector panicked: {}", panic_text(&panic))),
+        }
+    };
+    Outcome {
+        inst: job.inst,
+        owner: job.owner,
+        label,
+        result,
     }
-    let mut sink = fp_collect::Sink::default();
-    match collector.collect(&inst, ctx, &mut sink) {
-        Ok(()) => Outcome {
-            inst,
-            label,
-            sink: Some(sink),
-            error: None,
-        },
-        Err(e) => Outcome {
-            inst,
-            label,
-            sink: None,
-            error: Some(format!("{e:#}")),
-        },
+}
+
+const NOT_COLLECTED: &str = "not collected: interrupted";
+
+fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+}
+
+/// Events found in a user's home belong to that user unless the source said otherwise.
+fn stamp_owner(events: &mut [fp_core::Event], owner: &UserTarget) {
+    for event in events {
+        let actor = event.actor.get_or_insert_with(fp_core::Actor::default);
+        actor.uid.get_or_insert(owner.uid);
+        actor.user.get_or_insert_with(|| owner.user.clone());
     }
 }
 
@@ -224,21 +256,27 @@ pub fn run_collect(
     // discovery stays sequential (it is cheap) and assigns every source row up front,
     // so workers never touch the store; collection of instances runs in parallel and
     // the main thread is the single writer
-    struct Job {
-        collector: usize,
-        inst: SourceInstance,
-    }
     let mut jobs = Vec::new();
     for (ci, collector) in collectors.iter().enumerate() {
-        for mut inst in collector.discover(&env) {
-            inst.id = store.insert_source(run_id, &inst)?;
-            if inst.status != Availability::Present {
-                continue;
+        let scopes: Vec<(Option<Env>, Option<UserTarget>)> = if collector.per_user() {
+            env.user_targets
+                .iter()
+                .map(|t| (Some(env.for_user(t)), Some(t.clone())))
+                .collect()
+        } else {
+            vec![(None, None)]
+        };
+        for (scope, owner) in scopes {
+            for mut inst in collector.discover(scope.as_ref().unwrap_or(&env)) {
+                inst.id = store.insert_source(run_id, &inst)?;
+                if inst.status == Availability::Present {
+                    jobs.push(Job {
+                        collector: ci,
+                        inst,
+                        owner: owner.clone(),
+                    });
+                }
             }
-            jobs.push(Job {
-                collector: ci,
-                inst,
-            });
         }
     }
     let read = jobs.len();
@@ -269,20 +307,14 @@ pub fn run_collect(
                 let Some(job) = job else {
                     break;
                 };
-                let collector = &collectors[job.collector];
-                let outcome =
-                    collect_only(job.inst, collector.as_ref(), &ctx, progress_tx.as_ref());
-                let _ = outcome_tx.send(outcome);
+                let collector = collectors[job.collector].as_ref();
+                let _ = outcome_tx.send(collect_only(job, collector, &ctx, progress_tx.as_ref()));
             }
         }));
     }
     drop(job_rx);
-    let mut interrupted = false;
+    // workers check the interrupt flag before each job, so queuing them all up front is fine
     for job in jobs {
-        if crate::interrupt::interrupted() {
-            interrupted = true;
-            break; // jobs not yet sent are dropped; workers finish what they hold
-        }
         let _ = job_tx.send(job);
     }
     drop(job_tx);
@@ -290,25 +322,35 @@ pub fn run_collect(
 
     let mut errors = Vec::new();
     let mut totals = IngestTotals::default();
+    let mut interrupted = false;
     for outcome in outcome_rx.iter() {
         let Outcome {
             inst,
+            owner,
             label,
-            sink,
-            error,
+            result,
         } = outcome;
-        if let Some(error) = error {
-            store.update_source_status(inst.id, &Availability::Error(error.clone()), None)?;
-            if let Some(p) = progress {
-                let _ = p.send(CollectEvent::InstanceError {
-                    label: label.clone(),
-                    error: error.clone(),
-                });
+        let mut sink = match result {
+            Ok(sink) => sink,
+            Err(error) => {
+                store.update_source_status(inst.id, &Availability::Error(error.clone()), None)?;
+                if error == NOT_COLLECTED {
+                    interrupted = true;
+                    continue;
+                }
+                if let Some(p) = progress {
+                    let _ = p.send(CollectEvent::InstanceError {
+                        label: label.clone(),
+                        error: error.clone(),
+                    });
+                }
+                errors.push(format!("{label}: {error}"));
+                continue;
             }
-            errors.push(format!("{label}: {error}"));
-            continue;
+        };
+        if let Some(owner) = &owner {
+            stamp_owner(&mut sink.events, owner);
         }
-        let Some(sink) = sink else { continue };
         let stats = store.ingest(
             run_id,
             &Batch {

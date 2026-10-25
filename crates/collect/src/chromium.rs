@@ -213,6 +213,10 @@ impl ChromiumCollector {
 }
 
 impl Collector for ChromiumCollector {
+    fn per_user(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "chromium.history"
     }

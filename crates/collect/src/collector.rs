@@ -1,6 +1,7 @@
 use anyhow::Result;
 use fp_core::{Artifact, Event, Privilege, SourceInstance, StateRecord};
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserTarget {
@@ -18,20 +19,55 @@ pub struct Env {
     pub user_targets: Vec<UserTarget>,
 }
 
+/// One `/etc/passwd` line: (user, uid, home, shell).
+fn passwd_entries(passwd: &Path) -> Result<Vec<(String, u32, PathBuf, String)>> {
+    let contents = std::fs::read_to_string(passwd)?;
+    Ok(contents
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split(':').collect();
+            let [user, _, uid, _, _, home, shell] = parts.as_slice() else {
+                return None;
+            };
+            Some((
+                user.to_string(),
+                uid.parse().ok()?,
+                PathBuf::from(home),
+                shell.to_string(),
+            ))
+        })
+        .collect())
+}
+
+/// Under `sudo`, the user who ran it: their home is the one to read, not root's.
+fn sudo_invoker() -> Option<UserTarget> {
+    // SAFETY: geteuid cannot fail and touches no memory
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let uid: u32 = std::env::var("SUDO_UID").ok()?.parse().ok()?;
+    if uid == 0 {
+        return None;
+    }
+    let (user, _, home, _) = passwd_entries(Path::new("/etc/passwd"))
+        .ok()?
+        .into_iter()
+        .find(|(_, u, _, _)| *u == uid)?;
+    Some(UserTarget { uid, user, home })
+}
+
 impl Env {
     pub fn current() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         // SAFETY: getuid/geteuid cannot fail and touch no memory
         let uid = unsafe { libc::getuid() };
         let euid = unsafe { libc::geteuid() };
-        let user = std::env::var("USER").unwrap_or_default();
-        let target = UserTarget {
+        let target = sudo_invoker().unwrap_or_else(|| UserTarget {
             uid,
-            user,
-            home: home.clone(),
-        };
+            user: std::env::var("USER").unwrap_or_default(),
+            home: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+        });
         Self {
-            home,
+            home: target.home.clone(),
             root: PathBuf::from("/"),
             uid,
             euid,
@@ -58,37 +94,45 @@ impl Env {
         }
     }
 
-    pub fn add_user_home(&mut self, home: PathBuf, uid: Option<u32>, user: Option<String>) {
-        let uid = uid.unwrap_or(self.uid);
-        let user = user.unwrap_or_else(|| self.uid.to_string());
-        if !self.user_targets.iter().any(|t| t.home == home) {
-            self.user_targets.push(UserTarget { uid, user, home });
+    /// The same run, narrowed to one user's home (for collectors that read one home at a time).
+    pub fn for_user(&self, target: &UserTarget) -> Self {
+        Self {
+            home: target.home.clone(),
+            root: self.root.clone(),
+            uid: self.uid,
+            euid: self.euid,
+            user_targets: vec![target.clone()],
         }
+    }
+
+    /// Adds a home; without an explicit owner, the directory's owner (named via passwd) is used.
+    pub fn add_user_home(&mut self, home: PathBuf, uid: Option<u32>, user: Option<String>) {
+        if self.user_targets.iter().any(|t| t.home == home) {
+            return;
+        }
+        let uid = uid
+            .or_else(|| std::fs::metadata(&home).ok().map(|m| m.uid()))
+            .unwrap_or(self.uid);
+        let user = user
+            .or_else(|| {
+                passwd_entries(&self.system_path("/etc/passwd"))
+                    .ok()?
+                    .into_iter()
+                    .find(|(_, u, _, _)| *u == uid)
+                    .map(|(name, ..)| name)
+            })
+            .unwrap_or_else(|| uid.to_string());
+        self.user_targets.push(UserTarget { uid, user, home });
     }
 
     /// Enumerates `/etc/passwd` to discover homes of users with uid >= 1000.
     pub fn load_all_users(&mut self) -> Result<()> {
-        let passwd_path = self.system_path("/etc/passwd");
-        let contents = std::fs::read_to_string(&passwd_path)?;
-        for line in contents.lines() {
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() < 7 {
-                continue;
-            }
-            let user = parts[0];
-            let Ok(uid) = parts[2].parse::<u32>() else {
-                continue;
-            };
-            let home_dir = parts[5];
-            let shell = parts[6];
-
+        for (user, uid, home, shell) in passwd_entries(&self.system_path("/etc/passwd"))? {
             if uid < 1000 || shell.ends_with("/nologin") || shell.ends_with("/false") {
                 continue;
             }
-
-            let path = PathBuf::from(home_dir);
-            if path.is_dir() {
-                self.add_user_home(path, Some(uid), Some(user.to_string()));
+            if home.is_dir() {
+                self.add_user_home(home, Some(uid), Some(user));
             }
         }
         Ok(())
@@ -138,6 +182,11 @@ pub trait Collector: Send + Sync {
     fn discover(&self, env: &Env) -> Vec<SourceInstance>;
     /// An `Err` fails this instance only; the run continues with the next one.
     fn collect(&self, inst: &SourceInstance, ctx: &CollectCtx, sink: &mut Sink) -> Result<()>;
+    /// Reads one home (`Env::home`); the runner discovers it once per user target and stamps
+    /// that user on its events. System-wide collectors walk `Env::user_targets` themselves.
+    fn per_user(&self) -> bool {
+        false
+    }
     fn privilege(&self) -> Privilege {
         Privilege::User
     }

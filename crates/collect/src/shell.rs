@@ -63,6 +63,10 @@ use std::path::PathBuf;
 pub struct ShellCollector;
 
 impl Collector for ShellCollector {
+    fn per_user(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "shell.history"
     }

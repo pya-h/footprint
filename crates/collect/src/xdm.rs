@@ -26,6 +26,10 @@ const COLUMNS: &[&str] = &[
 pub struct XdmCollector;
 
 impl Collector for XdmCollector {
+    fn per_user(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "dlmgr.xdm"
     }

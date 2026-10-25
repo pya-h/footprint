@@ -187,6 +187,28 @@ fn collect_runs_and_refreshes() {
 }
 
 #[test]
+fn a_collect_that_cannot_start_reports_and_unblocks() {
+    let case = setup();
+    let mut app = App::new(&case.db).unwrap();
+    app.view = View::Collect;
+    app.collect.since = "not a time".into();
+    app.on_key(Key::Enter).unwrap();
+    for _ in 0..200 {
+        app.poll_collect().unwrap();
+        if !app.collect.running {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        !app.collect.running,
+        "a failed collect must not stay running"
+    );
+    let text = app.collect.summary.as_ref().unwrap();
+    assert!(text.contains("collect failed"), "{text}");
+}
+
+#[test]
 fn help_overlay_and_quit() {
     let case = setup();
     let mut app = App::new(&case.db).unwrap();

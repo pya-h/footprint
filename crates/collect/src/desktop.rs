@@ -33,6 +33,10 @@ struct AppUse {
 }
 
 impl Collector for DesktopCollector {
+    fn per_user(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "desktop.recent"
     }

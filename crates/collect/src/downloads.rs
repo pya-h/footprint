@@ -23,6 +23,10 @@ const KNOWN_MANAGERS: &[(&str, &str)] = &[
 pub struct XattrDownloadCollector;
 
 impl Collector for XattrDownloadCollector {
+    fn per_user(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "dlmgr.xattr"
     }
@@ -112,6 +116,10 @@ impl Collector for XattrDownloadCollector {
 pub struct DlmgrDetectCollector;
 
 impl Collector for DlmgrDetectCollector {
+    fn per_user(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "dlmgr.detect"
     }

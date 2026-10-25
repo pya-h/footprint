@@ -1,28 +1,45 @@
 //! Ctrl-C / SIGTERM handling for `collect`.
 //!
-//! The signal handler only flips an atomic flag — that is async-signal-safe. The
-//! collection loop checks the flag between instances and aborts gracefully, which
-//! drops the temp dir like a normal exit.
+//! The signal handler only flips an atomic flag — that is async-signal-safe. Workers check
+//! the flag before each instance and skip the rest, which drops the temp dir like a normal
+//! exit. A second signal exits at once.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+/// Exit status of a process ended by SIGINT, as shells report it.
+const EXIT_INTERRUPTED: libc::c_int = 130;
+
 extern "C" fn on_signal(_sig: libc::c_int) {
-    INTERRUPTED.store(true, Ordering::SeqCst);
+    // a second signal means "now": skip the graceful path (`_exit` is async-signal-safe)
+    if INTERRUPTED.swap(true, Ordering::SeqCst) {
+        unsafe { libc::_exit(EXIT_INTERRUPTED) };
+    }
 }
 
-pub struct InterruptGuard;
+/// Restores the handlers that were in place before [`arm`] when dropped.
+pub struct InterruptGuard {
+    previous: [(libc::c_int, libc::sighandler_t); 2],
+}
 
-/// Arms SIGINT/SIGTERM flagging. The previous handlers are not restored (the process
-/// exits right after an interrupt anyway).
+/// Arms SIGINT/SIGTERM flagging until the guard drops.
 pub fn arm() -> InterruptGuard {
     INTERRUPTED.store(false, Ordering::SeqCst);
-    unsafe {
-        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+    let handler = on_signal as *const () as libc::sighandler_t;
+    // SAFETY: the handler only touches an atomic (and `_exit`), both async-signal-safe
+    let previous =
+        [libc::SIGINT, libc::SIGTERM].map(|sig| (sig, unsafe { libc::signal(sig, handler) }));
+    InterruptGuard { previous }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        for (sig, handler) in self.previous {
+            // SAFETY: reinstalls the handler that was there before `arm`
+            unsafe { libc::signal(sig, handler) };
+        }
     }
-    InterruptGuard
 }
 
 pub fn interrupted() -> bool {

@@ -15,6 +15,10 @@ const ZEITGEIST_DB: &str = ".local/share/zeitgeist/activity.sqlite";
 pub struct KdeRecentCollector;
 
 impl Collector for KdeRecentCollector {
+    fn per_user(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "desktop.kde"
     }
@@ -106,6 +110,10 @@ impl Collector for KdeRecentCollector {
 pub struct ZeitgeistCollector;
 
 impl Collector for ZeitgeistCollector {
+    fn per_user(&self) -> bool {
+        true
+    }
+
     fn kind(&self) -> &'static str {
         "desktop.zeitgeist"
     }
