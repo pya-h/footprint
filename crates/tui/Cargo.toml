@@ -8,6 +8,7 @@ authors.workspace = true
 fp-core = { path = "../core" }
 fp-store = { path = "../store" }
 fp-query = { path = "../query" }
+fp-render = { path = "../render" }
 # the interactive terminal UI
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = "0.29"

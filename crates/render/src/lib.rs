@@ -8,6 +8,55 @@ pub use html::render_html;
 pub use jsonl::render_jsonl;
 pub use redact::{hash_secret, redact_json, redact_text, redact_url};
 
+/// Evidence is untrusted: strip control and ANSI escape characters
+/// before printing to a terminal. Printable text, newline and tab survive.
+pub fn sanitize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // skip an ANSI escape: CSI … final-byte, or a two-char sequence
+            let mut rest = chars.clone();
+            match rest.next() {
+                Some('[') => {
+                    for c2 in rest.by_ref() {
+                        if (0x40..=0x7e).contains(&(c2 as u32)) {
+                            break;
+                        }
+                    }
+                    chars = rest;
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        match c {
+            '\n' => out.push('\n'),
+            '\t' => out.push('\t'),
+            c if c.is_control() => continue,
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize;
+
+    #[test]
+    fn strips_ansi_and_control_chars() {
+        assert_eq!(sanitize("\x1b[31mred\x1b[0m plain"), "red plain");
+        assert_eq!(sanitize("beep\x07bell"), "beepbell");
+        assert_eq!(sanitize("line\nbreak\ttab"), "line\nbreak\ttab");
+        assert_eq!(sanitize("zero\x00width"), "zerowidth");
+        assert_eq!("plain", sanitize("plain"));
+    }
+}
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use fp_correlate::{IocHit, check_iocs, match_event_iocs};

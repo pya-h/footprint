@@ -502,7 +502,7 @@ fn print_rows(rows: Vec<fp_query::TimelineRow>, format: Format) -> Result<()> {
                     ),
                     row.source_label(),
                     row.kind,
-                    row.display_text(),
+                    fp_render::sanitize(&row.display_text()),
                     ioc_badge
                 );
             }
@@ -519,7 +519,7 @@ fn print_rows(rows: Vec<fp_query::TimelineRow>, format: Format) -> Result<()> {
                     fp_render::csv::escape_csv(&time_str),
                     fp_render::csv::escape_csv(&row.source_label()),
                     fp_render::csv::escape_csv(&row.kind),
-                    fp_render::csv::escape_csv(&row.display_text()),
+                    fp_render::csv::escape_csv(&fp_render::sanitize(&row.display_text())),
                     fp_render::csv::escape_csv(&row.ioc_hits.join(";")),
                 );
             }
@@ -566,9 +566,9 @@ fn show(case: &Path, id: u64) -> Result<()> {
             ev.profile.map(|p| format!("/{p}")).unwrap_or_default()
         ),
     );
-    field("subject", &dash(&ev.subject));
+    field("subject", &fp_render::sanitize(&dash(&ev.subject)));
     field("host", &dash(&ev.subject_host));
-    field("summary", &dash(&ev.summary));
+    field("summary", &fp_render::sanitize(&dash(&ev.summary)));
     field("confidence", &ev.confidence);
     field("file", &dash(&ev.prov_file));
     field("sha256", &dash(&ev.prov_sha256));
@@ -582,10 +582,12 @@ fn show(case: &Path, id: u64) -> Result<()> {
     );
     field(
         "attrs",
-        &ev.attrs
-            .as_ref()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "-".into()),
+        &fp_render::sanitize(
+            &ev.attrs
+                .as_ref()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "-".into()),
+        ),
     );
 
     if !ev.links.is_empty() {
@@ -811,11 +813,11 @@ fn ioc(case: &Path, args: IocArgs) -> Result<()> {
                         for h in hits {
                             println!(
                                 "{:<28} {:<8} {:<30} {:<18} {:<30} {}",
-                                h.target_desc,
+                                fp_render::sanitize(&h.target_desc),
                                 h.ioc_type,
-                                h.ioc_value,
+                                fp_render::sanitize(&h.ioc_value),
                                 h.matched_field,
-                                h.matched_value,
+                                fp_render::sanitize(&h.matched_value),
                                 h.ioc_note.unwrap_or_else(|| "-".into())
                             );
                         }

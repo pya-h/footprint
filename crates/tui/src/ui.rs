@@ -772,7 +772,9 @@ fn centered_rect(
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    let mut chars = s.chars();
+    // evidence is untrusted: control chars never reach the terminal
+    let clean = fp_render::sanitize(s);
+    let mut chars = clean.chars();
     let taken: String = chars.by_ref().take(max).collect();
     if chars.next().is_some() {
         format!("{taken}…")

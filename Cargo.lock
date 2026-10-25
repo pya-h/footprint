@@ -798,6 +798,7 @@ dependencies = [
  "fp-core",
  "fp-fixtures",
  "fp-query",
+ "fp-render",
  "fp-store",
  "ratatui",
  "serde_json",
