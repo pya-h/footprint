@@ -14,12 +14,16 @@ use fp_core::time::TimeFormat;
 use fp_core::{Actor, Artifact, Availability, EventKind, SourceInstance, StateRecord};
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// (browser, config root relative to $HOME)
 const ROOTS: &[(&str, &str)] = &[
     ("Firefox", ".mozilla/firefox"),
+    // newer Firefox releases follow XDG for new profiles
+    ("Firefox", ".config/mozilla/firefox"),
     ("Firefox", "snap/firefox/common/.mozilla/firefox"),
+    ("Firefox", ".var/app/org.mozilla.firefox/.mozilla/firefox"),
     ("Zen", ".zen"),
     ("LibreWolf", ".librewolf"),
 ];
@@ -233,6 +237,18 @@ struct FirefoxDownload {
     end_time: Option<i64>,
 }
 
+/// Above this, a download `endTime` is µs (PRTime); below, the ms `Date.now()` Firefox writes.
+/// 10^14 ms is the year 5138 and 10^14 µs is 1973, so real values never collide.
+const PRTIME_FLOOR: i64 = 100_000_000_000_000;
+
+fn end_time_format(end_time: i64) -> TimeFormat {
+    if end_time >= PRTIME_FLOOR {
+        TimeFormat::PRTime
+    } else {
+        TimeFormat::UnixMillis
+    }
+}
+
 /// Downloads are `moz_annos` rows named `downloads/destinationFileURI` / `downloads/metaData`.
 fn collect_downloads(
     conn: &Connection,
@@ -250,30 +266,28 @@ fn collect_downloads(
         return Ok(());
     }
     let mut stmt = conn.prepare(
-        "SELECT p.url, ma.name, a.content
+        "SELECT p.id, p.url, ma.name, a.content
          FROM moz_annos a
          JOIN moz_anno_attributes ma ON ma.id = a.anno_attribute_id
          JOIN moz_places p ON p.id = a.place_id
          WHERE ma.name = 'downloads/destinationFileURI' OR ma.name = 'downloads/metaData'",
     )?;
     let mut rows = stmt.query([])?;
-    let mut downloads: Vec<FirefoxDownload> = Vec::new();
+    // keyed by place id: the annotations of one download hang off its source url's place
+    let mut downloads: BTreeMap<i64, FirefoxDownload> = BTreeMap::new();
     while let Some(row) = rows.next()? {
-        let url: String = row.get(0)?;
-        let name: String = row.get(1)?;
-        let content: String = row.get(2)?;
-        let entry = match downloads.iter_mut().find(|d| d.url == url) {
-            Some(e) => e,
-            None => {
-                downloads.push(FirefoxDownload {
-                    url,
-                    target: None,
-                    size: None,
-                    end_time: None,
-                });
-                downloads.last_mut().expect("just pushed")
-            }
-        };
+        let place_id: i64 = row.get(0)?;
+        let url: String = row.get(1)?;
+        let name: String = row.get(2)?;
+        let content: String = row.get(3)?;
+        let entry = downloads
+            .entry(place_id)
+            .or_insert_with(|| FirefoxDownload {
+                url,
+                target: None,
+                size: None,
+                end_time: None,
+            });
         if name == "downloads/destinationFileURI" {
             entry.target = Some(file_uri_to_path(&content));
         } else if let Ok(meta) = serde_json::from_str::<Value>(&content) {
@@ -282,11 +296,11 @@ fn collect_downloads(
         }
     }
 
-    for (i, d) in downloads.iter().enumerate() {
+    for (place_id, d) in &downloads {
         let Some(end_time) = d.end_time.filter(|&t| t > 0) else {
             continue;
         };
-        let stamp = Stamp::parse(end_time.to_string(), TimeFormat::PRTime, None)?;
+        let stamp = Stamp::parse(end_time.to_string(), end_time_format(end_time), None)?;
         if !in_window(ctx, stamp.ts_utc) {
             continue;
         }
@@ -316,7 +330,7 @@ fn collect_downloads(
                 EventKind::WebDownload,
                 d.url.clone(),
                 summary,
-                origin.at(format!("moz_annos place#{} (downloads)", i + 1)),
+                origin.at(format!("moz_annos.place_id={place_id}")),
             )
         });
     }
@@ -508,6 +522,18 @@ mod tests {
         let instances = FirefoxCollector.discover(&env);
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].app, "Zen");
+    }
+
+    #[test]
+    fn download_end_time_in_ms_or_us() {
+        let ms = Stamp::parse("1792170893000", end_time_format(1_792_170_893_000), None).unwrap();
+        let us = Stamp::parse(
+            "1792170893000000",
+            end_time_format(1_792_170_893_000_000),
+            None,
+        )
+        .unwrap();
+        assert_eq!(ms.ts_utc, us.ts_utc);
     }
 
     #[test]
