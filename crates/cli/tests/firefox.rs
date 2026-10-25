@@ -54,6 +54,11 @@ fn firefox_profile_collects_visits_downloads_permissions_extensions() {
 
     // visits and the redirect chain, with from_visit for correlation
     let visits = events(&db, &["--kind", "web.visit"]);
+    // profiles.ini names the profile; the random directory prefix is not the label
+    assert!(
+        visits.iter().all(|e| e["profile"] == "default-release"),
+        "profile label should come from profiles.ini: {visits:?}"
+    );
     assert!(
         visits
             .iter()

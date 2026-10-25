@@ -70,18 +70,22 @@ impl FirefoxCollector {
             if !root.is_dir() {
                 continue;
             }
+            // profiles.ini carries the real names (`default-release`, `default-esr`); the
+            // directory is a random prefix. Anything on disk but not in the ini (or with no
+            // ini at all) falls back to the prefix.
+            let mut seen: Vec<PathBuf> = Vec::new();
+            for (name, path) in parse_profiles_ini(&root) {
+                if has_evidence(&path) && !seen.contains(&path) {
+                    seen.push(path.clone());
+                    out.push((browser, name, path));
+                }
+            }
             let Ok(entries) = std::fs::read_dir(&root) else {
                 continue;
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let has_evidence = ["places.sqlite", "permissions.sqlite", "extensions.json"]
-                    .iter()
-                    .any(|f| path.join(f).exists());
-                if !has_evidence {
+                if !path.is_dir() || !has_evidence(&path) || seen.contains(&path) {
                     continue;
                 }
                 let name = entry
@@ -91,11 +95,56 @@ impl FirefoxCollector {
                     .next()
                     .unwrap_or("default")
                     .to_string();
+                seen.push(path.clone());
                 out.push((browser, name, path));
             }
         }
         out
     }
+}
+
+fn has_evidence(path: &std::path::Path) -> bool {
+    ["places.sqlite", "permissions.sqlite", "extensions.json"]
+        .iter()
+        .any(|f| path.join(f).exists())
+}
+
+/// `[Profile0] Name=… Path=… IsRelative=…` entries, in file order.
+fn parse_profiles_ini(root: &std::path::Path) -> Vec<(String, PathBuf)> {
+    let Ok(text) = std::fs::read_to_string(root.join("profiles.ini")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut name: Option<String> = None;
+    let mut path: Option<PathBuf> = None;
+    let mut relative = true;
+    let flush = |name: &mut Option<String>,
+                 path: &mut Option<PathBuf>,
+                 relative: bool,
+                 out: &mut Vec<(String, PathBuf)>| {
+        if let (Some(n), Some(p)) = (name.take(), path.take()) {
+            out.push((n, if relative { root.join(&p) } else { p }));
+        }
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            flush(&mut name, &mut path, relative, &mut out);
+            relative = true;
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "Name" => name = Some(value.trim().to_string()),
+            "Path" => path = Some(PathBuf::from(value.trim())),
+            "IsRelative" => relative = value.trim() != "0",
+            _ => {}
+        }
+    }
+    flush(&mut name, &mut path, relative, &mut out);
+    out
 }
 
 impl Collector for FirefoxCollector {
@@ -237,8 +286,11 @@ struct FirefoxDownload {
     end_time: Option<i64>,
 }
 
-/// Above this, a download `endTime` is µs (PRTime); below, the ms `Date.now()` Firefox writes.
-/// 10^14 ms is the year 5138 and 10^14 µs is 1973, so real values never collide.
+/// Modern Firefox writes the `downloads/metaData` `endTime` in milliseconds (JS `Date.now()`;
+/// a real parsed record shows `1748605371660` — 13 digits, its last three matching the
+/// annotation's own microsecond `lastModified`'s milliseconds); legacy nsDownloadManager
+/// wrote PRTime µs. Above this floor the value is µs, below it ms: 10^14 ms is the year
+/// 5138 and 10^14 µs is 1973, so real values never collide.
 const PRTIME_FLOOR: i64 = 100_000_000_000_000;
 
 fn end_time_format(end_time: i64) -> TimeFormat {

@@ -418,6 +418,11 @@ pub fn firefox_profile(base: &Path) -> io::Result<PathBuf> {
     let home = base.join("home/u");
     let profile = home.join(".mozilla/firefox/fake.default-release");
     fs::create_dir_all(&profile)?;
+    // the real names live in profiles.ini; the directory is a random prefix
+    write(
+        &home.join(".mozilla/firefox/profiles.ini"),
+        "[Profile0]\nName=default-release\nIsRelative=1\nPath=fake.default-release\nDefault=1\n",
+    )?;
     let sqlite = |e: rusqlite::Error| io::Error::other(e);
 
     let places = profile.join("places.sqlite");
@@ -444,7 +449,7 @@ pub fn firefox_profile(base: &Path) -> io::Result<PathBuf> {
             (2, 'downloads/metaData');
         INSERT INTO moz_annos (place_id, anno_attribute_id, content, dateAdded, lastModified) VALUES
             (4, 1, 'file:///home/u/Downloads/zoom_amd64.deb', 1792170893000000, 1792170893000000),
-            (4, 2, '{\"fileSize\":317514752,\"endTime\":1792170893000000,\"state\":1}', 1792170893000000, 1792170893000000);
+            (4, 2, '{\"fileSize\":317514752,\"endTime\":1792170893000,\"state\":1}', 1792170893000000, 1792170893000000);
         ",
     )
     .map_err(sqlite)?;
