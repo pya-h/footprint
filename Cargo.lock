@@ -662,7 +662,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "fp-collect",
  "fp-core",
  "fp-correlate",
  "fp-fixtures",

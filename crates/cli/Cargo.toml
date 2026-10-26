@@ -11,7 +11,6 @@ path = "src/main.rs"
 [dependencies]
 fp-core = { path = "../core" }
 fp-store = { path = "../store" }
-fp-collect = { path = "../collect" }
 fp-correlate = { path = "../correlate" }
 fp-render = { path = "../render" }
 fp-query = { path = "../query" }
