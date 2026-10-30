@@ -122,7 +122,31 @@ struct Outcome {
     inst: SourceInstance,
     owner: Option<UserTarget>,
     label: String,
-    result: std::result::Result<fp_collect::Sink, String>,
+    result: std::result::Result<fp_collect::Sink, Failure>,
+}
+
+/// Why an instance produced nothing.
+struct Failure {
+    text: String,
+    /// the OS refused to let this user read it: `unreadable`, not a failure of the tool
+    denied: bool,
+}
+
+impl Failure {
+    fn other(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            denied: false,
+        }
+    }
+}
+
+fn permission_denied(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
 }
 
 /// Collects one source instance on a worker. No store access: the source row was
@@ -135,7 +159,7 @@ fn collect_only(
 ) -> Outcome {
     let label = label(&job.inst);
     let result = if crate::interrupt::interrupted() {
-        Err(NOT_COLLECTED.to_string())
+        Err(Failure::other(NOT_COLLECTED))
     } else {
         if let Some(p) = progress {
             let _ = p.send(CollectEvent::InstanceStarted {
@@ -148,8 +172,14 @@ fn collect_only(
             collector.collect(&job.inst, ctx, &mut sink)
         })) {
             Ok(Ok(())) => Ok(sink),
-            Ok(Err(e)) => Err(format!("{e:#}")),
-            Err(panic) => Err(format!("collector panicked: {}", panic_text(&panic))),
+            Ok(Err(e)) => Err(Failure {
+                text: format!("{e:#}"),
+                denied: permission_denied(&e),
+            }),
+            Err(panic) => Err(Failure::other(format!(
+                "collector panicked: {}",
+                panic_text(&panic)
+            ))),
         }
     };
     Outcome {
@@ -340,7 +370,23 @@ pub fn run_collect(
         } = outcome;
         let mut sink = match result {
             Ok(sink) => sink,
-            Err(error) => {
+            Err(Failure { text, denied: true }) => {
+                // permissions are a fact about this user, like a missing app: a coverage note
+                let status = Availability::Unreadable {
+                    needs_root: env.euid != 0,
+                };
+                store.update_source_status(inst.id, &status, Some(&text))?;
+                if let Some(p) = progress {
+                    let _ = p.send(CollectEvent::InstanceDone {
+                        label,
+                        totals: IngestTotals::default(),
+                        warnings: vec![format!("{status}: {text}")],
+                        status,
+                    });
+                }
+                continue;
+            }
+            Err(Failure { text: error, .. }) => {
                 store.update_source_status(inst.id, &Availability::Error(error.clone()), None)?;
                 if error == NOT_COLLECTED {
                     interrupted = true;

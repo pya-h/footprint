@@ -972,8 +972,13 @@ fn explain(finding: &str) -> Result<()> {
 }
 
 fn parse_ioc_line(line: &str) -> (String, String, Option<String>) {
-    let (body, note) = match line.split_once('#') {
-        Some((b, n)) => (b.trim(), Some(n.trim().to_string())),
+    // a comment starts at a `#` after whitespace; a URL's own `#fragment` is part of the value
+    let comment = line
+        .char_indices()
+        .find(|&(i, c)| c == '#' && (i == 0 || line[..i].ends_with(char::is_whitespace)))
+        .map(|(i, _)| i);
+    let (body, note) = match comment {
+        Some(i) => (line[..i].trim(), Some(line[i + 1..].trim().to_string())),
         None => (line.trim(), None),
     };
 
@@ -1005,14 +1010,15 @@ fn parse_ioc_line(line: &str) -> (String, String, Option<String>) {
 fn detect_ioc_type(val: &str) -> String {
     if val.len() == 64 && val.chars().all(|c| c.is_ascii_hexdigit()) {
         "sha256".to_string()
+    } else if val.contains("://") {
+        // before the glob check: a URL's query has a `?`
+        "url".to_string()
     } else if val.starts_with('/')
         || val.starts_with("./")
         || val.contains('*')
         || val.contains('?')
     {
         "path".to_string()
-    } else if val.contains("://") {
-        "url".to_string()
     } else if val.contains('/')
         && val
             .split('/')
@@ -1047,5 +1053,28 @@ mod tests {
         assert_eq!(detect_ioc_type("192.168.1.1"), "ip");
         assert_eq!(detect_ioc_type("192.168.1.0/24"), "cidr");
         assert_eq!(detect_ioc_type("/tmp/evil.sh"), "path");
+        // a query string is not a glob
+        assert_eq!(detect_ioc_type("https://evil.example/dl?id=1"), "url");
+    }
+
+    #[test]
+    fn ioc_lines_keep_url_fragments() {
+        use super::parse_ioc_line;
+        assert_eq!(
+            parse_ioc_line("url https://evil.example/#token  # phishing kit"),
+            (
+                "url".to_string(),
+                "https://evil.example/#token".to_string(),
+                Some("phishing kit".to_string())
+            )
+        );
+        assert_eq!(
+            parse_ioc_line("evil.example # c2"),
+            (
+                "domain".to_string(),
+                "evil.example".to_string(),
+                Some("c2".to_string())
+            )
+        );
     }
 }
