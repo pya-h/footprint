@@ -215,15 +215,20 @@ pub fn run_collect(
     params: &CollectParams,
     progress: Option<&Sender<CollectEvent>>,
 ) -> Result<CollectSummary> {
+    let assume_tz = params
+        .assume_tz
+        .as_deref()
+        .map(crate::parse_tz)
+        .transpose()?;
     let since = params
         .since
         .as_deref()
-        .map(crate::time::parse)
+        .map(|s| crate::time::parse_in(s, assume_tz))
         .transpose()?;
     let until = params
         .until
         .as_deref()
-        .map(crate::time::parse)
+        .map(|s| crate::time::parse_in(s, assume_tz))
         .transpose()?;
     if let (Some(lo), Some(hi)) = (since, until)
         && lo > hi
