@@ -73,13 +73,14 @@ impl Store {
         Self::open_with(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
     }
 
-    /// Opens an existing case; never creates one.
+    /// Opens an existing case read-only; never creates one, so query commands also
+    /// work on evidence-protected (0400) case files.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         if !path.exists() {
             return Err(StoreError::NotFound(path.to_path_buf()));
         }
-        Self::open_with(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        Self::open_with(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
     }
 
     fn open_with(path: &Path, flags: OpenFlags) -> Result<Self, StoreError> {
@@ -90,11 +91,11 @@ impl Store {
             conn,
             path: path.to_path_buf(),
         };
-        store.init()?;
+        store.init(!flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY))?;
         Ok(store)
     }
 
-    fn init(&self) -> Result<(), StoreError> {
+    fn init(&self, writable: bool) -> Result<(), StoreError> {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -105,13 +106,15 @@ impl Store {
         )?;
         match (version, has_tables) {
             (SCHEMA_VERSION, _) => {
-                self.conn.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS links_uniq ON links(src_type, src_id, rel, dst_type, dst_id)",
-                    [],
-                )?;
+                if writable {
+                    self.conn.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS links_uniq ON links(src_type, src_id, rel, dst_type, dst_id)",
+                        [],
+                    )?;
+                }
                 Ok(())
             }
-            (0, false) => {
+            (0, false) if writable => {
                 self.conn.execute_batch(SCHEMA)?;
                 self.conn
                     .pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -586,12 +589,25 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Adding an existing `(type, value)` again returns its id: imports stay idempotent
+    /// and a double import can't double the hits.
     pub fn insert_ioc(
         &mut self,
         ioc_type: &str,
         value: &str,
         note: Option<&str>,
     ) -> Result<u64, StoreError> {
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM iocs WHERE type = ?1 AND value = ?2 ORDER BY id LIMIT 1",
+                params![ioc_type, value],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(id as u64);
+        }
         let now = now_micros();
         self.conn.execute(
             "INSERT INTO iocs (type, value, note, added_utc) VALUES (?1, ?2, ?3, ?4)",
@@ -1201,6 +1217,16 @@ mod tests {
     }
 
     #[test]
+    fn open_reads_a_protected_case() {
+        let (dir, store) = open_case();
+        drop(store);
+        let path = dir.path().join("case.db");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let store = Store::open(&path).unwrap();
+        assert!(store.last_run_id().unwrap().is_none());
+    }
+
+    #[test]
     fn rerun_is_idempotent() {
         let (_dir, mut store) = open_case();
         let (r1, s1) = run(&mut store);
@@ -1398,6 +1424,17 @@ mod tests {
 
         let not_found = store.delete_ioc(999).unwrap();
         assert!(!not_found);
+    }
+
+    #[test]
+    fn ioc_insert_is_idempotent() {
+        let (_dir, mut store) = open_case();
+        let id1 = store.insert_ioc("domain", "evil.example", None).unwrap();
+        let id2 = store
+            .insert_ioc("domain", "evil.example", Some("again"))
+            .unwrap();
+        assert_eq!(id1, id2);
+        assert_eq!(store.list_iocs().unwrap().len(), 1);
     }
 
     #[test]

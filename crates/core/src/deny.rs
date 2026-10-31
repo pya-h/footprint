@@ -39,16 +39,24 @@ const SECRET_COMPONENTS: &[&str] = &[
 ];
 
 pub fn is_secret(path: &Path) -> bool {
-    let names: Vec<&str> = path
+    let mut names: Vec<&str> = path
         .components()
         .filter_map(|c| match c {
             Component::Normal(s) => s.to_str(),
             _ => None,
         })
         .collect();
-    let Some(&file) = names.last() else {
+    let Some(file) = names.last_mut() else {
         return false;
     };
+    // a SQLite sidecar holds the same data as its DB (Cookies-wal, key4.db-journal)
+    for suffix in ["-wal", "-journal", "-shm"] {
+        if let Some(base) = file.strip_suffix(suffix) {
+            *file = base;
+            break;
+        }
+    }
+    let file = *file;
     let parent = names.len().checked_sub(2).map(|i| names[i]);
 
     names.iter().any(|n| SECRET_COMPONENTS.contains(n))
@@ -77,9 +85,12 @@ mod tests {
     fn denies_secrets() {
         for p in [
             "/h/.config/BraveSoftware/Brave-Browser/Default/Cookies",
+            "/h/.config/BraveSoftware/Brave-Browser/Default/Cookies-journal",
             "/h/.config/google-chrome/Profile 1/Login Data",
             "/h/.config/brave/Default/Local Extension Settings/nkbihfbeogaeaoehlefnkodbefgpgknn/000003.log",
             "/h/.mozilla/firefox/x.default/key4.db",
+            "/h/.mozilla/firefox/x.default/key4.db-wal",
+            "/h/.mozilla/firefox/x.default/cookies.sqlite-shm",
             "/h/.mozilla/firefox/x.default/logins.json",
             "/h/.ssh/id_ed25519",
             "/h/.ssh/custom_deploy_key",

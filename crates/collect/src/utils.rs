@@ -84,6 +84,7 @@ pub fn copy_db_set(src: &Path, stage: &Path) -> Result<Snapshot> {
         side_name.push(suffix);
         let side = src.with_file_name(&side_name);
         if side.exists() {
+            guard(&side)?;
             regular_file(&side)?;
             fs::copy(&side, stage.join(&side_name))
                 .with_context(|| format!("copy {}", side.display()))?;

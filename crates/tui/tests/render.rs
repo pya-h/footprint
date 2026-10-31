@@ -67,7 +67,7 @@ fn no_color_disables_styling() {
     // flag every zoom.us row so the timeline shows the IOC marker
     {
         use fp_store::Store;
-        let mut store = Store::open(&db).unwrap();
+        let mut store = Store::open_or_create(&db).unwrap();
         store.insert_ioc("domain", "zoom.us", Some("flag")).unwrap();
     }
     drop(app);

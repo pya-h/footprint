@@ -8,6 +8,8 @@ pub use html::render_html;
 pub use jsonl::render_jsonl;
 pub use redact::{hash_secret, redact_json, redact_text, redact_url};
 
+use std::os::unix::fs::PermissionsExt;
+
 /// Directional overrides and isolates reorder what follows them: `evil\u{202e}fdp.exe`
 /// displays as `evilexe.pdf`.
 fn is_bidi_control(c: char) -> bool {
@@ -197,6 +199,9 @@ pub fn export_case(
         .mode(0o600)
         .open(out_path)
         .with_context(|| format!("failed to create export file {}", out_path.display()))?;
+    // `mode` applies at create only; overwriting a permissive file must not keep its mode
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to chmod export file {}", out_path.display()))?;
 
     let mut writer = BufWriter::new(file);
 
@@ -336,8 +341,10 @@ mod tests {
             format: &utc,
         };
 
-        // 1. JSONL with redact
+        // 1. JSONL with redact, overwriting a permissive file: the mode must tighten
         let jsonl_out = dir.path().join("export.jsonl");
+        fs::write(&jsonl_out, "old").unwrap();
+        fs::set_permissions(&jsonl_out, fs::Permissions::from_mode(0o644)).unwrap();
         let count = export_case(
             &store,
             &filter,
