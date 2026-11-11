@@ -338,12 +338,40 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
     }
 
-    fn build_events_query(
-        &self,
-        base_select: &str,
-        filter: &EventFilter,
-    ) -> (String, Vec<rusqlite::types::Value>) {
-        let mut sql = format!("{base_select} WHERE 1=1");
+    /// Counts all matching rows, ignoring paging and sort order.
+    pub fn count_events(&self, filter: &EventFilter) -> Result<u64, StoreError> {
+        let (conditions, args) = Self::events_where(filter);
+        let sql = format!(
+            "SELECT COUNT(*) FROM events e JOIN sources s ON s.id = e.source_id{conditions}"
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, params_from_iter(args), |row| row.get(0))?)
+    }
+
+    /// Time range of events with known or inferred timestamps.
+    pub fn time_bounds(&self) -> Result<Option<(i64, i64)>, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT
+                (SELECT e.ts_utc FROM events e JOIN sources s ON s.id = e.source_id
+                 WHERE e.ts_precision != 'order_only' ORDER BY e.ts_utc LIMIT 1),
+                (SELECT e.ts_utc FROM events e JOIN sources s ON s.id = e.source_id
+                 WHERE e.ts_precision != 'order_only' ORDER BY e.ts_utc DESC LIMIT 1)",
+            [],
+            |row| {
+                let min: Option<i64> = row.get(0)?;
+                let max: Option<i64> = row.get(1)?;
+                Ok(min.zip(max))
+            },
+        )?)
+    }
+
+    pub fn interrupt_handle(&self) -> rusqlite::InterruptHandle {
+        self.conn.get_interrupt_handle()
+    }
+
+    fn events_where(filter: &EventFilter) -> (String, Vec<rusqlite::types::Value>) {
+        let mut sql = String::from(" WHERE 1=1");
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
 
         if let Some(lo) = filter.since {
@@ -396,6 +424,16 @@ impl Store {
             let like = format!("%{}%", escape_like(text));
             args.extend([like.clone().into(), like.clone().into(), like.into()]);
         }
+        (sql, args)
+    }
+
+    fn build_events_query(
+        &self,
+        base_select: &str,
+        filter: &EventFilter,
+    ) -> (String, Vec<rusqlite::types::Value>) {
+        let (conditions, mut args) = Self::events_where(filter);
+        let mut sql = format!("{base_select}{conditions}");
         sql.push_str(if filter.reverse {
             " ORDER BY e.ts_utc DESC, e.id DESC"
         } else {
@@ -1317,6 +1355,155 @@ mod tests {
             ..Default::default()
         };
         assert!(store.list_events(&literal).unwrap().is_empty());
+    }
+
+    #[test]
+    fn count_matches_unpaged_timeline_filters() {
+        let (_dir, mut store) = open_case();
+        let (r, s) = run(&mut store);
+        let mut events = sample(r, s);
+        events.push(event(
+            r,
+            s,
+            500,
+            EventKind::WebVisit,
+            r"literal %_\ value",
+            None,
+            "visits.id=5",
+        ));
+        ingest(&mut store, r, &events);
+
+        let filters = [
+            EventFilter::default(),
+            EventFilter {
+                since: Some(200),
+                until: Some(400),
+                ..Default::default()
+            },
+            EventFilter {
+                kinds: vec!["web.v*".into(), "web.download".into()],
+                ..Default::default()
+            },
+            EventFilter {
+                hosts: vec!["zoom.us".into(), "page-redirect.com".into()],
+                ..Default::default()
+            },
+            EventFilter {
+                sources: vec!["Brave/Default".into()],
+                kinds: vec!["web.*".into()],
+                match_text: Some(r"%_\".into()),
+                ..Default::default()
+            },
+            EventFilter {
+                sources: vec!["missing".into()],
+                ..Default::default()
+            },
+        ];
+        for filter in filters {
+            let expected = store.list_events(&filter).unwrap().len() as u64;
+            let paged = EventFilter {
+                limit: Some(1),
+                offset: Some(1),
+                reverse: true,
+                ..filter
+            };
+            assert_eq!(store.count_events(&paged).unwrap(), expected);
+        }
+        assert_eq!(
+            store
+                .count_events(&EventFilter {
+                    match_text: Some(r"%_\".into()),
+                    ..Default::default()
+                })
+                .unwrap(),
+            1
+        );
+        let reader = Store::open(store.path()).unwrap();
+        assert_eq!(reader.count_events(&EventFilter::default()).unwrap(), 5);
+        assert_eq!(reader.time_bounds().unwrap(), Some((100, 500)));
+        drop(reader);
+
+        store
+            .conn()
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 UPDATE events SET source_id = 999 WHERE ts_utc = 500;",
+            )
+            .unwrap();
+        assert_eq!(store.count_events(&EventFilter::default()).unwrap(), 4);
+        assert_eq!(store.time_bounds().unwrap(), Some((100, 400)));
+    }
+
+    #[test]
+    fn time_bounds_exclude_only_order_only_events() {
+        let (_dir, mut store) = open_case();
+        assert_eq!(store.time_bounds().unwrap(), None);
+        let (r, s) = run(&mut store);
+        let mut events = sample(r, s);
+        for event in &mut events {
+            event.ts_utc = 0;
+            event.ts_precision = TimePrecision::OrderOnly;
+        }
+        ingest(&mut store, r, &events);
+        assert_eq!(store.time_bounds().unwrap(), None);
+
+        let mut negative = event(r, s, -20, EventKind::WebVisit, "negative", None, "negative");
+        negative.ts_precision = TimePrecision::Second;
+        negative.confidence = Confidence::Derived;
+        let zero = event(r, s, 0, EventKind::WebVisit, "zero", None, "zero");
+        ingest(&mut store, r, &[negative, zero]);
+        assert_eq!(store.time_bounds().unwrap(), Some((-20, 0)));
+    }
+
+    #[test]
+    fn interrupt_handle_cancels_running_query_and_connection_remains_usable() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_dir, store) = open_case();
+        let interrupt = store.interrupt_handle();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut statement = store
+                .conn()
+                .prepare(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000000000)
+                     SELECT SUM(i) FROM n",
+                )
+                .unwrap();
+            let mut ready = Some(ready_tx);
+            store.conn().progress_handler(
+                1,
+                Some(move || {
+                    if let Some(ready) = ready.take() {
+                        return ready.send(()).is_err()
+                            || resume_rx.recv_timeout(Duration::from_secs(10)).is_err();
+                    }
+                    false
+                }),
+            );
+            let result = statement.query_row([], |row| row.get::<_, i64>(0));
+            drop(statement);
+            store.conn().progress_handler(0, None::<fn() -> bool>);
+            (result, store.event_count())
+        });
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        interrupt.interrupt();
+        resume_tx.send(()).unwrap();
+        let (result, count) = worker.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::OperationInterrupted,
+                    ..
+                },
+                _
+            ))
+        ));
+        assert_eq!(count.unwrap(), 0);
+        interrupt.interrupt();
     }
 
     #[test]
