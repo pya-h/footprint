@@ -70,6 +70,75 @@ fn timeline_filters_and_rows() {
 }
 
 #[test]
+fn timeline_forwards_extended_filters() {
+    let case = setup();
+    let store = fp_store::Store::open_or_create(&case.db).unwrap();
+    let rows = fp_query::timeline(&store, &fp_query::TimelineFilter::default()).unwrap();
+    let row = rows.first().expect("fixture contains events");
+    let host = rows
+        .iter()
+        .find_map(|row| row.subject_host.clone())
+        .expect("fixture contains hosts");
+
+    for filter in [
+        fp_query::TimelineFilter {
+            kinds: vec![row.kind.clone()],
+            kinds_not: vec![row.kind.clone()],
+            ..Default::default()
+        },
+        fp_query::TimelineFilter {
+            hosts: vec![host.clone()],
+            hosts_not: vec![host],
+            ..Default::default()
+        },
+        fp_query::TimelineFilter {
+            sources: vec![row.source_kind.clone()],
+            sources_not: vec![row.source_kind.clone()],
+            ..Default::default()
+        },
+    ] {
+        assert!(fp_query::timeline(&store, &filter).unwrap().is_empty());
+    }
+
+    store
+        .conn()
+        .execute(
+            "UPDATE events SET ts_precision = 'order_only', confidence = 'derived',
+             summary = 'unique synthetic filter test' WHERE id = ?1",
+            [row.id],
+        )
+        .unwrap();
+    let filter = fp_query::TimelineFilter {
+        timing: fp_query::EventTiming::Untimed,
+        confidence: vec![fp_core::Confidence::Derived],
+        run_id: Some(row.run_id),
+        match_text: Some("unique synthetic filter test".into()),
+        limit: Some(1),
+        reverse: true,
+        ..Default::default()
+    };
+    let filtered = fp_query::timeline(&store, &filter).unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].id, row.id);
+    assert_eq!(
+        store
+            .count_events(&fp_store::EventFilter::from(&filter))
+            .unwrap(),
+        1
+    );
+    assert!(
+        fp_query::timeline(
+            &store,
+            &fp_query::TimelineFilter {
+                run_id: Some(u64::MAX),
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn detail_resolves_links() {
     let case = setup();
     let store = fp_store::Store::open(&case.db).unwrap();

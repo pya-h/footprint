@@ -1,4 +1,5 @@
-use fp_core::{Artifact, Event, Link, SourceInstance, SourceStatus, StateRecord};
+use fp_core::{Artifact, Confidence, Event, Link, SourceInstance, SourceStatus, StateRecord};
+use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params, params_from_iter};
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,6 +24,8 @@ pub enum StoreError {
         "case file schema v{found} is not supported (expected v{SCHEMA_VERSION}); start a new case"
     )]
     SchemaVersion { found: i64 },
+    #[error("run id {0} exceeds SQLite's integer range")]
+    InvalidRunId(u64),
 }
 
 pub struct Store {
@@ -340,7 +343,7 @@ impl Store {
 
     /// Counts all matching rows, ignoring paging and sort order.
     pub fn count_events(&self, filter: &EventFilter) -> Result<u64, StoreError> {
-        let (conditions, args) = Self::events_where(filter);
+        let (conditions, args) = Self::events_where(filter)?;
         let sql = format!(
             "SELECT COUNT(*) FROM events e JOIN sources s ON s.id = e.source_id{conditions}"
         );
@@ -370,9 +373,9 @@ impl Store {
         self.conn.get_interrupt_handle()
     }
 
-    fn events_where(filter: &EventFilter) -> (String, Vec<rusqlite::types::Value>) {
+    fn events_where(filter: &EventFilter) -> Result<(String, Vec<Value>), StoreError> {
         let mut sql = String::from(" WHERE 1=1");
-        let mut args: Vec<rusqlite::types::Value> = Vec::new();
+        let mut args: Vec<Value> = Vec::new();
 
         if let Some(lo) = filter.since {
             sql.push_str(" AND e.ts_utc >= ?");
@@ -382,40 +385,36 @@ impl Store {
             sql.push_str(" AND e.ts_utc <= ?");
             args.push(hi.into());
         }
-        if !filter.hosts.is_empty() {
-            let clauses = vec![
-                "(e.subject_host = ? OR e.subject_host LIKE ? ESCAPE '\\')";
-                filter.hosts.len()
-            ];
-            sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
-            for host in &filter.hosts {
-                let host = host.to_lowercase();
-                let subdomains = format!("%.{}", escape_like(&host));
-                args.extend([host.into(), subdomains.into()]);
-            }
+        add_hosts(&mut sql, &mut args, &filter.hosts, false);
+        add_hosts(&mut sql, &mut args, &filter.hosts_not, true);
+        add_kinds(&mut sql, &mut args, &filter.kinds, false);
+        add_kinds(&mut sql, &mut args, &filter.kinds_not, true);
+        add_sources(&mut sql, &mut args, &filter.sources, false);
+        add_sources(&mut sql, &mut args, &filter.sources_not, true);
+        if !filter.confidence.is_empty() {
+            sql.push_str(&format!(
+                " AND e.confidence IN ({})",
+                vec!["?"; filter.confidence.len()].join(", ")
+            ));
+            args.extend(
+                filter
+                    .confidence
+                    .iter()
+                    .map(|value| value.to_string().into()),
+            );
         }
-        if !filter.kinds.is_empty() {
-            let clauses = vec!["e.kind LIKE ? ESCAPE '\\'"; filter.kinds.len()];
-            sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
-            for kind in &filter.kinds {
-                args.push(kind_pattern(kind).into());
-            }
+        if let Some(run_id) = filter.run_id {
+            sql.push_str(" AND e.run_id = ?");
+            args.push(
+                i64::try_from(run_id)
+                    .map_err(|_| StoreError::InvalidRunId(run_id))?
+                    .into(),
+            );
         }
-        if !filter.sources.is_empty() {
-            let clause = "(s.kind = ? OR s.kind LIKE ? ESCAPE '\\' OR s.app = ? \
-                 OR s.app || '/' || COALESCE(s.profile, '') = ? OR e.kind LIKE ? ESCAPE '\\')";
-            let clauses = vec![clause; filter.sources.len()];
-            sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
-            for source in &filter.sources {
-                let escaped = escape_like(source);
-                args.extend([
-                    source.clone().into(),
-                    format!("{escaped}.%").into(),
-                    source.clone().into(),
-                    source.clone().into(),
-                    format!("{escaped}%").into(),
-                ]);
-            }
+        match filter.timing {
+            EventTiming::Any => {}
+            EventTiming::Timed => sql.push_str(" AND e.ts_precision != 'order_only'"),
+            EventTiming::Untimed => sql.push_str(" AND e.ts_precision = 'order_only'"),
         }
         if let Some(text) = &filter.match_text {
             sql.push_str(
@@ -424,15 +423,15 @@ impl Store {
             let like = format!("%{}%", escape_like(text));
             args.extend([like.clone().into(), like.clone().into(), like.into()]);
         }
-        (sql, args)
+        Ok((sql, args))
     }
 
     fn build_events_query(
         &self,
         base_select: &str,
         filter: &EventFilter,
-    ) -> (String, Vec<rusqlite::types::Value>) {
-        let (conditions, mut args) = Self::events_where(filter);
+    ) -> Result<(String, Vec<Value>), StoreError> {
+        let (conditions, mut args) = Self::events_where(filter)?;
         let mut sql = format!("{base_select}{conditions}");
         sql.push_str(if filter.reverse {
             " ORDER BY e.ts_utc DESC, e.id DESC"
@@ -447,11 +446,11 @@ impl Store {
             sql.push_str(" OFFSET ?");
             args.push((offset as i64).into());
         }
-        (sql, args)
+        Ok((sql, args))
     }
 
     pub fn list_events(&self, filter: &EventFilter) -> Result<Vec<EventRow>, StoreError> {
-        let (sql, args) = self.build_events_query(EVENT_ROW_SELECT, filter);
+        let (sql, args) = self.build_events_query(EVENT_ROW_SELECT, filter)?;
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(args), EventRow::from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -461,7 +460,7 @@ impl Store {
         &self,
         filter: &EventFilter,
     ) -> Result<Vec<EventDetail>, StoreError> {
-        let (sql, args) = self.build_events_query(EVENT_DETAIL_SELECT, filter);
+        let (sql, args) = self.build_events_query(EVENT_DETAIL_SELECT, filter)?;
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(args), EventDetail::from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -693,15 +692,84 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+fn add_disjunction(sql: &mut String, clause: &str, count: usize, exclude: bool) {
+    if count == 0 {
+        return;
+    }
+    // a missing host or source attribute is not a match for an exclusion
+    sql.push_str(if exclude {
+        " AND NOT COALESCE(("
+    } else {
+        " AND ("
+    });
+    sql.push_str(&vec![clause; count].join(" OR "));
+    sql.push_str(if exclude { "), 0)" } else { ")" });
+}
+
+fn add_hosts(sql: &mut String, args: &mut Vec<Value>, hosts: &[String], exclude: bool) {
+    add_disjunction(
+        sql,
+        "(e.subject_host = ? OR e.subject_host LIKE ? ESCAPE '\\')",
+        hosts.len(),
+        exclude,
+    );
+    for host in hosts {
+        let host = host.to_lowercase();
+        let subdomains = format!("%.{}", escape_like(&host));
+        args.extend([host.into(), subdomains.into()]);
+    }
+}
+
+fn add_kinds(sql: &mut String, args: &mut Vec<Value>, kinds: &[String], exclude: bool) {
+    add_disjunction(sql, "e.kind LIKE ? ESCAPE '\\'", kinds.len(), exclude);
+    args.extend(kinds.iter().map(|kind| kind_pattern(kind).into()));
+}
+
+fn add_sources(sql: &mut String, args: &mut Vec<Value>, sources: &[String], exclude: bool) {
+    let clause = "(s.kind = ? OR s.kind LIKE ? ESCAPE '\\' OR s.app = ? \
+        OR s.app || '/' || COALESCE(s.profile, '') = ? OR e.kind LIKE ? ESCAPE '\\')";
+    add_disjunction(sql, clause, sources.len(), exclude);
+    for source in sources {
+        let escaped = escape_like(source);
+        args.extend([
+            source.clone().into(),
+            format!("{escaped}.%").into(),
+            source.clone().into(),
+            source.clone().into(),
+            format!("{escaped}%").into(),
+        ]);
+    }
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventTiming {
+    #[default]
+    Any,
+    /// Includes both directly observed and inferred timestamps.
+    Timed,
+    /// Order-only events do not have a real timestamp.
+    Untimed,
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct EventFilter {
     pub since: Option<i64>,
     pub until: Option<i64>,
     pub kinds: Vec<String>,
+    /// Exclusions use the same patterns as `kinds`.
+    pub kinds_not: Vec<String>,
     /// a host also matches its subdomains (`zoom.us` matches `cdn.zoom.us`)
     pub hosts: Vec<String>,
+    /// Exclusions also match subdomains; missing hosts are retained.
+    pub hosts_not: Vec<String>,
     /// a source kind or family (`chromium`), an app, `app/profile`, or an event kind prefix
     pub sources: Vec<String>,
+    /// Exclusions use the same source, app, profile and kind-prefix rules.
+    pub sources_not: Vec<String>,
+    pub confidence: Vec<Confidence>,
+    /// The run that first stored an event, not every run that observed it.
+    pub run_id: Option<u64>,
+    pub timing: EventTiming,
     pub match_text: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -1275,6 +1343,24 @@ mod tests {
         let second = ingest(&mut store, r2, &sample(r2, s2));
         assert_eq!((second.events_new, second.events_known), (0, 4));
         assert_eq!(store.event_count().unwrap(), 4);
+        assert_eq!(
+            store
+                .count_events(&EventFilter {
+                    run_id: Some(r1),
+                    ..Default::default()
+                })
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            store
+                .count_events(&EventFilter {
+                    run_id: Some(r2),
+                    ..Default::default()
+                })
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1432,6 +1518,252 @@ mod tests {
             .unwrap();
         assert_eq!(store.count_events(&EventFilter::default()).unwrap(), 4);
         assert_eq!(store.time_bounds().unwrap(), Some((100, 400)));
+    }
+
+    #[test]
+    fn extended_filters_match_counts_and_preserve_null_values() {
+        let (_dir, mut store) = open_case();
+        let (r1, s1) = run(&mut store);
+        let mut events = sample(r1, s1);
+        let mut untimed = event(
+            r1,
+            s1,
+            0,
+            EventKind::ShellCommand,
+            "untimed",
+            None,
+            "untimed",
+        );
+        untimed.ts_precision = TimePrecision::OrderOnly;
+        untimed.confidence = Confidence::Derived;
+        events.push(untimed);
+        for (ts, subject, host) in [
+            (500, "host_literal", Some("srv_a.example")),
+            (600, "host_similar", Some("srvXa.example")),
+            (700, "host_subdomain", Some("child.srv_a.example")),
+            (800, "kind_literal", None),
+            (900, "kind_similar", None),
+        ] {
+            events.push(event(
+                r1,
+                s1,
+                ts,
+                EventKind::WebVisit,
+                subject,
+                host,
+                subject,
+            ));
+        }
+        ingest(&mut store, r1, &events);
+        store
+            .conn()
+            .execute_batch(
+                "UPDATE events SET kind = 'web.a_b' WHERE subject = 'kind_literal';
+                 UPDATE events SET kind = 'web.axb' WHERE subject = 'kind_similar';",
+            )
+            .unwrap();
+
+        let (r2, s2) = run(&mut store);
+        let s3 = store
+            .insert_source(
+                r2,
+                &SourceInstance::new("other", "Other", None, "/other".into()),
+            )
+            .unwrap();
+        for (id, kind) in [(s2, r"odd_%\.plugin"), (s3, r"oddXY\.plugin")] {
+            store
+                .conn()
+                .execute(
+                    "UPDATE sources SET kind = ?1, app = NULL, profile = NULL WHERE id = ?2",
+                    params![kind, id],
+                )
+                .unwrap();
+        }
+        let mut package = event(r2, s2, 1000, EventKind::PkgInstall, "package", None, "pkg1");
+        package.confidence = Confidence::Heuristic;
+        let similar = event(
+            r2,
+            s3,
+            1100,
+            EventKind::PkgInstall,
+            "other_package",
+            None,
+            "pkg2",
+        );
+        ingest(&mut store, r2, &[package, similar]);
+
+        let subjects = |filter: EventFilter| {
+            let rows = store.list_events(&filter).unwrap();
+            let details = store.list_events_detailed(&filter).unwrap();
+            assert_eq!(store.count_events(&filter).unwrap(), rows.len() as u64);
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                details.iter().map(|row| row.id).collect::<Vec<_>>()
+            );
+            rows.into_iter()
+                .map(|row| row.subject.unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let excluded_hosts = subjects(EventFilter {
+            hosts_not: vec!["srv_a.example".into()],
+            ..Default::default()
+        });
+        assert_eq!(excluded_hosts.len(), 10);
+        assert!(!excluded_hosts.contains(&"host_literal".into()));
+        assert!(!excluded_hosts.contains(&"host_subdomain".into()));
+        assert!(excluded_hosts.contains(&"host_similar".into()));
+        assert!(excluded_hosts.contains(&"untimed".into()));
+        assert_eq!(
+            subjects(EventFilter {
+                hosts: vec!["srv_a.example".into()],
+                ..Default::default()
+            })
+            .len(),
+            2
+        );
+        assert_eq!(
+            subjects(EventFilter {
+                hosts_not: vec!["srv_a.example".into(), "zoom.us".into()],
+                ..Default::default()
+            })
+            .len(),
+            8
+        );
+
+        let excluded_kind = subjects(EventFilter {
+            kinds_not: vec!["web.a_b".into()],
+            ..Default::default()
+        });
+        assert_eq!(excluded_kind.len(), 11);
+        assert!(!excluded_kind.contains(&"kind_literal".into()));
+        assert!(excluded_kind.contains(&"kind_similar".into()));
+        assert_eq!(
+            subjects(EventFilter {
+                kinds_not: vec!["web.*".into()],
+                ..Default::default()
+            }),
+            ["untimed", "package", "other_package"]
+        );
+
+        assert_eq!(
+            subjects(EventFilter {
+                sources_not: vec!["Brave".into()],
+                ..Default::default()
+            }),
+            ["package", "other_package"]
+        );
+        for source in ["Brave/Default", "chromium"] {
+            assert_eq!(
+                subjects(EventFilter {
+                    sources_not: vec![source.into()],
+                    ..Default::default()
+                }),
+                ["package", "other_package"]
+            );
+        }
+        assert_eq!(
+            subjects(EventFilter {
+                sources_not: vec!["web".into()],
+                ..Default::default()
+            }),
+            ["untimed", "package", "other_package"]
+        );
+        let excluded_source = subjects(EventFilter {
+            sources_not: vec![r"odd_%\".into()],
+            ..Default::default()
+        });
+        assert_eq!(excluded_source.len(), 11);
+        assert!(!excluded_source.contains(&"package".into()));
+        assert!(excluded_source.contains(&"other_package".into()));
+
+        assert_eq!(
+            subjects(EventFilter {
+                timing: EventTiming::Untimed,
+                confidence: vec![Confidence::Derived],
+                run_id: Some(r1),
+                ..Default::default()
+            }),
+            ["untimed"]
+        );
+        assert_eq!(
+            subjects(EventFilter {
+                timing: EventTiming::Timed,
+                confidence: vec![Confidence::Heuristic],
+                run_id: Some(r2),
+                ..Default::default()
+            }),
+            ["package"]
+        );
+        assert_eq!(
+            subjects(EventFilter {
+                timing: EventTiming::Timed,
+                ..Default::default()
+            })
+            .len(),
+            11
+        );
+
+        let invalid = EventFilter {
+            run_id: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert!(matches!(
+            store.count_events(&invalid),
+            Err(StoreError::InvalidRunId(u64::MAX))
+        ));
+        assert!(matches!(
+            store.list_events(&invalid),
+            Err(StoreError::InvalidRunId(u64::MAX))
+        ));
+        assert!(matches!(
+            store.list_events_detailed(&invalid),
+            Err(StoreError::InvalidRunId(u64::MAX))
+        ));
+    }
+
+    #[test]
+    fn exclusion_patterns_escape_percent_underscore_and_backslash() {
+        let (_dir, mut store) = open_case();
+        let (run, source) = run(&mut store);
+        let events = [
+            event(
+                run,
+                source,
+                100,
+                EventKind::WebVisit,
+                "literal",
+                Some(r"srv_%\.example"),
+                "one",
+            ),
+            event(
+                run,
+                source,
+                200,
+                EventKind::WebVisit,
+                "subdomain",
+                Some(r"cdn.srv_%\.example"),
+                "two",
+            ),
+            event(
+                run,
+                source,
+                300,
+                EventKind::WebVisit,
+                "similar",
+                Some(r"srvAX\.example"),
+                "three",
+            ),
+        ];
+        ingest(&mut store, run, &events);
+        let rows = store
+            .list_events(&EventFilter {
+                hosts_not: vec![r"srv_%\.example".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject.as_deref(), Some("similar"));
     }
 
     #[test]

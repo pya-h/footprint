@@ -413,6 +413,7 @@ fn list(case: &Path, args: ListArgs, tz: fp_query::Tz) -> Result<()> {
         },
         offset: None,
         reverse: args.reverse,
+        ..Default::default()
     };
     let rows = fp_query::timeline(&store, &filter)?;
     if let Some(gb) = args.group_by {
@@ -925,6 +926,7 @@ fn export(case: &Path, args: ExportArgs, tz: fp_query::Tz) -> Result<()> {
         limit: args.limit,
         offset: None,
         reverse: args.reverse,
+        ..Default::default()
     };
 
     let fmt = match args.format {

@@ -24,6 +24,8 @@ pub use timeline::{
 
 pub use fp_correlate::{IocHit, TraceArrow, TraceHead, TraceTree, check_iocs, trace_tree};
 
+pub use fp_store::EventTiming;
+
 use chrono::{DateTime, Local, Utc};
 
 /// Which zone to render instants in.

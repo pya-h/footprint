@@ -1,6 +1,7 @@
 use anyhow::Result;
+use fp_core::Confidence;
 use fp_correlate::match_event_iocs;
-use fp_store::{EventFilter, Store};
+use fp_store::{EventFilter, EventTiming, Store};
 
 /// Everything `list` filters on. Times are unix µs, UTC.
 #[derive(Debug, Default, Clone)]
@@ -9,10 +10,17 @@ pub struct TimelineFilter {
     pub until: Option<i64>,
     /// event kinds; `web.*` matches a family
     pub kinds: Vec<String>,
+    pub kinds_not: Vec<String>,
     /// hosts, each also matching its subdomains
     pub hosts: Vec<String>,
+    pub hosts_not: Vec<String>,
     /// source kinds, apps, or `app/profile`
     pub sources: Vec<String>,
+    pub sources_not: Vec<String>,
+    pub confidence: Vec<Confidence>,
+    /// The run that first stored an event, not every run that observed it.
+    pub run_id: Option<u64>,
+    pub timing: EventTiming,
     /// substring of subject, summary or attributes
     pub match_text: Option<String>,
     pub limit: Option<usize>,
@@ -82,18 +90,30 @@ impl TimelineRow {
     }
 }
 
+impl From<&TimelineFilter> for EventFilter {
+    fn from(filter: &TimelineFilter) -> Self {
+        Self {
+            since: filter.since,
+            until: filter.until,
+            kinds: filter.kinds.clone(),
+            kinds_not: filter.kinds_not.clone(),
+            hosts: filter.hosts.clone(),
+            hosts_not: filter.hosts_not.clone(),
+            sources: filter.sources.clone(),
+            sources_not: filter.sources_not.clone(),
+            confidence: filter.confidence.clone(),
+            run_id: filter.run_id,
+            timing: filter.timing,
+            match_text: filter.match_text.clone(),
+            limit: filter.limit,
+            offset: filter.offset,
+            reverse: filter.reverse,
+        }
+    }
+}
+
 pub fn timeline(store: &Store, filter: &TimelineFilter) -> Result<Vec<TimelineRow>> {
-    let store_filter = EventFilter {
-        since: filter.since,
-        until: filter.until,
-        kinds: filter.kinds.clone(),
-        hosts: filter.hosts.clone(),
-        sources: filter.sources.clone(),
-        match_text: filter.match_text.clone(),
-        limit: filter.limit,
-        offset: filter.offset,
-        reverse: filter.reverse,
-    };
+    let store_filter = EventFilter::from(filter);
     let iocs = store.list_iocs()?;
     let rows = store
         .list_events(&store_filter)?
