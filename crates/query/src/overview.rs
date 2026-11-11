@@ -1,6 +1,6 @@
 use crate::TimelineFilter;
 use crate::category::{Category, category};
-use fp_store::{EventFilter, Store, StoreError};
+use fp_store::{EventFilter, EventTiming, FacetField, FacetPage, Store, StoreError};
 use thiserror::Error;
 
 const SECOND_US: u128 = 1_000_000;
@@ -29,6 +29,8 @@ pub enum OverviewError {
     InvalidSpan,
     #[error("histogram bucket calculation overflowed")]
     BucketOverflow,
+    #[error("facet limit {0} must be between 1 and 500")]
+    InvalidLimit(usize),
     #[error("histogram count overflowed")]
     CountOverflow,
     #[error("event timestamp {0} is outside the histogram window")]
@@ -161,5 +163,109 @@ pub fn histogram(
         window,
         bucket_width_us,
         buckets,
+    })
+}
+
+pub const MAX_FACET_ROWS: usize = 500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Facet {
+    Kind,
+    Source,
+    Host,
+    Confidence,
+    Run,
+}
+
+impl Facet {
+    fn field(self) -> FacetField {
+        match self {
+            Self::Kind => FacetField::Kind,
+            Self::Source => FacetField::Source,
+            Self::Host => FacetField::Host,
+            Self::Confidence => FacetField::Confidence,
+            Self::Run => FacetField::Run,
+        }
+    }
+
+    /// The scope without this facet's own selections, so excluded values keep their counts.
+    pub fn without(self, filter: &TimelineFilter) -> TimelineFilter {
+        let mut scope = filter.clone();
+        match self {
+            Self::Kind => {
+                scope.kinds.clear();
+                scope.kinds_not.clear();
+            }
+            Self::Source => {
+                scope.sources.clear();
+                scope.sources_not.clear();
+            }
+            Self::Host => {
+                scope.hosts.clear();
+                scope.hosts_not.clear();
+            }
+            Self::Confidence => scope.confidence.clear(),
+            Self::Run => scope.run_id = None,
+        }
+        scope
+    }
+}
+
+/// Counts for one facet under the scope minus that facet's own selections.
+/// Paging and order are ignored; `limit` is between 1 and [`MAX_FACET_ROWS`].
+pub fn facets(
+    store: &Store,
+    filter: &TimelineFilter,
+    facet: Facet,
+    limit: usize,
+) -> Result<FacetPage, OverviewError> {
+    if limit == 0 || limit > MAX_FACET_ROWS {
+        return Err(OverviewError::InvalidLimit(limit));
+    }
+    let scope = facet.without(filter);
+    Ok(store.facet_counts(&EventFilter::from(&scope), facet.field(), limit)?)
+}
+
+/// Event counts per category, folded from kind counts under the scope minus kind selections.
+pub fn category_counts(
+    store: &Store,
+    filter: &TimelineFilter,
+) -> Result<[u64; Category::ALL.len()], OverviewError> {
+    let scope = Facet::Kind.without(filter);
+    let mut counts = [0u64; Category::ALL.len()];
+    let mut overflow = false;
+    store.visit_kind_counts(&EventFilter::from(&scope), |kind, count| {
+        let slot = &mut counts[category(kind) as usize];
+        match slot.checked_add(count) {
+            Some(total) => *slot = total,
+            None => overflow = true,
+        }
+    })?;
+    if overflow {
+        return Err(OverviewError::CountOverflow);
+    }
+    Ok(counts)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingCounts {
+    pub timed: u64,
+    pub untimed: u64,
+}
+
+/// Timed and untimed counts under the scope minus its timing selection.
+pub fn timing_counts(
+    store: &Store,
+    filter: &TimelineFilter,
+) -> Result<TimingCounts, OverviewError> {
+    let count = |timing| {
+        store.count_events(&EventFilter {
+            timing,
+            ..EventFilter::from(filter)
+        })
+    };
+    Ok(TimingCounts {
+        timed: count(EventTiming::Timed)?,
+        untimed: count(EventTiming::Untimed)?,
     })
 }

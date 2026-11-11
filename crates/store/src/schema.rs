@@ -26,6 +26,8 @@ pub enum StoreError {
     SchemaVersion { found: i64 },
     #[error("run id {0} exceeds SQLite's integer range")]
     InvalidRunId(u64),
+    #[error("limit {0} exceeds SQLite's integer range")]
+    InvalidLimit(usize),
     #[error("invalid time range: start {start} is after end {end}")]
     InvalidTimeRange { start: i64, end: i64 },
 }
@@ -407,6 +409,58 @@ impl Store {
         Ok(())
     }
 
+    /// Top values of one field in scope, by count then key; paging and order are ignored.
+    pub fn facet_counts(
+        &self,
+        filter: &EventFilter,
+        field: FacetField,
+        limit: usize,
+    ) -> Result<FacetPage, StoreError> {
+        let limit = i64::try_from(limit).map_err(|_| StoreError::InvalidLimit(limit))?;
+        let (conditions, mut args) = Self::events_where(filter)?;
+        let key = field.expression();
+        let sql = format!(
+            "SELECT {key} AS k, COUNT(*) AS n, COUNT(*) OVER () FROM events e
+             JOIN sources s ON s.id = e.source_id{conditions}
+             GROUP BY k ORDER BY n DESC, k LIMIT ?"
+        );
+        args.push(limit.into());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(args))?;
+        let mut page = FacetPage::default();
+        while let Some(row) = rows.next()? {
+            page.values.push(FacetCount {
+                key: row.get(0)?,
+                count: row.get(1)?,
+            });
+            page.distinct_values = row.get(2)?;
+        }
+        Ok(page)
+    }
+
+    /// Visits `(kind, count)` for every distinct kind in scope without retaining them.
+    pub fn visit_kind_counts(
+        &self,
+        filter: &EventFilter,
+        mut visit: impl FnMut(&str, u64),
+    ) -> Result<(), StoreError> {
+        let (conditions, args) = Self::events_where(filter)?;
+        let sql = format!(
+            "SELECT e.kind, COUNT(*) FROM events e
+             JOIN sources s ON s.id = e.source_id{conditions} GROUP BY e.kind"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(args))?;
+        while let Some(row) = rows.next()? {
+            let value = row.get_ref(0)?;
+            let kind = value.as_str().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(0, value.data_type(), Box::new(error))
+            })?;
+            visit(kind, row.get(1)?);
+        }
+        Ok(())
+    }
+
     fn events_where(filter: &EventFilter) -> Result<(String, Vec<Value>), StoreError> {
         let mut sql = String::from(" WHERE 1=1");
         let mut args: Vec<Value> = Vec::new();
@@ -773,6 +827,43 @@ fn add_sources(sql: &mut String, args: &mut Vec<Value>, sources: &[String], excl
             format!("{escaped}%").into(),
         ]);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FacetField {
+    Kind,
+    /// `app/profile`, else the app, else the source kind: the strings the source filter accepts.
+    Source,
+    Host,
+    Confidence,
+    /// The run that first stored each event.
+    Run,
+}
+
+impl FacetField {
+    fn expression(self) -> &'static str {
+        match self {
+            Self::Kind => "e.kind",
+            Self::Source => "COALESCE(s.app || '/' || s.profile, s.app, s.kind)",
+            Self::Host => "e.subject_host",
+            Self::Confidence => "e.confidence",
+            Self::Run => "CAST(e.run_id AS TEXT)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FacetCount {
+    /// `None` groups events without a value, such as no host.
+    pub key: Option<String>,
+    pub count: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FacetPage {
+    pub values: Vec<FacetCount>,
+    /// All distinct values in scope, not only the returned ones.
+    pub distinct_values: u64,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]

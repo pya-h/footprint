@@ -201,6 +201,48 @@ fn histogram_matches_scoped_fake_zoom_timeline_without_paging() {
 }
 
 #[test]
+fn facets_match_timeline_groupings_on_fake_zoom() {
+    use fp_query::overview::{Facet, facets};
+    use std::collections::BTreeMap;
+
+    let case = setup();
+    let store = fp_store::Store::open(&case.db).unwrap();
+    let scope = fp_query::TimelineFilter {
+        hosts: vec!["zoom.us".into()],
+        kinds: vec!["web.visit".into()],
+        ..Default::default()
+    };
+    let rows = fp_query::timeline(&store, &fp_query::TimelineFilter::default()).unwrap();
+    for (facet, key) in [
+        (
+            Facet::Kind,
+            (|r: &fp_query::TimelineRow| Some(r.kind.clone())) as fn(&_) -> _,
+        ),
+        (Facet::Source, |r| Some(r.source_label())),
+        (Facet::Host, |r| r.subject_host.clone()),
+        (Facet::Confidence, |r| Some(r.confidence.clone())),
+    ] {
+        // the facet's own selection is dropped, the remaining selection must still apply
+        let mut remaining = facet.without(&scope);
+        remaining.limit = None;
+        let expected_rows = fp_query::timeline(&store, &remaining).unwrap();
+        let mut expected: BTreeMap<Option<String>, u64> = BTreeMap::new();
+        for row in &expected_rows {
+            *expected.entry(key(row)).or_default() += 1;
+        }
+        let page = facets(&store, &scope, facet, 500).unwrap();
+        let actual: BTreeMap<_, _> = page
+            .values
+            .iter()
+            .map(|v| (v.key.clone(), v.count))
+            .collect();
+        assert_eq!(actual, expected, "{facet:?}");
+        assert_eq!(page.distinct_values as usize, expected.len());
+    }
+    assert!(!rows.is_empty());
+}
+
+#[test]
 fn detail_resolves_links() {
     let case = setup();
     let store = fp_store::Store::open(&case.db).unwrap();
