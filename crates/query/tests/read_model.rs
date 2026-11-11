@@ -139,6 +139,68 @@ fn timeline_forwards_extended_filters() {
 }
 
 #[test]
+fn histogram_matches_scoped_fake_zoom_timeline_without_paging() {
+    use fp_query::category::Category;
+    use fp_query::overview::{TimeWindow, histogram};
+
+    let case = setup();
+    let store = fp_store::Store::open(&case.db).unwrap();
+    let (start_utc, end_utc) = store.time_bounds().unwrap().unwrap();
+    let window = TimeWindow { start_utc, end_utc };
+    for mut filter in [
+        fp_query::TimelineFilter::default(),
+        fp_query::TimelineFilter {
+            hosts: vec!["zoom.us".into()],
+            sources_not: vec!["xdm".into()],
+            ..Default::default()
+        },
+        fp_query::TimelineFilter {
+            kinds_not: vec!["web.*".into()],
+            run_id: Some(1),
+            confidence: vec![fp_core::Confidence::Direct],
+            ..Default::default()
+        },
+    ] {
+        let rows = fp_query::timeline(&store, &filter).unwrap();
+        filter.limit = Some(1);
+        filter.offset = Some(50);
+        filter.reverse = true;
+        let result = histogram(&store, &filter, window, 200).unwrap();
+        let mut expected = vec![[0u64; Category::ALL.len()]; result.buckets.len()];
+        for row in rows.iter().filter(|row| row.ts_precision != "order_only") {
+            let category = match row.kind.as_str() {
+                "web.download" | "dl.manager_download" => Category::Downloads,
+                "web.visit"
+                | "web.redirect"
+                | "web.permission_change"
+                | "web.permission_used"
+                | "web.search" => Category::Web,
+                "pkg.install" | "pkg.upgrade" | "pkg.remove" => Category::Packages,
+                "priv.sudo" | "priv.su" | "auth.login" | "auth.ssh" | "auth.session" => {
+                    Category::Access
+                }
+                "shell.command" => Category::Shell,
+                "file.opened" | "file.created" | "file.modified" => Category::Files,
+                "persist.unit_added" | "persist.autostart" => Category::Persistence,
+                "ext.installed" => Category::Extensions,
+                "net.listen" | "proc.exec" | "other" => Category::Other,
+                other => panic!("unexpected fixture kind: {other}"),
+            };
+            let index = result
+                .buckets
+                .iter()
+                .position(|bucket| (bucket.start_utc..=bucket.end_utc).contains(&row.ts_utc))
+                .expect("fixture timestamp in window");
+            expected[index][category as usize] += 1;
+        }
+        assert_eq!(
+            result.buckets.iter().map(|b| b.counts).collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn detail_resolves_links() {
     let case = setup();
     let store = fp_store::Store::open(&case.db).unwrap();

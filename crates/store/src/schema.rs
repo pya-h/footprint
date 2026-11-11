@@ -26,6 +26,8 @@ pub enum StoreError {
     SchemaVersion { found: i64 },
     #[error("run id {0} exceeds SQLite's integer range")]
     InvalidRunId(u64),
+    #[error("invalid time range: start {start} is after end {end}")]
+    InvalidTimeRange { start: i64, end: i64 },
 }
 
 pub struct Store {
@@ -371,6 +373,38 @@ impl Store {
 
     pub fn interrupt_handle(&self) -> rusqlite::InterruptHandle {
         self.conn.get_interrupt_handle()
+    }
+
+    /// Visits scoped timed events in an inclusive UTC microsecond range, without paging.
+    /// If an error occurs, the visitor may already have seen some rows.
+    pub fn visit_timed_events(
+        &self,
+        filter: &EventFilter,
+        start: i64,
+        end: i64,
+        mut visit: impl FnMut(i64, &str),
+    ) -> Result<(), StoreError> {
+        if start > end {
+            return Err(StoreError::InvalidTimeRange { start, end });
+        }
+        let (conditions, mut args) = Self::events_where(filter)?;
+        let sql = format!(
+            "SELECT e.ts_utc, e.kind FROM events e
+             JOIN sources s ON s.id = e.source_id{conditions}
+             AND e.ts_precision != 'order_only' AND e.ts_utc >= ? AND e.ts_utc <= ?"
+        );
+        args.extend([start.into(), end.into()]);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(args))?;
+        while let Some(row) = rows.next()? {
+            let ts = row.get(0)?;
+            let value = row.get_ref(1)?;
+            let kind = value.as_str().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(1, value.data_type(), Box::new(error))
+            })?;
+            visit(ts, kind);
+        }
+        Ok(())
     }
 
     fn events_where(filter: &EventFilter) -> Result<(String, Vec<Value>), StoreError> {
@@ -1785,6 +1819,93 @@ mod tests {
         let zero = event(r, s, 0, EventKind::WebVisit, "zero", None, "zero");
         ingest(&mut store, r, &[negative, zero]);
         assert_eq!(store.time_bounds().unwrap(), Some((-20, 0)));
+    }
+
+    #[test]
+    fn timed_event_visitor_applies_scope_without_paging() {
+        let (_dir, mut store) = open_case();
+        let (r, s) = run(&mut store);
+        let mut untimed = event(r, s, 0, EventKind::WebVisit, "untimed", None, "untimed");
+        untimed.ts_precision = TimePrecision::OrderOnly;
+        let events = [
+            untimed,
+            event(r, s, 0, EventKind::WebDownload, "zero", None, "zero"),
+            event(
+                r,
+                s,
+                100,
+                EventKind::WebVisit,
+                "selected",
+                Some("selected.example"),
+                "selected",
+            ),
+            event(
+                r,
+                s,
+                100,
+                EventKind::WebVisit,
+                "excluded",
+                Some("excluded.example"),
+                "excluded",
+            ),
+        ];
+        ingest(&mut store, r, &events);
+        let filter = EventFilter {
+            kinds: vec!["web.*".into()],
+            hosts_not: vec!["excluded.example".into()],
+            sources: vec!["Brave".into()],
+            run_id: Some(r),
+            limit: Some(0),
+            offset: Some(10),
+            reverse: true,
+            ..Default::default()
+        };
+        let mut rows = Vec::new();
+        store
+            .visit_timed_events(&filter, 0, 100, |ts, kind| {
+                rows.push((ts, kind.to_string()));
+            })
+            .unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            [(0, "web.download".into()), (100, "web.visit".into())]
+        );
+
+        assert!(matches!(
+            store.visit_timed_events(&filter, 1, 0, |_, _| {}),
+            Err(StoreError::InvalidTimeRange { start: 1, end: 0 })
+        ));
+        let invalid = EventFilter {
+            run_id: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert!(matches!(
+            store.visit_timed_events(&invalid, 0, 100, |_, _| {}),
+            Err(StoreError::InvalidRunId(u64::MAX))
+        ));
+        let untimed_only = EventFilter {
+            timing: EventTiming::Untimed,
+            ..Default::default()
+        };
+        let mut visited = 0;
+        store
+            .visit_timed_events(&untimed_only, 0, 100, |_, _| visited += 1)
+            .unwrap();
+        assert_eq!(visited, 0);
+
+        store
+            .conn()
+            .execute(
+                "UPDATE events SET kind = CAST(X'80' AS TEXT) WHERE subject = 'zero'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .visit_timed_events(&EventFilter::default(), 0, 100, |_, _| {})
+                .is_err()
+        );
     }
 
     #[test]

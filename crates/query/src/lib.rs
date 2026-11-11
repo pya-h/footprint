@@ -3,11 +3,13 @@
 
 pub mod time;
 
+pub mod category;
 mod collect;
 mod detail;
 mod diff;
 mod explain;
 mod interrupt;
+pub mod overview;
 mod sources;
 mod state;
 mod timeline;
