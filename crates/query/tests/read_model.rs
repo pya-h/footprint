@@ -327,3 +327,136 @@ fn time_formatting_utc_is_zone_independent() {
         "(untimed)"
     );
 }
+
+#[test]
+fn group_counts_reproduce_the_old_cli_grouping_on_fake_zoom() {
+    use fp_query::overview::{GroupBy, group};
+    use std::collections::HashMap;
+
+    let case = setup();
+    let store = fp_store::Store::open(&case.db).unwrap();
+    let tz = fp_query::Tz::Utc;
+
+    // the exact algorithm the CLI used before G1.5: fold timeline rows into string keys,
+    // then sort by count desc, key asc, then truncate to the limit.
+    let old = |by: GroupBy, filter: &fp_query::TimelineFilter, limit: Option<usize>| {
+        let rows = fp_query::timeline(&store, filter).unwrap();
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for r in &rows {
+            let key = match by {
+                GroupBy::Dir => {
+                    let subj = r.subject.as_deref().unwrap_or("");
+                    if subj.contains('/') {
+                        std::path::Path::new(subj)
+                            .parent()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "/".into())
+                    } else {
+                        "-".into()
+                    }
+                }
+                GroupBy::Host => r.subject_host.clone().unwrap_or_else(|| "-".into()),
+                GroupBy::Source => r.source_label(),
+                GroupBy::Kind => r.kind.clone(),
+                GroupBy::Minute => {
+                    fp_query::format_time(r.ts_utc, &r.ts_precision, tz, "%Y-%m-%d %H:%M")
+                }
+            };
+            *counts.entry(key).or_default() += 1;
+        }
+        let mut sorted: Vec<(String, u64)> = counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if let Some(limit) = limit {
+            sorted.truncate(limit);
+        }
+        sorted
+    };
+
+    let scopes = [
+        fp_query::TimelineFilter::default(),
+        fp_query::TimelineFilter {
+            hosts: vec!["zoom.us".into()],
+            ..Default::default()
+        },
+        fp_query::TimelineFilter {
+            kinds: vec!["web.*".into(), "dl.*".into()],
+            ..Default::default()
+        },
+    ];
+    for by in [
+        GroupBy::Dir,
+        GroupBy::Host,
+        GroupBy::Source,
+        GroupBy::Kind,
+        GroupBy::Minute,
+    ] {
+        for scope in &scopes {
+            for limit in [None, Some(2)] {
+                let expected = old(by, scope, limit);
+                let actual: Vec<(String, u64)> = group(&store, scope, by, limit, tz)
+                    .unwrap()
+                    .into_iter()
+                    .map(|g| (g.key, g.count))
+                    .collect();
+                assert_eq!(actual, expected, "{by:?} {scope:?} limit={limit:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn host_summaries_rank_the_lure_domains_on_fake_zoom() {
+    use fp_query::overview::{HostSort, hosts};
+    use std::collections::HashMap;
+
+    let case = setup();
+    let store = fp_store::Store::open(&case.db).unwrap();
+    let scope = fp_query::TimelineFilter::default();
+
+    let summaries = hosts(&store, &scope, HostSort::EventsDesc, 500).unwrap();
+    let by_host: HashMap<&str, &fp_query::overview::HostSummary> =
+        summaries.iter().map(|s| (s.host.as_str(), s)).collect();
+
+    // the fake page is the busiest host in the scenario
+    let lure = by_host["us09-web-zoom.com"];
+    assert_eq!(lure.events, 4);
+    assert!(lure.first_in_case.is_some());
+    // every host in a single-day case is first-seen that day, so a day-window flags them NEW
+    let (lo, hi) = store.time_bounds().unwrap().unwrap();
+    assert!(
+        summaries
+            .iter()
+            .all(|s| s.first_in_case.is_none_or(|t| (lo..=hi).contains(&t)))
+    );
+
+    // event counts agree with grouping the unpaged timeline by host (hosts without a value drop)
+    let rows = fp_query::timeline(&store, &scope).unwrap();
+    let mut expected: HashMap<String, u64> = HashMap::new();
+    for row in &rows {
+        if let Some(host) = &row.subject_host {
+            *expected.entry(host.clone()).or_default() += 1;
+        }
+    }
+    let actual: HashMap<String, u64> = summaries
+        .iter()
+        .map(|s| (s.host.clone(), s.events))
+        .collect();
+    assert_eq!(actual, expected);
+
+    // ranking is non-increasing by events
+    assert!(summaries.windows(2).all(|w| w[0].events >= w[1].events));
+
+    // scoping to the lure host keeps only it
+    let scoped = hosts(
+        &store,
+        &fp_query::TimelineFilter {
+            hosts: vec!["us09-web-zoom.com".into()],
+            ..Default::default()
+        },
+        HostSort::EventsDesc,
+        500,
+    )
+    .unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].host, "us09-web-zoom.com");
+}

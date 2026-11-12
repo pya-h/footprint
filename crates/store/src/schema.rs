@@ -438,6 +438,114 @@ impl Store {
         Ok(page)
     }
 
+    /// Counts events per value of one dimension in scope, with the first and last
+    /// instant seen in each group. Sorted by count then key, like the CLI's `--group-by`.
+    /// `limit` bounds the number of groups returned; `None` returns them all.
+    pub fn group_counts(
+        &self,
+        filter: &EventFilter,
+        field: GroupField,
+        limit: Option<usize>,
+    ) -> Result<Vec<GroupCount>, StoreError> {
+        let limit = limit
+            .map(|n| i64::try_from(n).map_err(|_| StoreError::InvalidLimit(n)))
+            .transpose()?;
+        let (conditions, mut args) = Self::events_where(filter)?;
+        let key = field.expression();
+        let bound = if limit.is_some() { " LIMIT ?" } else { "" };
+        let sql = format!(
+            "SELECT {key} AS k, COUNT(*) AS n,
+                    MIN(CASE WHEN e.ts_precision != 'order_only' THEN e.ts_utc END),
+                    MAX(CASE WHEN e.ts_precision != 'order_only' THEN e.ts_utc END)
+             FROM events e JOIN sources s ON s.id = e.source_id{conditions}
+             GROUP BY k ORDER BY n DESC, k{bound}"
+        );
+        if let Some(limit) = limit {
+            args.push(limit.into());
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(args))?;
+        let mut groups = Vec::new();
+        while let Some(row) = rows.next()? {
+            groups.push(GroupCount {
+                key: row.get(0)?,
+                count: row.get(1)?,
+                first_ts: row.get(2)?,
+                last_ts: row.get(3)?,
+            });
+        }
+        Ok(groups)
+    }
+
+    /// Summarizes the busiest hosts in scope, top `limit` by `sort`. Rows without a host
+    /// are excluded, since a host summary is about a domain or IP. `first_in_case` is the
+    /// host's earliest timed event across the whole case (scope ignored), fetched only for
+    /// the hosts on this page, so the `NEW` badge needs no full-case scan.
+    pub fn host_summaries(
+        &self,
+        filter: &EventFilter,
+        sort: HostSort,
+        limit: usize,
+    ) -> Result<Vec<HostSummary>, StoreError> {
+        let limit = i64::try_from(limit).map_err(|_| StoreError::InvalidLimit(limit))?;
+        let (conditions, mut args) = Self::events_where(filter)?;
+        let sql = format!(
+            "SELECT e.subject_host AS host, COUNT(*) AS events,
+                    MIN(CASE WHEN e.ts_precision != 'order_only' THEN e.ts_utc END) AS first_in_scope,
+                    MAX(CASE WHEN e.ts_precision != 'order_only' THEN e.ts_utc END) AS last_in_scope,
+                    COUNT(DISTINCT e.kind) AS kinds,
+                    COUNT(DISTINCT COALESCE(s.app || '/' || s.profile, s.app, s.kind)) AS sources
+             FROM events e JOIN sources s ON s.id = e.source_id{conditions}
+             AND e.subject_host IS NOT NULL
+             GROUP BY host ORDER BY {} LIMIT ?",
+            sort.order_by()
+        );
+        args.push(limit.into());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut summaries: Vec<HostSummary> = stmt
+            .query_map(params_from_iter(args), |row| {
+                Ok(HostSummary {
+                    host: row.get(0)?,
+                    events: row.get(1)?,
+                    first_in_scope: row.get(2)?,
+                    last_in_scope: row.get(3)?,
+                    first_in_case: None,
+                    distinct_kinds: row.get(4)?,
+                    distinct_sources: row.get(5)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        self.fill_first_in_case(&mut summaries)?;
+        Ok(summaries)
+    }
+
+    /// Sets `first_in_case` on each summary from one `MIN(ts_utc)` query over the page's hosts.
+    fn fill_first_in_case(&self, summaries: &mut [HostSummary]) -> Result<(), StoreError> {
+        if summaries.is_empty() {
+            return Ok(());
+        }
+        let placeholders = vec!["?"; summaries.len()].join(", ");
+        let sql = format!(
+            "SELECT subject_host, MIN(ts_utc) FROM events
+             WHERE subject_host IN ({placeholders}) AND ts_precision != 'order_only'
+             GROUP BY subject_host"
+        );
+        let hosts = summaries.iter().map(|s| Value::from(s.host.clone()));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(hosts))?;
+        let mut first_seen: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        while let Some(row) = rows.next()? {
+            if let (Some(host), Some(ts)) = (row.get::<_, Option<String>>(0)?, row.get(1)?) {
+                first_seen.insert(host, ts);
+            }
+        }
+        for summary in summaries {
+            summary.first_in_case = first_seen.get(&summary.host).copied();
+        }
+        Ok(())
+    }
+
     /// Visits `(kind, count)` for every distinct kind in scope without retaining them.
     pub fn visit_kind_counts(
         &self,
@@ -857,6 +965,76 @@ pub struct FacetCount {
     /// `None` groups events without a value, such as no host.
     pub key: Option<String>,
     pub count: u64,
+}
+
+/// Dimensions that `group_counts` can aggregate directly in SQL. `Dir` and `Minute`
+/// grouping stay in `fp-query` because they depend on path and time-zone rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupField {
+    Host,
+    /// `app/profile`, else the app, else the source kind, as `FacetField::Source`.
+    Source,
+    Kind,
+}
+
+impl GroupField {
+    fn expression(self) -> &'static str {
+        match self {
+            Self::Host => "e.subject_host",
+            Self::Source => "COALESCE(s.app || '/' || s.profile, s.app, s.kind)",
+            Self::Kind => "e.kind",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupCount {
+    /// `None` groups events without a value, such as no host.
+    pub key: Option<String>,
+    pub count: u64,
+    /// First and last timed instant in the group; `None` when every member is untimed.
+    pub first_ts: Option<i64>,
+    pub last_ts: Option<i64>,
+}
+
+/// Which column orders the hosts returned by `host_summaries`, and in which direction.
+/// Every variant breaks ties by host name so the page is deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostSort {
+    /// Most events first: the lure a host matters by its activity.
+    EventsDesc,
+    HostAsc,
+    /// Earliest-active host in scope first.
+    FirstInScopeAsc,
+    /// Most-recently-active host in scope first.
+    LastInScopeDesc,
+}
+
+impl HostSort {
+    /// `MIN`/`MAX` ignore untimed rows, so a host with only untimed events sorts last on a
+    /// time column via `NULLS LAST`, which SQLite spells as an `IS NULL` tie-breaker.
+    fn order_by(self) -> &'static str {
+        match self {
+            Self::EventsDesc => "events DESC, host",
+            Self::HostAsc => "host",
+            Self::FirstInScopeAsc => "first_in_scope IS NULL, first_in_scope, host",
+            Self::LastInScopeDesc => "last_in_scope IS NULL, last_in_scope DESC, host",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSummary {
+    pub host: String,
+    pub events: u64,
+    /// First and last timed instant for this host within the scope; `None` when all untimed.
+    pub first_in_scope: Option<i64>,
+    pub last_in_scope: Option<i64>,
+    /// The host's earliest timed event in the whole case, ignoring the scope. Drives the
+    /// `NEW` badge: the host is first-seen in the window when this falls inside it.
+    pub first_in_case: Option<i64>,
+    pub distinct_kinds: u64,
+    pub distinct_sources: u64,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1997,6 +2175,136 @@ mod tests {
                 .visit_timed_events(&EventFilter::default(), 0, 100, |_, _| {})
                 .is_err()
         );
+    }
+
+    #[test]
+    fn group_counts_fold_hosts_with_timed_bounds() {
+        let (_dir, mut store) = open_case();
+        let (r, s) = run(&mut store);
+        let mut untimed = event(r, s, 0, EventKind::ShellCommand, "x", None, "u");
+        untimed.ts_precision = TimePrecision::OrderOnly;
+        let events = [
+            event(r, s, 10, EventKind::WebVisit, "a", Some("zoom.us"), "a"),
+            event(r, s, 40, EventKind::WebVisit, "b", Some("zoom.us"), "b"),
+            event(r, s, 20, EventKind::WebDownload, "c", None, "c"),
+            untimed,
+        ];
+        ingest(&mut store, r, &events);
+
+        let hosts = store
+            .group_counts(&EventFilter::default(), GroupField::Host, None)
+            .unwrap();
+        // count desc then key asc; SQLite groups NULL separately (we map it in fp-query)
+        let zoom = hosts
+            .iter()
+            .find(|g| g.key.as_deref() == Some("zoom.us"))
+            .unwrap();
+        assert_eq!(zoom.count, 2);
+        assert_eq!((zoom.first_ts, zoom.last_ts), (Some(10), Some(40)));
+        let null = hosts.iter().find(|g| g.key.is_none()).unwrap();
+        assert_eq!(null.count, 2);
+        // the download is timed (20), the shell line is untimed and excluded from the bounds
+        assert_eq!((null.first_ts, null.last_ts), (Some(20), Some(20)));
+
+        // limit bounds the group list
+        let one = store
+            .group_counts(&EventFilter::default(), GroupField::Host, Some(1))
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert!(matches!(
+            store.group_counts(&EventFilter::default(), GroupField::Host, Some(usize::MAX)),
+            Err(StoreError::InvalidLimit(_))
+        ));
+
+        // kind grouping never yields a NULL key
+        let kinds = store
+            .group_counts(&EventFilter::default(), GroupField::Kind, None)
+            .unwrap();
+        assert!(kinds.iter().all(|g| g.key.is_some()));
+        assert_eq!(kinds.iter().map(|g| g.count).sum::<u64>(), 4);
+    }
+
+    #[test]
+    fn host_summaries_rank_hosts_and_resolve_case_first_seen() {
+        let (_dir, store) = open_case();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO runs(id, started_utc) VALUES (1, 0);
+                 INSERT INTO sources(id, run_id, kind, app, profile) VALUES
+                   (1, 1, 'chromium.history', 'Brave', 'Default'),
+                   (2, 1, 'xdm.downloads', 'xdm', NULL);
+                 INSERT INTO events(run_id, source_id, ts_utc, ts_precision, kind, subject_host, confidence, dedup_key) VALUES
+                   (1, 1, 50,  'exact',      'web.visit',           'old.example',  'direct', 'o1'),
+                   (1, 1, 150, 'exact',      'web.visit',           'old.example',  'direct', 'o2'),
+                   (1, 1, 120, 'exact',      'web.visit',           'zoom.us',      'direct', 'z1'),
+                   (1, 1, 180, 'exact',      'web.redirect',        'zoom.us',      'direct', 'z2'),
+                   (1, 2, 160, 'exact',      'dl.manager_download', 'zoom.us',      'direct', 'z3'),
+                   (1, 1, 0,   'order_only', 'web.visit',           'zoom.us',      'direct', 'z4'),
+                   (1, 1, 170, 'exact',      'web.visit',           NULL,           'direct', 'n1');",
+            )
+            .unwrap();
+
+        // scope the window to [100, 199]: old.example's event at 50 is out of scope,
+        // but its case-wide first-seen must still be 50.
+        let scope = EventFilter {
+            since: Some(100),
+            until: Some(199),
+            ..Default::default()
+        };
+
+        let by_events = store
+            .host_summaries(&scope, HostSort::EventsDesc, 10)
+            .unwrap();
+        // the NULL-host row is excluded; zoom.us (3 in scope) outranks old.example (1 in scope)
+        assert_eq!(by_events.len(), 2);
+        let zoom = &by_events[0];
+        assert_eq!(zoom.host, "zoom.us");
+        assert_eq!(zoom.events, 3);
+        assert_eq!(
+            (zoom.first_in_scope, zoom.last_in_scope),
+            (Some(120), Some(180))
+        );
+        assert_eq!(zoom.first_in_case, Some(120));
+        assert_eq!(zoom.distinct_kinds, 3); // web.visit, web.redirect, dl.manager_download
+        assert_eq!(zoom.distinct_sources, 2); // Brave/Default and xdm
+
+        let old = &by_events[1];
+        assert_eq!(old.host, "old.example");
+        assert_eq!(old.events, 1);
+        assert_eq!(
+            (old.first_in_scope, old.last_in_scope),
+            (Some(150), Some(150))
+        );
+        // case-wide first-seen ignores the scope: the event at 50 wins
+        assert_eq!(old.first_in_case, Some(50));
+
+        // host sort is alphabetical
+        let by_host = store.host_summaries(&scope, HostSort::HostAsc, 10).unwrap();
+        assert_eq!(
+            by_host.iter().map(|s| s.host.as_str()).collect::<Vec<_>>(),
+            ["old.example", "zoom.us"]
+        );
+
+        // limit bounds the page; the busiest host survives
+        let top = store
+            .host_summaries(&scope, HostSort::EventsDesc, 1)
+            .unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].host, "zoom.us");
+
+        // a scope matching nothing yields no rows and no first-seen lookup
+        let empty = store
+            .host_summaries(
+                &EventFilter {
+                    hosts: vec!["no.such.host".into()],
+                    ..Default::default()
+                },
+                HostSort::EventsDesc,
+                10,
+            )
+            .unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

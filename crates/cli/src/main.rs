@@ -415,74 +415,49 @@ fn list(case: &Path, args: ListArgs, tz: fp_query::Tz) -> Result<()> {
         reverse: args.reverse,
         ..Default::default()
     };
-    let rows = fp_query::timeline(&store, &filter)?;
     if let Some(gb) = args.group_by {
-        print_grouped(rows, gb, args.format, args.limit, tz)
+        let groups = fp_query::overview::group(&store, &filter, gb.into(), args.limit, tz)?;
+        print_grouped(groups, args.format)
     } else {
+        let rows = fp_query::timeline(&store, &filter)?;
         print_rows(rows, args.format, tz)
     }
 }
 
-fn print_grouped(
-    rows: Vec<fp_query::TimelineRow>,
-    group_by: GroupBy,
-    format: Format,
-    limit: Option<usize>,
-    tz: fp_query::Tz,
-) -> Result<()> {
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-
-    for r in &rows {
-        let key = match group_by {
-            GroupBy::Dir => {
-                let subj = r.subject.as_deref().unwrap_or("");
-                if subj.contains('/') {
-                    std::path::Path::new(subj)
-                        .parent()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "/".into())
-                } else {
-                    "-".into()
-                }
-            }
-            GroupBy::Host => r.subject_host.clone().unwrap_or_else(|| "-".into()),
-            GroupBy::Source => r.source_label(),
-            GroupBy::Minute => {
-                fp_query::format_time(r.ts_utc, &r.ts_precision, tz, "%Y-%m-%d %H:%M")
-            }
-        };
-        *counts.entry(key).or_insert(0) += 1;
+impl From<GroupBy> for fp_query::overview::GroupBy {
+    fn from(group_by: GroupBy) -> Self {
+        match group_by {
+            GroupBy::Dir => Self::Dir,
+            GroupBy::Host => Self::Host,
+            GroupBy::Source => Self::Source,
+            GroupBy::Minute => Self::Minute,
+        }
     }
+}
 
-    let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-    if let Some(lim) = limit {
-        sorted.truncate(lim);
-    }
-
+fn print_grouped(groups: Vec<fp_query::overview::GroupRow>, format: Format) -> Result<()> {
     match format {
         Format::Jsonl => {
-            for (key, count) in sorted {
+            for group in groups {
                 println!(
                     "{}",
                     serde_json::json!({
-                        "group": key,
-                        "count": count,
+                        "group": group.key,
+                        "count": group.count,
                     })
                 );
             }
         }
         Format::Table => {
             println!("{:>6}  GROUP", "COUNT");
-            for (key, count) in sorted {
-                println!("{:>6}  {}", count, key);
+            for group in groups {
+                println!("{:>6}  {}", group.count, group.key);
             }
         }
         Format::Csv => {
             println!("count,group");
-            for (key, count) in sorted {
-                println!("{},{}", count, fp_render::csv::escape_csv(&key));
+            for group in groups {
+                println!("{},{}", group.count, fp_render::csv::escape_csv(&group.key));
             }
         }
     }

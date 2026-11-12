@@ -1,7 +1,11 @@
-use crate::TimelineFilter;
 use crate::category::{Category, category};
-use fp_store::{EventFilter, EventTiming, FacetField, FacetPage, Store, StoreError};
+use crate::{TimelineFilter, Tz, format_time};
+use fp_store::{EventFilter, EventTiming, FacetField, FacetPage, GroupField, Store, StoreError};
+use std::collections::HashMap;
+use std::path::Path;
 use thiserror::Error;
+
+pub use fp_store::{HostSort, HostSummary};
 
 const SECOND_US: u128 = 1_000_000;
 const MINUTE_US: u128 = 60 * SECOND_US;
@@ -268,4 +272,119 @@ pub fn timing_counts(
         timed: count(EventTiming::Timed)?,
         untimed: count(EventTiming::Untimed)?,
     })
+}
+
+/// Dimensions the `list --group-by` aggregation can count events over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupBy {
+    Dir,
+    Host,
+    Source,
+    Kind,
+    Minute,
+}
+
+/// One aggregated group: its display key, how many events it holds, and the first
+/// and last timed instant among them (`None` when every member is untimed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRow {
+    pub key: String,
+    pub count: u64,
+    pub first_ts: Option<i64>,
+    pub last_ts: Option<i64>,
+}
+
+/// The directory key for a subject, matching the CLI's historical `--group-by dir`:
+/// the parent path when the subject looks like a path, `/` when it has no parent,
+/// and `-` when the subject holds no path at all.
+fn dir_key(subject: Option<&str>) -> String {
+    let subject = subject.unwrap_or("");
+    if subject.contains('/') {
+        Path::new(subject)
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "/".into())
+    } else {
+        "-".into()
+    }
+}
+
+/// Counts events per value of a dimension under the scope, newest-first by count then key.
+/// `Host`/`Source`/`Kind` aggregate in SQL; `Dir` and `Minute` fold in Rust because they
+/// depend on path parsing and zone-aware time rendering. `limit` bounds the number of
+/// groups (`None` returns them all); `tz` only affects `Minute`.
+pub fn group(
+    store: &Store,
+    filter: &TimelineFilter,
+    by: GroupBy,
+    limit: Option<usize>,
+    tz: Tz,
+) -> Result<Vec<GroupRow>, OverviewError> {
+    let mut rows: Vec<GroupRow> = match by {
+        GroupBy::Host | GroupBy::Source | GroupBy::Kind => {
+            let field = match by {
+                GroupBy::Host => GroupField::Host,
+                GroupBy::Source => GroupField::Source,
+                GroupBy::Kind => GroupField::Kind,
+                _ => unreachable!(),
+            };
+            store
+                .group_counts(&EventFilter::from(filter), field, None)?
+                .into_iter()
+                .map(|g| GroupRow {
+                    key: g.key.unwrap_or_else(|| "-".into()),
+                    count: g.count,
+                    first_ts: g.first_ts,
+                    last_ts: g.last_ts,
+                })
+                .collect()
+        }
+        GroupBy::Dir | GroupBy::Minute => {
+            let mut folded: HashMap<String, GroupRow> = HashMap::new();
+            for row in store.list_events(&EventFilter::from(filter))? {
+                let key = match by {
+                    GroupBy::Dir => dir_key(row.subject.as_deref()),
+                    GroupBy::Minute => {
+                        format_time(row.ts_utc, &row.ts_precision, tz, "%Y-%m-%d %H:%M")
+                    }
+                    _ => unreachable!(),
+                };
+                let timed = row.ts_precision != "order_only";
+                let entry = folded.entry(key.clone()).or_insert_with(|| GroupRow {
+                    key,
+                    count: 0,
+                    first_ts: None,
+                    last_ts: None,
+                });
+                entry.count = entry
+                    .count
+                    .checked_add(1)
+                    .ok_or(OverviewError::CountOverflow)?;
+                if timed {
+                    entry.first_ts = Some(entry.first_ts.map_or(row.ts_utc, |t| t.min(row.ts_utc)));
+                    entry.last_ts = Some(entry.last_ts.map_or(row.ts_utc, |t| t.max(row.ts_utc)));
+                }
+            }
+            folded.into_values().collect()
+        }
+    };
+    rows.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    Ok(rows)
+}
+
+/// The busiest hosts in scope, top `limit` by `sort`, with case-wide first-seen for the
+/// `NEW` badge. `limit` is 1..=[`MAX_FACET_ROWS`].
+pub fn hosts(
+    store: &Store,
+    filter: &TimelineFilter,
+    sort: HostSort,
+    limit: usize,
+) -> Result<Vec<HostSummary>, OverviewError> {
+    if limit == 0 || limit > MAX_FACET_ROWS {
+        return Err(OverviewError::InvalidLimit(limit));
+    }
+    Ok(store.host_summaries(&EventFilter::from(filter), sort, limit)?)
 }
