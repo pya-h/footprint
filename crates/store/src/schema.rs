@@ -26,6 +26,8 @@ pub enum StoreError {
     SchemaVersion { found: i64 },
     #[error("run id {0} exceeds SQLite's integer range")]
     InvalidRunId(u64),
+    #[error("event id {0} exceeds SQLite's integer range")]
+    InvalidEventId(u64),
     #[error("limit {0} exceeds SQLite's integer range")]
     InvalidLimit(usize),
     #[error("invalid time range: start {start} is after end {end}")]
@@ -546,6 +548,52 @@ impl Store {
         Ok(())
     }
 
+    /// The ascending row offset of the first event at or after `ts` in scope: the count of
+    /// scoped events strictly before `ts`. Used to scroll a virtual table to a time without
+    /// a scan, via the `ev_ts` index.
+    pub fn seek_offset(&self, filter: &EventFilter, ts: i64) -> Result<u64, StoreError> {
+        let strictly_before = ts.saturating_sub(1);
+        self.count_events(&EventFilter {
+            until: Some(
+                filter
+                    .until
+                    .map_or(strictly_before, |hi| hi.min(strictly_before)),
+            ),
+            ..filter.clone()
+        })
+    }
+
+    /// The events around `(ts, id)` in chronological order: up to `before` immediately
+    /// earlier and up to `after` immediately later, excluding the anchor itself. `scope`
+    /// narrows the neighbourhood to the same filter the table is showing when given.
+    pub fn events_around(
+        &self,
+        ts: i64,
+        id: u64,
+        before: usize,
+        after: usize,
+        scope: Option<&EventFilter>,
+    ) -> Result<Vec<EventRow>, StoreError> {
+        let base = scope.cloned().unwrap_or_default();
+        let mut earlier = self.list_events(&EventFilter {
+            reverse: true,
+            after: Some((ts, id)),
+            limit: Some(before),
+            offset: None,
+            ..base.clone()
+        })?;
+        earlier.reverse();
+        let later = self.list_events(&EventFilter {
+            reverse: false,
+            after: Some((ts, id)),
+            limit: Some(after),
+            offset: None,
+            ..base
+        })?;
+        earlier.extend(later);
+        Ok(earlier)
+    }
+
     /// Visits `(kind, count)` for every distinct kind in scope without retaining them.
     pub fn visit_kind_counts(
         &self,
@@ -627,7 +675,19 @@ impl Store {
         base_select: &str,
         filter: &EventFilter,
     ) -> Result<(String, Vec<Value>), StoreError> {
-        let (conditions, mut args) = Self::events_where(filter)?;
+        let (mut conditions, mut args) = Self::events_where(filter)?;
+        // the keyset cursor is part of paging, not the scope, so it lives here and never
+        // touches the aggregate helpers that share `events_where`.
+        if let Some((ts, id)) = filter.after {
+            let op = if filter.reverse { '<' } else { '>' };
+            conditions.push_str(&format!(" AND (e.ts_utc, e.id) {op} (?, ?)"));
+            args.push(ts.into());
+            args.push(
+                i64::try_from(id)
+                    .map_err(|_| StoreError::InvalidEventId(id))?
+                    .into(),
+            );
+        }
         let mut sql = format!("{base_select}{conditions}");
         sql.push_str(if filter.reverse {
             " ORDER BY e.ts_utc DESC, e.id DESC"
@@ -672,6 +732,10 @@ impl Store {
     }
 
     pub fn get_event(&self, id: u64) -> Result<Option<EventDetail>, StoreError> {
+        // row ids are stored as i64; an id beyond that range can't match any row.
+        let Ok(id) = i64::try_from(id) else {
+            return Ok(None);
+        };
         let mut stmt = self
             .conn
             .prepare_cached(&format!("{EVENT_DETAIL_SELECT} WHERE e.id = ?1"))?;
@@ -1077,6 +1141,9 @@ pub struct EventFilter {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub reverse: bool,
+    /// Keyset cursor `(ts_utc, id)`: return only rows after it in the current order.
+    /// This is paging, not scope, so counts and aggregates must leave it unset.
+    pub after: Option<(i64, u64)>,
 }
 
 const EVENT_ROW_SELECT: &str =
@@ -2305,6 +2372,77 @@ mod tests {
             )
             .unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn keyset_paging_seek_and_around_respect_ties_and_scope() {
+        let (_dir, store) = open_case();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO runs(id, started_utc) VALUES (1, 0);
+                 INSERT INTO sources(id, run_id, kind, app, profile) VALUES
+                   (1, 1, 'chromium.history', 'Brave', 'Default');
+                 INSERT INTO events(id, run_id, source_id, ts_utc, ts_precision, kind, subject_host, confidence, dedup_key) VALUES
+                   (1, 1, 1, 100, 'exact', 'web.visit',  'a.example', 'direct', 'e1'),
+                   (2, 1, 1, 100, 'exact', 'web.visit',  'a.example', 'direct', 'e2'),
+                   (3, 1, 1, 100, 'exact', 'web.visit',  'b.example', 'direct', 'e3'),
+                   (4, 1, 1, 200, 'exact', 'web.visit',  'a.example', 'direct', 'e4'),
+                   (5, 1, 1, 300, 'exact', 'web.redirect','a.example','direct', 'e5');",
+            )
+            .unwrap();
+        let all = EventFilter::default();
+        let ids = |rows: &[EventRow]| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+
+        // keyset after a tie on ts_utc=100: the (ts,id) tuple orders e1,e2,e3 and the page
+        // resumes strictly after e2, so e3 (same ts, higher id) comes next, then e4, e5.
+        let page = store
+            .list_events(&EventFilter {
+                after: Some((100, 2)),
+                limit: Some(10),
+                ..all.clone()
+            })
+            .unwrap();
+        assert_eq!(ids(&page), [3, 4, 5]);
+
+        // reverse keyset: strictly before (200, 4) in descending order is e3, e2, e1.
+        let back = store
+            .list_events(&EventFilter {
+                reverse: true,
+                after: Some((200, 4)),
+                limit: Some(10),
+                ..all.clone()
+            })
+            .unwrap();
+        assert_eq!(ids(&back), [3, 2, 1]);
+
+        // the cursor is paging, not scope: aggregates ignore `after`.
+        let scoped_after = EventFilter {
+            after: Some((300, 5)),
+            ..all.clone()
+        };
+        assert_eq!(store.count_events(&scoped_after).unwrap(), 5);
+
+        // seek_offset: rows strictly before a time, honouring the scope's own filters.
+        assert_eq!(store.seek_offset(&all, 100).unwrap(), 0);
+        assert_eq!(store.seek_offset(&all, 101).unwrap(), 3);
+        assert_eq!(store.seek_offset(&all, 300).unwrap(), 4);
+        assert_eq!(store.seek_offset(&all, i64::MAX).unwrap(), 5);
+        let only_a = EventFilter {
+            hosts: vec!["a.example".into()],
+            ..all.clone()
+        };
+        assert_eq!(store.seek_offset(&only_a, 101).unwrap(), 2);
+
+        // events_around excludes the anchor and returns chronological neighbours.
+        let around = store.events_around(200, 4, 2, 2, None).unwrap();
+        assert_eq!(ids(&around), [2, 3, 5]);
+        // clamped at the ends: nothing before the first row.
+        let head = store.events_around(100, 1, 3, 1, None).unwrap();
+        assert_eq!(ids(&head), [2]);
+        // a scope narrows the neighbourhood.
+        let scoped = store.events_around(200, 4, 5, 5, Some(&only_a)).unwrap();
+        assert_eq!(ids(&scoped), [1, 2, 5]);
     }
 
     #[test]

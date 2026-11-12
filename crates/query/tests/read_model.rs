@@ -460,3 +460,69 @@ fn host_summaries_rank_the_lure_domains_on_fake_zoom() {
     assert_eq!(scoped.len(), 1);
     assert_eq!(scoped[0].host, "us09-web-zoom.com");
 }
+
+#[test]
+fn keyset_paging_reconstructs_the_timeline_on_fake_zoom() {
+    let case = setup();
+    let store = fp_store::Store::open(&case.db).unwrap();
+
+    for reverse in [false, true] {
+        let scope = fp_query::TimelineFilter {
+            reverse,
+            ..Default::default()
+        };
+        let whole = fp_query::timeline(&store, &scope).unwrap();
+
+        // walk the scope in small keyset pages and prove it equals the unpaged order
+        let mut paged = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = fp_query::timeline_after(&store, &scope, cursor, 3).unwrap();
+            if let Some(last) = page.rows.last() {
+                cursor = Some((last.ts_utc, last.id));
+            }
+            let more = page.has_more;
+            paged.extend(page.rows.into_iter().map(|r| r.id));
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(paged, whole.iter().map(|r| r.id).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn seek_and_around_navigate_the_fake_zoom_timeline() {
+    let case = setup();
+    let store = fp_store::Store::open(&case.db).unwrap();
+    let scope = fp_query::TimelineFilter::default();
+    let whole = fp_query::timeline(&store, &scope).unwrap();
+
+    // pick a timed event in the middle and confirm seek lands on its row offset
+    let anchor = whole
+        .iter()
+        .find(|r| r.ts_precision != "order_only" && r.subject_host.is_some())
+        .unwrap();
+    let offset = fp_query::seek_offset(&store, &scope, anchor.ts_utc).unwrap() as usize;
+    // every row before the offset is strictly earlier; the offset row is at or after the anchor time
+    assert!(whole[..offset].iter().all(|r| r.ts_utc < anchor.ts_utc));
+    assert!(whole[offset].ts_utc >= anchor.ts_utc);
+
+    // around excludes the anchor and stays within the neighbour counts
+    let around = fp_query::events_around(&store, anchor.id, 2, 2, Some(&scope)).unwrap();
+    assert!(around.len() <= 4);
+    assert!(around.iter().all(|r| r.id != anchor.id));
+    // results are chronological
+    assert!(
+        around
+            .windows(2)
+            .all(|w| (w[0].ts_utc, w[0].id) <= (w[1].ts_utc, w[1].id))
+    );
+
+    // an unknown event has no neighbours
+    assert!(
+        fp_query::events_around(&store, u64::MAX, 5, 5, None)
+            .unwrap()
+            .is_empty()
+    );
+}

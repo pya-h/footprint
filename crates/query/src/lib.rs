@@ -21,7 +21,8 @@ pub use explain::{EXPLANATIONS, Explanation, explain};
 pub use sources::{CoverageRow, CoverageStatus, SourceView, coverage, sources};
 pub use state::{StateView, state_details, state_records};
 pub use timeline::{
-    PAGE_SIZE, TimelineFilter, TimelinePage, TimelineRow, search, timeline, timeline_page,
+    PAGE_SIZE, TimelineFilter, TimelinePage, TimelineRow, events_around, search, seek_offset,
+    timeline, timeline_after, timeline_page,
 };
 
 pub use fp_correlate::{IocHit, TraceArrow, TraceHead, TraceTree, check_iocs, trace_tree};
