@@ -928,6 +928,51 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Hit counts per IOC from `ioc_match` links: `(ioc id, hits)`. Links are rebuilt by
+    /// the correlation pass, so counts reflect the last completed pass, not live matching.
+    pub fn ioc_hit_counts(&self) -> Result<Vec<(u64, u64)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dst_id, COUNT(*) FROM links
+             WHERE rel = 'ioc_match' AND dst_type = 'ioc' GROUP BY dst_id ORDER BY dst_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            Ok((id as u64, row.get(1)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// One page of `ioc_match` links, newest targets ordered by ioc then target. `ioc_id`
+    /// of `None` returns hits for every IOC.
+    pub fn ioc_hits_page(
+        &self,
+        ioc_id: Option<u64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<IocHitLink>, StoreError> {
+        let limit = i64::try_from(limit).map_err(|_| StoreError::InvalidLimit(limit))?;
+        let offset = i64::try_from(offset).map_err(|_| StoreError::InvalidLimit(offset))?;
+        // row ids are stored as i64; an id beyond that range can't match any link
+        let Ok(ioc_id) = ioc_id.map(i64::try_from).transpose() else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT dst_id, src_type, src_id, why FROM links
+             WHERE rel = 'ioc_match' AND dst_type = 'ioc' AND (?1 IS NULL OR dst_id = ?1)
+             ORDER BY dst_id, src_type, src_id LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(params![ioc_id, limit, offset], |row| {
+            let id: i64 = row.get(0)?;
+            Ok(IocHitLink {
+                ioc_id: id as u64,
+                target_type: row.get(1)?,
+                target_id: row.get(2)?,
+                why: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub fn list_runs(&self) -> Result<Vec<RunRow>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, started_utc, finished_utc, host, user, uid, euid, tool_version, tz, args, errors_json
@@ -1344,6 +1389,15 @@ impl StateRow {
             locator: row.get(5)?,
         })
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct IocHitLink {
+    pub ioc_id: u64,
+    /// `event`, `artifact` or `state`: what the IOC matched against.
+    pub target_type: String,
+    pub target_id: u64,
+    pub why: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -2494,6 +2548,88 @@ mod tests {
         ));
         assert_eq!(count.unwrap(), 0);
         interrupt.interrupt();
+    }
+
+    #[test]
+    fn ioc_hit_counts_and_pages_read_match_links() {
+        let (_dir, mut store) = open_case();
+        assert!(store.ioc_hit_counts().unwrap().is_empty());
+        assert!(store.ioc_hits_page(None, 0, 10).unwrap().is_empty());
+
+        let ioc_a = store.insert_ioc("domain", "zoom.us", None).unwrap();
+        let ioc_b = store.insert_ioc("sha256", "ab", None).unwrap();
+        store
+            .insert_links(&[
+                Link {
+                    src_type: fp_core::LinkType::Event,
+                    src_id: 7,
+                    rel: "ioc_match".into(),
+                    dst_type: fp_core::LinkType::Ioc,
+                    dst_id: ioc_a,
+                    confidence: Confidence::Direct,
+                    why: Some("domain: zoom.us (matched on subject_host)".into()),
+                },
+                Link {
+                    src_type: fp_core::LinkType::Event,
+                    src_id: 9,
+                    rel: "ioc_match".into(),
+                    dst_type: fp_core::LinkType::Ioc,
+                    dst_id: ioc_a,
+                    confidence: Confidence::Direct,
+                    why: None,
+                },
+                Link {
+                    src_type: fp_core::LinkType::Artifact,
+                    src_id: 3,
+                    rel: "ioc_match".into(),
+                    dst_type: fp_core::LinkType::Ioc,
+                    dst_id: ioc_b,
+                    confidence: Confidence::Direct,
+                    why: None,
+                },
+                // another relation must never appear in IOC counts or pages
+                Link {
+                    src_type: fp_core::LinkType::Event,
+                    src_id: 7,
+                    rel: "navigated_from".into(),
+                    dst_type: fp_core::LinkType::Event,
+                    dst_id: 8,
+                    confidence: Confidence::Direct,
+                    why: None,
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(store.ioc_hit_counts().unwrap(), [(ioc_a, 2), (ioc_b, 1)]);
+
+        let all = store.ioc_hits_page(None, 0, 10).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all.iter()
+                .map(|h| (h.ioc_id, h.target_type.as_str(), h.target_id))
+                .collect::<Vec<_>>(),
+            [
+                (ioc_a, "event", 7),
+                (ioc_a, "event", 9),
+                (ioc_b, "artifact", 3),
+            ]
+        );
+
+        // `None` counts and pages every IOC; a filter narrows to one, ordered by target
+        let one = store.ioc_hits_page(Some(ioc_a), 0, 1).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].target_id, 7);
+        assert_eq!(store.ioc_hits_page(Some(ioc_b), 0, 10).unwrap().len(), 1);
+        assert!(
+            store
+                .ioc_hits_page(Some(u64::MAX), 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            store.ioc_hits_page(None, 0, usize::MAX),
+            Err(StoreError::InvalidLimit(_))
+        ));
     }
 
     #[test]

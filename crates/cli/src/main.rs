@@ -243,9 +243,6 @@ enum Format {
     Csv,
 }
 
-/// Indicator types the matcher understands.
-const IOC_TYPES: &[&str] = &["domain", "ip", "cidr", "sha256", "path", "url"];
-
 /// Evidence is untrusted: nothing from it reaches the terminal unsanitized.
 fn clean(text: &str) -> String {
     fp_render::sanitize(text)
@@ -769,15 +766,8 @@ fn ioc(case: &Path, args: IocArgs, tz: fp_query::Tz) -> Result<()> {
             note,
         } => {
             let ioc_type = ioc_type.to_lowercase();
-            if !IOC_TYPES.contains(&ioc_type.as_str()) {
-                bail!(
-                    "unknown ioc type `{ioc_type}`; expected one of {}",
-                    IOC_TYPES.join(", ")
-                );
-            }
             let mut store = Store::open_or_create(case)?;
-            let id = store.insert_ioc(&ioc_type, &value, note.as_deref())?;
-            fp_correlate::correlate_iocs(&mut store)?;
+            let id = fp_query::iocs::add_ioc(&mut store, &ioc_type, &value, note.as_deref())?;
             println!(
                 "added IOC #{id}: {ioc_type} {value}{}",
                 note.map(|n| format!(" ({n})")).unwrap_or_default()
@@ -787,19 +777,7 @@ fn ioc(case: &Path, args: IocArgs, tz: fp_query::Tz) -> Result<()> {
             let mut store = Store::open_or_create(case)?;
             let content = std::fs::read_to_string(&file)
                 .with_context(|| format!("failed to read IOC file {}", file.display()))?;
-            let mut count = 0;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let (ioc_type, val, note) = parse_ioc_line(line);
-                if !val.is_empty() {
-                    store.insert_ioc(&ioc_type, &val, note.as_deref())?;
-                    count += 1;
-                }
-            }
-            fp_correlate::correlate_iocs(&mut store)?;
+            let count = fp_query::iocs::import_iocs(&mut store, &content)?;
             println!("imported {count} IOCs from {}", file.display());
         }
         IocCommand::Check { format } => {
@@ -946,112 +924,4 @@ fn explain(finding: &str) -> Result<()> {
         println!("  proof: {}", hit.proof);
     }
     Ok(())
-}
-
-fn parse_ioc_line(line: &str) -> (String, String, Option<String>) {
-    // a comment starts at a `#` after whitespace; a URL's own `#fragment` is part of the value
-    let comment = line
-        .char_indices()
-        .find(|&(i, c)| c == '#' && (i == 0 || line[..i].ends_with(char::is_whitespace)))
-        .map(|(i, _)| i);
-    let (body, note) = match comment {
-        Some(i) => (line[..i].trim(), Some(line[i + 1..].trim().to_string())),
-        None => (line.trim(), None),
-    };
-
-    let parts: Vec<&str> = if body.contains(',') {
-        body.split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        body.split_whitespace().collect()
-    };
-
-    if parts.len() >= 2 && IOC_TYPES.contains(&parts[0].to_lowercase().as_str()) {
-        let ioc_type = parts[0].to_lowercase();
-        let val = parts[1].to_string();
-        let note = if parts.len() > 2 {
-            Some(parts[2..].join(" "))
-        } else {
-            note
-        };
-        (ioc_type, val, note)
-    } else {
-        let val = parts.first().copied().unwrap_or(body);
-        let ioc_type = detect_ioc_type(val);
-        (ioc_type, val.to_string(), note)
-    }
-}
-
-fn detect_ioc_type(val: &str) -> String {
-    if val.len() == 64 && val.chars().all(|c| c.is_ascii_hexdigit()) {
-        "sha256".to_string()
-    } else if val.contains("://") {
-        // before the glob check: a URL's query has a `?`
-        "url".to_string()
-    } else if val.starts_with('/')
-        || val.starts_with("./")
-        || val.contains('*')
-        || val.contains('?')
-    {
-        "path".to_string()
-    } else if val.contains('/')
-        && val
-            .split('/')
-            .next()
-            .is_some_and(|ip| ip.parse::<std::net::IpAddr>().is_ok())
-    {
-        "cidr".to_string()
-    } else if val.parse::<std::net::IpAddr>().is_ok() {
-        "ip".to_string()
-    } else if val.ends_with(".deb")
-        || val.ends_with(".rpm")
-        || val.ends_with(".tar.gz")
-        || val.ends_with(".zip")
-        || val.ends_with(".sh")
-        || val.ends_with(".service")
-        || val.ends_with(".desktop")
-        || val.ends_with(".so")
-        || val.ends_with(".exe")
-    {
-        "path".to_string()
-    } else {
-        "domain".to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn ioc_type_detection() {
-        use super::detect_ioc_type;
-        assert_eq!(detect_ioc_type("us09-web-zoom.com"), "domain");
-        assert_eq!(detect_ioc_type("192.168.1.1"), "ip");
-        assert_eq!(detect_ioc_type("192.168.1.0/24"), "cidr");
-        assert_eq!(detect_ioc_type("/tmp/evil.sh"), "path");
-        // a query string is not a glob
-        assert_eq!(detect_ioc_type("https://evil.example/dl?id=1"), "url");
-    }
-
-    #[test]
-    fn ioc_lines_keep_url_fragments() {
-        use super::parse_ioc_line;
-        assert_eq!(
-            parse_ioc_line("url https://evil.example/#token  # phishing kit"),
-            (
-                "url".to_string(),
-                "https://evil.example/#token".to_string(),
-                Some("phishing kit".to_string())
-            )
-        );
-        assert_eq!(
-            parse_ioc_line("evil.example # c2"),
-            (
-                "domain".to_string(),
-                "evil.example".to_string(),
-                Some("c2".to_string())
-            )
-        );
-    }
 }

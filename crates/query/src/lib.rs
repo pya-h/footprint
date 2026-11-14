@@ -9,6 +9,7 @@ mod detail;
 mod diff;
 mod explain;
 mod interrupt;
+pub mod iocs;
 pub mod overview;
 mod sources;
 mod state;

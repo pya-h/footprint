@@ -526,3 +526,42 @@ fn seek_and_around_navigate_the_fake_zoom_timeline() {
             .is_empty()
     );
 }
+
+#[test]
+fn link_based_ioc_counts_match_the_full_check_on_fake_zoom() {
+    let case = setup();
+    let mut store = fp_store::Store::open_or_create(&case.db).unwrap();
+
+    // the lure chain's hosts and the downloaded artifact, via the shared write path
+    let lure = fp_query::iocs::add_ioc(&mut store, "domain", "us09-web-zoom.com", None).unwrap();
+    let cdn = fp_query::iocs::add_ioc(&mut store, "domain", "zoom.us", None).unwrap();
+    fp_query::iocs::add_ioc(&mut store, "domain", "no-hits.example", None).unwrap();
+
+    // link counts agree with the authoritative full scan for every IOC
+    let full = fp_correlate::check_iocs(&store).unwrap();
+    let summary = fp_query::iocs::ioc_summary(&store).unwrap();
+    assert_eq!(summary.len(), 3);
+    for entry in &summary {
+        let expected = full.iter().filter(|h| h.ioc_id == entry.ioc.id).count() as u64;
+        assert_eq!(entry.hits, expected, "{:?}", entry.ioc);
+    }
+
+    // every hit the full scan found for the lure IOC appears in its page
+    let page = fp_query::iocs::ioc_hits_page(&store, Some(lure), 0, 500).unwrap();
+    let scanned: Vec<(String, u64)> = full
+        .iter()
+        .filter(|h| h.ioc_id == lure)
+        .map(|h| (h.target_type.clone(), h.target_id))
+        .collect();
+    let mut linked: Vec<(String, u64)> = page
+        .iter()
+        .map(|h| (h.target_type.clone(), h.target_id))
+        .collect();
+    let mut scanned = scanned;
+    linked.sort();
+    scanned.sort();
+    assert_eq!(linked, scanned);
+
+    // an IOC added against an unrelated value still correlates (zoom.us matches cdn.zoom.us)
+    assert!(summary.iter().find(|s| s.ioc.id == cdn).unwrap().hits > 0);
+}
