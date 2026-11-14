@@ -98,6 +98,21 @@ fn dir_matches_path_parent_semantics() {
             ("https://cdn.zoom.us", 1),
         ]
     );
+
+    // a paged scope still folds every matching row, exactly like the SQL dimensions
+    let paged = TimelineFilter {
+        limit: Some(2),
+        offset: Some(1),
+        ..TimelineFilter::default()
+    };
+    assert_eq!(
+        keyed(&group(&store, &paged, GroupBy::Dir, None, utc).unwrap()),
+        keyed(&dirs)
+    );
+    assert_eq!(
+        keyed(&group(&store, &all, GroupBy::Dir, Some(1), utc).unwrap()),
+        [("/home/u/Downloads", 2)]
+    );
 }
 
 #[test]

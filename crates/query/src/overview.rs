@@ -340,8 +340,14 @@ pub fn group(
                 .collect()
         }
         GroupBy::Dir | GroupBy::Minute => {
+            // like the SQL dimensions, the filter's own paging must not truncate the fold
+            let unpaged = EventFilter {
+                limit: None,
+                offset: None,
+                ..EventFilter::from(filter)
+            };
             let mut folded: HashMap<String, GroupRow> = HashMap::new();
-            for row in store.list_events(&EventFilter::from(filter))? {
+            for row in store.list_events(&unpaged)? {
                 let key = match by {
                     GroupBy::Dir => dir_key(row.subject.as_deref()),
                     GroupBy::Minute => {
