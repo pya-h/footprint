@@ -21,6 +21,8 @@ pub struct TimelineFilter {
     /// The run that first stored an event, not every run that observed it.
     pub run_id: Option<u64>,
     pub timing: EventTiming,
+    /// only events carrying an `ioc_match` link
+    pub ioc_only: bool,
     /// substring of subject, summary or attributes
     pub match_text: Option<String>,
     pub limit: Option<usize>,
@@ -104,6 +106,7 @@ impl From<&TimelineFilter> for EventFilter {
             confidence: filter.confidence.clone(),
             run_id: filter.run_id,
             timing: filter.timing,
+            ioc_only: filter.ioc_only,
             match_text: filter.match_text.clone(),
             limit: filter.limit,
             offset: filter.offset,

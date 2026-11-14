@@ -93,8 +93,8 @@ struct CollectArgs {
     with_scanners: bool,
 }
 
-#[derive(Args)]
-struct ListArgs {
+#[derive(Args, Clone, Default)]
+struct ScopeArgs {
     /// start of the window (`2026-10-16T20:40`, `20:40`, `-24h`, `yesterday`, `@epoch`)
     #[arg(short, long, allow_hyphen_values = true)]
     since: Option<String>,
@@ -113,6 +113,93 @@ struct ListArgs {
     /// substring of subject, summary or attributes
     #[arg(short, long)]
     r#match: Option<String>,
+    /// event kinds to exclude; `web.*` matches a family
+    #[arg(long, value_delimiter = ',')]
+    exclude_kind: Vec<String>,
+    /// hosts to exclude, each also matching its subdomains
+    #[arg(long, value_delimiter = ',')]
+    exclude_host: Vec<String>,
+    /// source kinds, apps or `app/profile` to exclude
+    #[arg(long, value_delimiter = ',')]
+    exclude_source: Vec<String>,
+    /// only events first stored by this run
+    #[arg(long)]
+    run: Option<u64>,
+    /// confidence levels to keep
+    #[arg(long, value_enum, value_delimiter = ',')]
+    confidence: Vec<ConfidenceArg>,
+    /// only events with a known or inferred timestamp
+    #[arg(long, conflicts_with = "untimed")]
+    timed: bool,
+    /// only events with no timestamp
+    #[arg(long)]
+    untimed: bool,
+    /// only events matching a configured IOC
+    #[arg(long)]
+    ioc_only: bool,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+enum ConfidenceArg {
+    Direct,
+    Derived,
+    Heuristic,
+}
+
+impl From<ConfidenceArg> for fp_core::Confidence {
+    fn from(arg: ConfidenceArg) -> Self {
+        match arg {
+            ConfidenceArg::Direct => Self::Direct,
+            ConfidenceArg::Derived => Self::Derived,
+            ConfidenceArg::Heuristic => Self::Heuristic,
+        }
+    }
+}
+
+impl ScopeArgs {
+    fn filter(
+        &self,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        reverse: bool,
+    ) -> Result<fp_query::TimelineFilter> {
+        Ok(fp_query::TimelineFilter {
+            since: self
+                .since
+                .as_deref()
+                .map(fp_query::time::parse)
+                .transpose()?,
+            until: self
+                .until
+                .as_deref()
+                .map(fp_query::time::parse)
+                .transpose()?,
+            kinds: self.kind.clone(),
+            hosts: self.host.clone(),
+            sources: self.source.clone(),
+            match_text: self.r#match.clone(),
+            kinds_not: self.exclude_kind.clone(),
+            hosts_not: self.exclude_host.clone(),
+            sources_not: self.exclude_source.clone(),
+            run_id: self.run,
+            confidence: self.confidence.iter().map(|c| (*c).into()).collect(),
+            timing: match (self.timed, self.untimed) {
+                (true, false) => fp_store::EventTiming::Timed,
+                (false, true) => fp_store::EventTiming::Untimed,
+                _ => fp_store::EventTiming::Any,
+            },
+            ioc_only: self.ioc_only,
+            limit,
+            offset,
+            reverse,
+        })
+    }
+}
+
+#[derive(Args)]
+struct ListArgs {
+    #[command(flatten)]
+    scope: ScopeArgs,
     /// aggregate count of events by dimension
     #[arg(long, value_enum)]
     group_by: Option<GroupBy>,
@@ -203,24 +290,8 @@ struct ExportArgs {
     #[arg(long)]
     redact: bool,
 
-    /// start of the window (`2026-10-16T20:40`, `20:40`, `-24h`, `yesterday`, `@epoch`)
-    #[arg(short, long, allow_hyphen_values = true)]
-    since: Option<String>,
-    /// end of the window, in the same forms as `--since`
-    #[arg(short, long, allow_hyphen_values = true)]
-    until: Option<String>,
-    /// event kinds; `web.*` matches a family
-    #[arg(short, long, value_delimiter = ',')]
-    kind: Vec<String>,
-    /// source kinds or families, apps, or `app/profile`
-    #[arg(long, value_delimiter = ',')]
-    source: Vec<String>,
-    /// hosts, each also matching its subdomains
-    #[arg(long, value_delimiter = ',')]
-    host: Vec<String>,
-    /// substring of subject, summary or attributes
-    #[arg(short, long)]
-    r#match: Option<String>,
+    #[command(flatten)]
+    scope: ScopeArgs,
     /// at most this many events
     #[arg(short, long)]
     limit: Option<usize>,
@@ -388,30 +459,15 @@ fn sources(case: &Path, run: Option<u64>, all_runs: bool, coverage: bool) -> Res
 
 fn list(case: &Path, args: ListArgs, tz: fp_query::Tz) -> Result<()> {
     let store = Store::open(case)?;
-    let filter = fp_query::TimelineFilter {
-        since: args
-            .since
-            .as_deref()
-            .map(fp_query::time::parse)
-            .transpose()?,
-        until: args
-            .until
-            .as_deref()
-            .map(fp_query::time::parse)
-            .transpose()?,
-        kinds: args.kind,
-        hosts: args.host,
-        sources: args.source,
-        match_text: args.r#match,
-        limit: if args.group_by.is_some() {
+    let filter = args.scope.filter(
+        if args.group_by.is_some() {
             None
         } else {
             args.limit
         },
-        offset: None,
-        reverse: args.reverse,
-        ..Default::default()
-    };
+        None,
+        args.reverse,
+    )?;
     if let Some(gb) = args.group_by {
         let groups = fp_query::overview::group(&store, &filter, gb.into(), args.limit, tz)?;
         print_grouped(groups, args.format)
@@ -861,26 +917,7 @@ fn ioc(case: &Path, args: IocArgs, tz: fp_query::Tz) -> Result<()> {
 
 fn export(case: &Path, args: ExportArgs, tz: fp_query::Tz) -> Result<()> {
     let store = Store::open(case)?;
-    let filter = fp_store::EventFilter {
-        since: args
-            .since
-            .as_deref()
-            .map(fp_query::time::parse)
-            .transpose()?,
-        until: args
-            .until
-            .as_deref()
-            .map(fp_query::time::parse)
-            .transpose()?,
-        kinds: args.kind,
-        hosts: args.host,
-        sources: args.source,
-        match_text: args.r#match,
-        limit: args.limit,
-        offset: None,
-        reverse: args.reverse,
-        ..Default::default()
-    };
+    let filter = fp_store::EventFilter::from(&args.scope.filter(args.limit, None, args.reverse)?);
 
     let fmt = match args.format {
         ExportCliFormat::Jsonl => fp_render::ExportFormat::Jsonl,

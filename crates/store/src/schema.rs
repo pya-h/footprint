@@ -660,6 +660,12 @@ impl Store {
             EventTiming::Timed => sql.push_str(" AND e.ts_precision != 'order_only'"),
             EventTiming::Untimed => sql.push_str(" AND e.ts_precision = 'order_only'"),
         }
+        if filter.ioc_only {
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM links l
+                              WHERE l.src_type = 'event' AND l.src_id = e.id AND l.rel = 'ioc_match')",
+            );
+        }
         if let Some(text) = &filter.match_text {
             sql.push_str(
                 " AND (e.subject LIKE ? ESCAPE '\\' OR e.summary LIKE ? ESCAPE '\\' OR e.attrs_json LIKE ? ESCAPE '\\')",
@@ -1194,6 +1200,9 @@ pub struct EventFilter {
     /// The run that first stored an event, not every run that observed it.
     pub run_id: Option<u64>,
     pub timing: EventTiming,
+    /// Only events with an `ioc_match` link; like the link counts, this reflects the last
+    /// completed correlation pass.
+    pub ioc_only: bool,
     pub match_text: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -2642,6 +2651,61 @@ mod tests {
             store.ioc_hits_page(None, 0, usize::MAX),
             Err(StoreError::InvalidLimit(_))
         ));
+    }
+
+    #[test]
+    fn ioc_only_selects_linked_events() {
+        let (_dir, mut store) = open_case();
+        let (r, s) = run(&mut store);
+        ingest(&mut store, r, &sample(r, s));
+        assert!(
+            store
+                .list_events(&EventFilter {
+                    ioc_only: true,
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty()
+        );
+
+        let ioc = store.insert_ioc("domain", "zoom.us", None).unwrap();
+        let linked = store
+            .list_events(&EventFilter {
+                hosts: vec!["zoom.us".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        for row in &linked {
+            store
+                .insert_link(&fp_core::Link {
+                    src_type: fp_core::LinkType::Event,
+                    src_id: row.id,
+                    rel: "ioc_match".into(),
+                    dst_type: fp_core::LinkType::Ioc,
+                    dst_id: ioc,
+                    confidence: Confidence::Direct,
+                    why: None,
+                })
+                .unwrap();
+        }
+        let hits = store
+            .list_events(&EventFilter {
+                ioc_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), linked.len());
+        assert_eq!(store.count_events(&EventFilter::default()).unwrap(), 4);
+
+        // scope parts compose with the link requirement
+        let scoped = store
+            .list_events(&EventFilter {
+                ioc_only: true,
+                hosts: vec!["page-redirect.com".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(scoped.is_empty());
     }
 
     #[test]
