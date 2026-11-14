@@ -981,6 +981,18 @@ impl Store {
         let rows = stmt.query_map([], RunRow::from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+
+    /// How many events each run first stored (`events.run_id`), ascending by run.
+    pub fn events_stored_per_run(&self) -> Result<Vec<(u64, u64)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT run_id, COUNT(*) FROM events GROUP BY run_id ORDER BY run_id")?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            Ok((id as u64, row.get(1)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
 }
 
 /// `web.*` matches every `web.` kind; anything else matches exactly.

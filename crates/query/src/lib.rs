@@ -11,6 +11,7 @@ mod explain;
 mod interrupt;
 pub mod iocs;
 pub mod overview;
+mod runs;
 mod sources;
 mod state;
 mod timeline;
@@ -19,6 +20,7 @@ pub use collect::{CollectEvent, CollectParams, CollectSummary, run_collect, sele
 pub use detail::{EventDetailView, LinkDirection, LinkView, event_detail};
 pub use diff::{DiffChange, DiffEntry, diff_runs};
 pub use explain::{EXPLANATIONS, Explanation, explain};
+pub use runs::{RunView, runs};
 pub use sources::{CoverageRow, CoverageStatus, SourceView, coverage, sources};
 pub use state::{StateView, state_details, state_records};
 pub use timeline::{

@@ -565,3 +565,24 @@ fn link_based_ioc_counts_match_the_full_check_on_fake_zoom() {
     // an IOC added against an unrelated value still correlates (zoom.us matches cdn.zoom.us)
     assert!(summary.iter().find(|s| s.ioc.id == cdn).unwrap().hits > 0);
 }
+
+#[test]
+fn runs_list_the_collect_with_its_stored_events_on_fake_zoom() {
+    let case = setup();
+    let store = fp_store::Store::open(&case.db).unwrap();
+
+    let runs = fp_query::runs(&store).unwrap();
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert_eq!(run.id, 1);
+    assert!(run.finished_utc.is_some());
+    assert!(run.duration_utc.is_some_and(|d| d >= 0));
+    assert!(run.errors.is_empty());
+    // args record the invoking process's argv, so only their presence is stable here
+    assert!(run.args.is_some());
+
+    let total = fp_store::Store::event_count(&store).unwrap();
+    assert_eq!(run.events_new, total);
+    let per_run = store.events_stored_per_run().unwrap();
+    assert_eq!(per_run, [(run.id, total)]);
+}
