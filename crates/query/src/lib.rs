@@ -16,7 +16,9 @@ mod sources;
 mod state;
 mod timeline;
 
-pub use collect::{CollectEvent, CollectParams, CollectSummary, run_collect, selected};
+pub use collect::{
+    CollectEvent, CollectParams, CollectSummary, cancel_collect, run_collect, selected,
+};
 pub use detail::{EventDetailView, LinkDirection, LinkView, event_detail};
 pub use diff::{DiffChange, DiffEntry, diff_runs};
 pub use explain::{EXPLANATIONS, Explanation, explain};

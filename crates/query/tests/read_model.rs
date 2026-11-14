@@ -1,11 +1,16 @@
 use fp_fixtures::{SCENARIO_TZ, fake_zoom, local};
 
+// run_collect shares one process-global interrupt flag, so collects in this binary
+// (including the cancellation test) must not overlap
+static COLLECT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Case {
     _dir: tempfile::TempDir,
     db: std::path::PathBuf,
 }
 
 fn setup() -> Case {
+    let _guard = COLLECT_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     fake_zoom(dir.path()).unwrap();
     let db = dir.path().join("case.db");
@@ -585,4 +590,67 @@ fn runs_list_the_collect_with_its_stored_events_on_fake_zoom() {
     assert_eq!(run.events_new, total);
     let per_run = store.events_stored_per_run().unwrap();
     assert_eq!(per_run, [(run.id, total)]);
+}
+
+fn params_for(dir: &std::path::Path) -> fp_query::CollectParams {
+    fp_query::CollectParams {
+        since: Some(format!("@{}", local(0, 0, 0))),
+        until: Some(format!("@{}", local(23, 59, 59))),
+        assume_tz: Some(SCENARIO_TZ.into()),
+        homes: vec![dir.join("home/u")],
+        root: dir.join("root"),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn planned_announces_the_source_count_before_any_work() {
+    let _guard = COLLECT_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    fake_zoom(dir.path()).unwrap();
+    let db = dir.path().join("case.db");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let params = params_for(dir.path());
+
+    let handle = std::thread::spawn(move || fp_query::run_collect(&db, &params, Some(&tx)));
+    let mut planned = None;
+    while let Ok(event) = rx.recv() {
+        if let fp_query::CollectEvent::Planned { total } = event {
+            planned = Some(total);
+            break;
+        }
+    }
+    let summary = handle.join().unwrap().unwrap();
+    let planned = planned.expect("Planned precedes every other event");
+    assert!(planned > 0);
+    assert_eq!(planned, summary.sources_read);
+}
+
+#[test]
+fn cancel_collect_stops_the_run_before_the_next_source() {
+    let _guard = COLLECT_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    fake_zoom(dir.path()).unwrap();
+    let db = dir.path().join("case.db");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let params = params_for(dir.path());
+
+    let handle = std::thread::spawn(move || fp_query::run_collect(&db, &params, Some(&tx)));
+    // Planned is sent before workers take their first job, so this always lands in time
+    while let Ok(event) = rx.recv() {
+        if matches!(event, fp_query::CollectEvent::Planned { .. }) {
+            fp_query::cancel_collect();
+            break;
+        }
+    }
+    let summary = handle.join().unwrap().unwrap();
+    assert_eq!(summary.totals.events_new, 0);
+    assert!(
+        summary
+            .errors
+            .iter()
+            .any(|e| e.contains("interrupted by user")),
+        "{:?}",
+        summary.errors
+    );
 }

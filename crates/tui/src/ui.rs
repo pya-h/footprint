@@ -684,7 +684,10 @@ fn draw_collect(frame: &mut Frame, app: &App, theme: Theme, area: ratatui::layou
     }
     form.push(Span::styled(
         if app.collect.running {
-            " collecting…".to_string()
+            match app.collect.total {
+                Some(total) => format!(" collecting… ({}/{total})", app.collect.done),
+                None => " collecting…".to_string(),
+            }
         } else {
             " e/Tab edit · Enter start".to_string()
         },

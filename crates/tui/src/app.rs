@@ -169,6 +169,9 @@ pub struct CollectState {
     pub running: bool,
     pub lines: Vec<CollectLine>,
     pub summary: Option<String>,
+    /// sources the current run plans to read, and how many of them have finished
+    pub total: Option<usize>,
+    pub done: usize,
     pub since: String,
     pub until: String,
     pub sources: String,
@@ -405,6 +408,8 @@ impl App {
         self.collect.running = true;
         self.collect.summary = None;
         self.collect.lines.clear();
+        self.collect.total = None;
+        self.collect.done = 0;
         self.status = "collecting…".into();
         self.collect_rx = Some(rx);
         Ok(())
@@ -418,6 +423,9 @@ impl App {
         let mut finished = None;
         while let Ok(event) = rx.try_recv() {
             match event {
+                CollectEvent::Planned { total } => {
+                    self.collect.total = Some(total);
+                }
                 CollectEvent::InstanceStarted { label } => {
                     self.collect.lines.push(CollectLine {
                         label,
@@ -430,6 +438,7 @@ impl App {
                     status,
                     ..
                 } => {
+                    self.collect.done += 1;
                     let outcome = format!(
                         "{} new / {} known, {}",
                         totals.events_new, totals.events_known, status
@@ -447,6 +456,7 @@ impl App {
                     }
                 }
                 CollectEvent::InstanceError { label, error } => {
+                    self.collect.done += 1;
                     let outcome = format!("error: {error}");
                     if let Some(line) = self
                         .collect

@@ -45,6 +45,10 @@ pub struct CollectSummary {
 
 #[derive(Debug, Clone)]
 pub enum CollectEvent {
+    /// How many source instances the run will read; sent once, before any work starts.
+    Planned {
+        total: usize,
+    },
     InstanceStarted {
         label: String,
     },
@@ -323,6 +327,9 @@ pub fn run_collect(
         }
     }
     let read = jobs.len();
+    if let Some(p) = progress {
+        let _ = p.send(CollectEvent::Planned { total: read });
+    }
 
     let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
     let (outcome_tx, outcome_rx) = std::sync::mpsc::channel::<Outcome>();
@@ -457,6 +464,11 @@ pub fn run_collect(
     for handle in handles {
         let _ = handle.join();
     }
+    // a signal or cancel that arrived while the last jobs were already running leaves no
+    // NOT_COLLECTED outcome; the flag itself is authoritative for the error
+    if crate::interrupt::interrupted() {
+        interrupted = true;
+    }
     if interrupted {
         errors.push("interrupted by user; some sources were not collected".into());
     }
@@ -479,6 +491,12 @@ pub fn run_collect(
         let _ = p.send(CollectEvent::Finished(summary.clone()));
     }
     Ok(summary)
+}
+
+/// Asks the running collect to stop before its next source. Safe to call when nothing is
+/// running: the flag is cleared by the next run's `arm`.
+pub fn cancel_collect() {
+    crate::interrupt::cancel();
 }
 
 /// Running under sudo, the case must belong to the user who invoked it.
