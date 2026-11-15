@@ -7,12 +7,19 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use eframe::egui;
+use fp_query::overview::{Facet, TimeWindow};
 
 use crate::model::{Action, Counts, LoadStatus, Model, ScopeAction, Selection, View};
 use crate::settings::Settings;
-use crate::theme::Theme;
-use crate::theme::ThemeName;
-use crate::worker::{QueryError, ReqKind, Worker};
+use crate::theme::{Theme, ThemeName};
+use crate::vm::{DetailVm, GroupRowVm, RowVm, RunMarkerVm};
+use crate::widgets::chip::{ChipEditorState, show_scope_bar, thousands};
+use crate::widgets::event_table::TableState;
+use crate::widgets::facets::{FacetsState, show_facets};
+use crate::widgets::inspector::show_inspector;
+use crate::widgets::strip::StripState;
+use crate::worker::cache::BLOCK_SIZE;
+use crate::worker::{BlockCache, Generation, QueryError, ReqKind, Worker};
 
 pub struct Shell {
     case: PathBuf,
@@ -25,8 +32,21 @@ pub struct Shell {
     startup_error: Option<String>,
     search: String,
     case_missing: bool,
-    submitted: Option<crate::worker::Generation>,
+    submitted: Option<Generation>,
+    submitted_hist_gen: Option<(Generation, usize)>,
+    submitted_detail_hist: Option<(Generation, i64, i64, usize)>,
+    submitted_facets: HashSet<(Generation, Facet)>,
+    submitted_runs: bool,
+    submitted_detail: Option<Generation>,
+    submitted_groups: Option<Generation>,
+    submitted_seek: Option<Generation>,
     outstanding: HashSet<u64>,
+    cache: BlockCache,
+    chip_editor: ChipEditorState,
+    strip_state: StripState,
+    facets_state: FacetsState,
+    table_state: TableState,
+    focus_search_next: bool,
 }
 
 fn apply_theme(name: ThemeName, ui_scale: f32, ctx: &egui::Context) {
@@ -46,16 +66,63 @@ fn view_from_label(label: &str) -> Option<View> {
         .copied()
 }
 
-fn thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
+fn downcast<T: 'static>(
+    res: Result<crate::worker::Payload, QueryError>,
+    what: &str,
+) -> Result<T, String> {
+    match res {
+        Ok(payload) => payload
+            .downcast::<T>()
+            .map(|b| *b)
+            .map_err(|_| format!("internal: {what} payload mismatch")),
+        Err(QueryError::Message(m)) => Err(m),
+        Err(QueryError::Interrupted) => Err("interrupted".to_string()),
     }
-    out
+}
+
+fn facet_sub(facet: Facet) -> &'static str {
+    match facet {
+        Facet::Kind => "kind",
+        Facet::Source => "source",
+        Facet::Host => "host",
+        Facet::Confidence => "confidence",
+        Facet::Run => "run",
+    }
+}
+
+fn facet_from_sub(sub: &str) -> Option<Facet> {
+    match sub {
+        "kind" => Some(Facet::Kind),
+        "source" => Some(Facet::Source),
+        "host" => Some(Facet::Host),
+        "confidence" => Some(Facet::Confidence),
+        "run" => Some(Facet::Run),
+        _ => None,
+    }
+}
+
+fn facet_minus_self_filter(
+    base: &fp_query::TimelineFilter,
+    facet: Facet,
+) -> fp_query::TimelineFilter {
+    let mut f = base.clone();
+    match facet {
+        Facet::Kind => {
+            f.kinds.clear();
+            f.kinds_not.clear();
+        }
+        Facet::Source => {
+            f.sources.clear();
+            f.sources_not.clear();
+        }
+        Facet::Host => {
+            f.hosts.clear();
+            f.hosts_not.clear();
+        }
+        Facet::Confidence => f.confidence.clear(),
+        Facet::Run => f.run_id = None,
+    }
+    f
 }
 
 fn bytes(n: u64) -> String {
@@ -107,12 +174,43 @@ impl Shell {
             search: String::new(),
             case_missing,
             submitted: None,
+            submitted_hist_gen: None,
+            submitted_detail_hist: None,
+            submitted_facets: HashSet::new(),
+            submitted_runs: false,
+            submitted_detail: None,
+            submitted_groups: None,
+            submitted_seek: None,
             outstanding: HashSet::new(),
+            cache: BlockCache::new(),
+            chip_editor: ChipEditorState::default(),
+            strip_state: StripState::default(),
+            facets_state: FacetsState::default(),
+            table_state: TableState::default(),
+            focus_search_next: false,
         }
     }
 
-    fn apply(&mut self, action: Action) {
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
+    pub fn apply(&mut self, action: Action) {
         self.model.apply(action);
+    }
+
+    fn apply_all(&mut self, actions: Vec<Action>) {
+        for action in actions {
+            self.apply(action);
+        }
+    }
+
+    fn active_theme(&self) -> Theme {
+        match self.theme {
+            ThemeName::Dark => Theme::dark(),
+            ThemeName::Light => Theme::light(),
+            ThemeName::HighContrast => Theme::high_contrast(),
+        }
     }
 
     fn drain_worker(&mut self) {
@@ -178,37 +276,162 @@ impl Shell {
                     if self.case_missing {
                         // the case appeared after startup: leave the empty state and load it
                         self.case_missing = false;
-                        self.submitted = None;
+                        self.reset_submission_markers();
                     }
                     self.apply(Action::Observed { version });
+                }
+                ReqKind::Histogram => {
+                    let result =
+                        downcast::<fp_query::overview::Histogram>(resp.result, "histogram");
+                    match resp.sub.as_deref() {
+                        Some("detail") => self.apply(Action::DetailHistogram {
+                            generation: resp.generation,
+                            result,
+                        }),
+                        Some("ioc") => self.apply(Action::IocHistogram {
+                            generation: resp.generation,
+                            result,
+                        }),
+                        _ => self.apply(Action::Histogram {
+                            generation: resp.generation,
+                            result,
+                        }),
+                    }
+                }
+                ReqKind::Runs => {
+                    let result = downcast::<Vec<RunMarkerVm>>(resp.result, "runs");
+                    self.apply(Action::Runs {
+                        generation: resp.generation,
+                        result,
+                    });
+                }
+                ReqKind::Facets => match resp.sub.as_deref() {
+                    Some("category") => {
+                        let result = downcast::<[u64; fp_query::category::Category::ALL.len()]>(
+                            resp.result,
+                            "category",
+                        );
+                        self.apply(Action::Category {
+                            generation: resp.generation,
+                            result,
+                        });
+                    }
+                    Some("timing") => {
+                        let result =
+                            downcast::<fp_query::overview::TimingCounts>(resp.result, "timing");
+                        self.apply(Action::Timing {
+                            generation: resp.generation,
+                            result,
+                        });
+                    }
+                    Some("ioc_count") => {
+                        let result = downcast::<u64>(resp.result, "ioc_count");
+                        self.apply(Action::IocCount {
+                            generation: resp.generation,
+                            result,
+                        });
+                    }
+                    Some(sub) => {
+                        let Some(facet) = facet_from_sub(sub) else {
+                            continue;
+                        };
+                        let result = downcast::<fp_store::FacetPage>(resp.result, "facet");
+                        self.apply(Action::Facets {
+                            facet,
+                            generation: resp.generation,
+                            result,
+                        });
+                    }
+                    None => {}
+                },
+                ReqKind::Page => {
+                    let Some(sub) = resp.sub.as_deref() else {
+                        continue;
+                    };
+                    let Some(key) = BlockCache::decode_sub(sub) else {
+                        continue;
+                    };
+                    match downcast::<Vec<RowVm>>(resp.result, "page") {
+                        Ok(rows) => self.cache.insert(key, rows),
+                        Err(msg) => self.cache.record_error(key, resp.generation, msg),
+                    }
+                }
+                ReqKind::Seek => {
+                    let result = downcast::<u64>(resp.result, "seek");
+                    self.apply(Action::SeekResolved {
+                        generation: resp.generation,
+                        offset: result,
+                    });
+                }
+                ReqKind::Detail => {
+                    let result = downcast::<Option<Box<DetailVm>>>(resp.result, "detail");
+                    self.apply(Action::Detail {
+                        generation: resp.generation,
+                        result,
+                    });
+                }
+                ReqKind::Around => {
+                    let result = downcast::<Vec<RowVm>>(resp.result, "around");
+                    self.apply(Action::Around {
+                        generation: resp.generation,
+                        result,
+                    });
+                }
+                ReqKind::Groups => {
+                    let result = downcast::<Vec<GroupRowVm>>(resp.result, "groups");
+                    self.apply(Action::Groups {
+                        generation: resp.generation,
+                        result,
+                    });
                 }
                 _ => {}
             }
         }
     }
 
+    fn reset_submission_markers(&mut self) {
+        self.cache.clear();
+        self.submitted = None;
+        self.submitted_hist_gen = None;
+        self.submitted_detail_hist = None;
+        self.submitted_facets.clear();
+        self.submitted_runs = false;
+        self.submitted_detail = None;
+        self.submitted_groups = None;
+        self.submitted_seek = None;
+    }
+
     fn ensure_requests(&mut self) {
         if self.case_missing || self.startup_error.is_some() || self.worker.is_none() {
             return;
         }
-        if self.submitted == Some(self.model.generation) {
-            return;
-        }
-        self.submitted = Some(self.model.generation);
         let generation = self.model.generation;
-        let filter = self.model.scope.filter();
+        if self.submitted != Some(generation) {
+            self.submitted = Some(generation);
+            self.cache.prune_stale_pending(generation);
+            self.submit_scope_queries(generation);
+        }
+        self.submit_histogram_queries(generation);
+        self.submit_facet_queries(generation);
+        self.submit_page_queries(generation);
+        self.submit_detail_queries();
+        self.submit_group_and_seek();
+    }
+
+    fn submit_scope_queries(&mut self, generation: Generation) {
         let Some(worker) = &self.worker else {
             return;
         };
-
+        let filter = self.model.scope.filter();
+        let count_filter = filter.clone();
         let id = worker.submit(ReqKind::Count, None, generation, move |store| {
             let in_case = store.event_count()?;
-            let in_scope = store.count_events(&fp_store::EventFilter::from(&filter))?;
+            let in_scope = store.count_events(&fp_store::EventFilter::from(&count_filter))?;
             let untimed_filter = fp_query::TimelineFilter {
                 since: None,
                 until: None,
                 timing: fp_store::EventTiming::Untimed,
-                ..filter.clone()
+                ..count_filter.clone()
             };
             let untimed = store.count_events(&fp_store::EventFilter::from(&untimed_filter))?;
             Ok(Box::new((Counts { in_scope, in_case }, untimed)))
@@ -219,9 +442,302 @@ impl Shell {
             Ok(Box::new(store.time_bounds()?))
         });
         self.outstanding.insert(id);
+
+        if !self.submitted_runs {
+            self.submitted_runs = true;
+            let id = worker.submit(ReqKind::Runs, None, generation, |store| {
+                let markers: Vec<RunMarkerVm> = fp_query::runs(store)?
+                    .iter()
+                    .map(RunMarkerVm::from_view)
+                    .collect();
+                Ok(Box::new(markers))
+            });
+            self.outstanding.insert(id);
+        }
+
+        let cat_filter = filter.clone();
+        let id = worker.submit(
+            ReqKind::Facets,
+            Some("category".to_string()),
+            generation,
+            move |store| {
+                let counts = fp_query::overview::category_counts(store, &cat_filter)
+                    .map_err(|e| QueryError::Message(e.to_string()))?;
+                Ok(Box::new(counts))
+            },
+        );
+        self.outstanding.insert(id);
+
+        let timing_filter = fp_query::TimelineFilter {
+            timing: fp_store::EventTiming::Any,
+            ..filter.clone()
+        };
+        let id = worker.submit(
+            ReqKind::Facets,
+            Some("timing".to_string()),
+            generation,
+            move |store| {
+                let counts = fp_query::overview::timing_counts(store, &timing_filter)
+                    .map_err(|e| QueryError::Message(e.to_string()))?;
+                Ok(Box::new(counts))
+            },
+        );
+        self.outstanding.insert(id);
+
+        let ioc_filter = fp_query::TimelineFilter {
+            ioc_only: true,
+            ..filter
+        };
+        let id = worker.submit(
+            ReqKind::Facets,
+            Some("ioc_count".to_string()),
+            generation,
+            move |store| {
+                let count = store.count_events(&fp_store::EventFilter::from(&ioc_filter))?;
+                Ok(Box::new(count))
+            },
+        );
+        self.outstanding.insert(id);
+    }
+
+    fn submit_histogram_queries(&mut self, generation: Generation) {
+        let Some(Some((case_start, case_end))) = self.model.bounds.value().copied() else {
+            return;
+        };
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let width_px = self.strip_state.last_width_px.max(64);
+        let filter = self.model.scope.filter();
+
+        if self.submitted_hist_gen != Some((generation, width_px)) {
+            self.submitted_hist_gen = Some((generation, width_px));
+            let base = fp_query::TimelineFilter {
+                since: None,
+                until: None,
+                ..filter.clone()
+            };
+            let window = TimeWindow {
+                start_utc: case_start,
+                end_utc: case_end.max(case_start),
+            };
+            let base_clone = base.clone();
+            let id = worker.submit(
+                ReqKind::Histogram,
+                Some("minimap".to_string()),
+                generation,
+                move |store| {
+                    let h = fp_query::overview::histogram(store, &base_clone, window, width_px)
+                        .map_err(|e| QueryError::Message(e.to_string()))?;
+                    Ok(Box::new(h))
+                },
+            );
+            self.outstanding.insert(id);
+
+            let ioc_base = fp_query::TimelineFilter {
+                ioc_only: true,
+                ..base
+            };
+            let id = worker.submit(
+                ReqKind::Histogram,
+                Some("ioc".to_string()),
+                generation,
+                move |store| {
+                    let h = fp_query::overview::histogram(store, &ioc_base, window, width_px)
+                        .map_err(|e| QueryError::Message(e.to_string()))?;
+                    Ok(Box::new(h))
+                },
+            );
+            self.outstanding.insert(id);
+        }
+
+        if filter.since.is_some() || filter.until.is_some() {
+            let ws = filter.since.unwrap_or(case_start);
+            let we = filter.until.unwrap_or(case_end).max(ws);
+            let key = (generation, ws, we, width_px);
+            if self.submitted_detail_hist != Some(key) {
+                self.submitted_detail_hist = Some(key);
+                let window = TimeWindow {
+                    start_utc: ws,
+                    end_utc: we,
+                };
+                let id = worker.submit(
+                    ReqKind::Histogram,
+                    Some("detail".to_string()),
+                    generation,
+                    move |store| {
+                        let h = fp_query::overview::histogram(store, &filter, window, width_px)
+                            .map_err(|e| QueryError::Message(e.to_string()))?;
+                        Ok(Box::new(h))
+                    },
+                );
+                self.outstanding.insert(id);
+            }
+        }
+    }
+
+    fn submit_facet_queries(&mut self, generation: Generation) {
+        if self.settings.panels.facets_collapsed {
+            return;
+        }
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let base_filter = self.model.scope.filter();
+        for facet in self.facets_state.expanded_facets() {
+            if !self.submitted_facets.insert((generation, facet)) {
+                continue;
+            }
+            let scoped = facet_minus_self_filter(&base_filter, facet);
+            let sub = facet_sub(facet).to_string();
+            let id = worker.submit(ReqKind::Facets, Some(sub), generation, move |store| {
+                let page = fp_query::overview::facets(
+                    store,
+                    &scoped,
+                    facet,
+                    fp_query::overview::MAX_FACET_ROWS,
+                )
+                .map_err(|e| QueryError::Message(e.to_string()))?;
+                Ok(Box::new(page))
+            });
+            self.outstanding.insert(id);
+        }
+    }
+
+    fn submit_page_queries(&mut self, generation: Generation) {
+        if self.model.view() != View::Timeline || self.model.group_by.is_some() {
+            return;
+        }
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let scope_hash = self.model.scope.hash();
+        let reverse = self.model.reverse;
+        let blocks = std::mem::take(&mut self.table_state.needed_blocks);
+        for block_idx in blocks {
+            let key = (scope_hash, reverse, block_idx);
+            if !self.cache.mark_pending(key, generation) {
+                continue;
+            }
+            let cursor = self.cache.prev_block_cursor(scope_hash, reverse, block_idx);
+            let mut filter = self.model.scope.filter();
+            filter.reverse = reverse;
+            let sub = BlockCache::encode_sub(key);
+            let id = worker.submit(ReqKind::Page, Some(sub), generation, move |store| {
+                let page = match cursor {
+                    Some(c) => fp_query::timeline_after(store, &filter, Some(c), BLOCK_SIZE)?,
+                    None => {
+                        fp_query::timeline_page(store, &filter, block_idx * BLOCK_SIZE, BLOCK_SIZE)?
+                    }
+                };
+                let rows: Vec<RowVm> = page.rows.iter().map(RowVm::from_row).collect();
+                Ok(Box::new(rows))
+            });
+            self.outstanding.insert(id);
+        }
+    }
+
+    fn submit_detail_queries(&mut self) {
+        let sel_gen = self.model.selection_gen;
+        if self.submitted_detail == Some(sel_gen) {
+            return;
+        }
+        self.submitted_detail = Some(sel_gen);
+        let Selection::Event(id) = self.model.inspected() else {
+            return;
+        };
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let req_id = worker.submit(
+            ReqKind::Detail,
+            Some(id.to_string()),
+            sel_gen,
+            move |store| {
+                let view = fp_query::event_detail(store, id)?;
+                Ok(Box::new(
+                    view.as_ref().map(|v| Box::new(DetailVm::from_view(v))),
+                ))
+            },
+        );
+        self.outstanding.insert(req_id);
+
+        let scope = self.model.scope.filter();
+        let req_id = worker.submit(
+            ReqKind::Around,
+            Some(id.to_string()),
+            sel_gen,
+            move |store| {
+                let anchor_ts = store.get_event(id)?.map(|e| e.ts_utc).unwrap_or(0);
+                let rows = fp_query::events_around(store, id, 25, 25, Some(&scope))?;
+                let nearby: Vec<RowVm> = rows
+                    .iter()
+                    .filter(|r| {
+                        r.ts_precision != "order_only"
+                            && r.ts_utc.abs_diff(anchor_ts) <= 300_000_000
+                    })
+                    .map(RowVm::from_row)
+                    .collect();
+                Ok(Box::new(nearby))
+            },
+        );
+        self.outstanding.insert(req_id);
+    }
+
+    fn submit_group_and_seek(&mut self) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        if let Some(by) = self.model.group_by
+            && self.submitted_groups != Some(self.model.group_gen)
+        {
+            self.submitted_groups = Some(self.model.group_gen);
+            let filter = self.model.scope.filter();
+            let tz = self.tz;
+            let group_gen = self.model.group_gen;
+            let sub = format!("{by:?}");
+            let id = worker.submit(ReqKind::Groups, Some(sub), group_gen, move |store| {
+                let rows = fp_query::overview::group(store, &filter, by, Some(500), tz)
+                    .map_err(|e| QueryError::Message(e.to_string()))?;
+                let vms: Vec<GroupRowVm> = rows.iter().map(GroupRowVm::from_row).collect();
+                Ok(Box::new(vms))
+            });
+            self.outstanding.insert(id);
+        }
+
+        if let Some(ts) = self.model.pending_seek
+            && self.submitted_seek != Some(self.model.seek_gen)
+        {
+            self.submitted_seek = Some(self.model.seek_gen);
+            let filter = self.model.scope.filter();
+            let reverse = self.model.reverse;
+            let seek_gen = self.model.seek_gen;
+            let id = worker.submit(ReqKind::Seek, None, seek_gen, move |store| {
+                let offset = if reverse {
+                    let after_ts = ts.saturating_add(1);
+                    let since = filter.since.map_or(after_ts, |s| s.max(after_ts));
+                    let f = fp_query::TimelineFilter {
+                        since: Some(since),
+                        ..filter
+                    };
+                    store.count_events(&fp_store::EventFilter::from(&f))?
+                } else {
+                    fp_query::seek_offset(store, &filter, ts)?
+                };
+                Ok(Box::new(offset))
+            });
+            self.outstanding.insert(id);
+        }
     }
 
     fn shortcuts(&mut self, ui: &egui::Ui) {
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.chip_editor.is_open() {
+                self.chip_editor.close();
+            } else if self.model.selection() != Selection::None {
+                self.apply(Action::Select(Selection::None));
+            }
+        }
         if ui.ctx().egui_wants_keyboard_input() {
             return;
         }
@@ -235,6 +751,26 @@ impl Shell {
         }
         if ui.input(|i| i.key_pressed(egui::Key::C) && i.modifiers.ctrl && i.modifiers.shift) {
             ui.ctx().copy_text(self.model.scope.to_cli());
+        }
+        if ui
+            .input(|i| i.key_pressed(egui::Key::Backspace) && i.modifiers.ctrl && i.modifiers.shift)
+        {
+            self.apply(Action::Scope(ScopeAction::Clear));
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Slash) && !i.modifiers.any()) {
+            self.focus_search_next = true;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::F) && !i.modifiers.any()) {
+            self.settings.panels.facets_collapsed = !self.settings.panels.facets_collapsed;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::I) && !i.modifiers.any()) {
+            self.settings.panels.inspector_collapsed = !self.settings.panels.inspector_collapsed;
+        }
+        if ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) {
+            self.apply(Action::NavBack);
+        }
+        if ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)) {
+            self.apply(Action::NavForward);
         }
         if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Minus)) {
             self.zoom_by(ui, -0.1);
@@ -261,7 +797,7 @@ impl Shell {
         .iter()
         .enumerate()
         {
-            if ui.input(|i| i.key_pressed(*key))
+            if ui.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(*key))
                 && let Some(view) = View::from_shortcut(i)
             {
                 self.apply(Action::Go(view));
@@ -297,8 +833,11 @@ impl Shell {
             let response = ui.add_sized(
                 [280.0, 20.0],
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("search subjects, hosts, commands…"),
+                    .hint_text("search subjects, hosts, commands… (/)"),
             );
+            if std::mem::take(&mut self.focus_search_next) {
+                response.request_focus();
+            }
             if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 let text = (!self.search.is_empty()).then(|| self.search.clone());
                 self.apply(Action::Scope(ScopeAction::SetText(text)));
@@ -314,12 +853,16 @@ impl Shell {
                 {
                     self.apply(Action::Go(View::Collect));
                 }
-                let glyph = match self.theme {
-                    ThemeName::Dark => "☾",
-                    ThemeName::Light => "☀",
-                    ThemeName::HighContrast => "◐",
+                let theme_label = match self.theme {
+                    ThemeName::Dark => "theme: dark",
+                    ThemeName::Light => "theme: light",
+                    ThemeName::HighContrast => "theme: contrast",
                 };
-                if ui.button(glyph).on_hover_text("switch theme").clicked() {
+                if ui
+                    .button(theme_label)
+                    .on_hover_text("switch theme")
+                    .clicked()
+                {
                     self.theme = match self.theme {
                         ThemeName::Dark => ThemeName::Light,
                         ThemeName::Light => ThemeName::HighContrast,
@@ -328,7 +871,40 @@ impl Shell {
                     self.settings.theme = self.theme;
                     apply_theme(self.theme, self.settings.ui_scale, ui.ctx());
                 }
-                ui.label(self.tz_label());
+                let tz_resp = egui::ComboBox::from_id_salt("tz_combo")
+                    .selected_text(self.tz_label())
+                    .width(74.0)
+                    .show_ui(ui, |ui| {
+                        for preset in ["local", "UTC", "+03:30", "+00:00", "-05:00", "+09:00"] {
+                            let selected = self.tz_label() == preset;
+                            if ui.selectable_label(selected, preset).clicked()
+                                && let Ok(parsed) = fp_query::parse_tz(preset)
+                            {
+                                self.tz = parsed;
+                                self.settings.tz = preset.to_string();
+                                self.model.group_gen += 1;
+                            }
+                        }
+                    });
+                tz_resp.response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Time zone")
+                });
+                if ui
+                    .selectable_label(!self.settings.panels.inspector_collapsed, "inspector")
+                    .on_hover_text("toggle inspector (i)")
+                    .clicked()
+                {
+                    self.settings.panels.inspector_collapsed =
+                        !self.settings.panels.inspector_collapsed;
+                }
+                if self.model.view() == View::Timeline
+                    && ui
+                        .selectable_label(!self.settings.panels.facets_collapsed, "facets")
+                        .on_hover_text("toggle facets (f)")
+                        .clicked()
+                {
+                    self.settings.panels.facets_collapsed = !self.settings.panels.facets_collapsed;
+                }
             });
         });
     }
@@ -342,68 +918,17 @@ impl Shell {
     }
 
     fn scope_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            let chips = self.model.scope.chips();
-            if chips.is_empty() {
-                ui.label(egui::RichText::new("everything in the case").weak());
-            }
-            for chip in &chips {
-                egui::Frame::group(ui.style())
-                    .corner_radius(egui::CornerRadius::same(6))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(&chip.label);
-                            if ui.small_button("×").on_hover_text("remove").clicked() {
-                                self.apply(Action::Scope(ScopeAction::Remove(chip.remove.clone())));
-                            }
-                        });
-                    });
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let scope_empty = self.model.scope.is_empty();
-                if ui
-                    .add_enabled(!scope_empty, egui::Button::new("clear"))
-                    .on_hover_text("clear the scope (Ctrl+Shift+Backspace)")
-                    .clicked()
-                {
-                    self.apply(Action::Scope(ScopeAction::Clear));
-                }
-                if ui
-                    .button("copy CLI")
-                    .on_hover_text("copy the scope as a footprint command (Ctrl+Shift+C)")
-                    .clicked()
-                {
-                    ui.ctx().copy_text(self.model.scope.to_cli());
-                }
-                if ui
-                    .add_enabled(self.model.scope.can_redo(), egui::Button::new("redo"))
-                    .on_hover_text("Ctrl+Y")
-                    .clicked()
-                {
-                    self.apply(Action::RedoScope);
-                }
-                if ui
-                    .add_enabled(self.model.scope.can_undo(), egui::Button::new("undo"))
-                    .on_hover_text("Ctrl+Z")
-                    .clicked()
-                {
-                    self.apply(Action::UndoScope);
-                }
-                match self.model.counts.value() {
-                    Some(counts) => {
-                        ui.label(format!(
-                            "{} / {}",
-                            thousands(counts.in_scope),
-                            thousands(counts.in_case)
-                        ));
-                    }
-                    None => {
-                        ui.label(egui::RichText::new("— / —").weak());
-                    }
-                }
-            });
-        });
+        let counts = self.model.counts.value().map(|c| (c.in_scope, c.in_case));
+        let mut actions = Vec::new();
+        show_scope_bar(
+            ui,
+            &self.model.scope,
+            counts,
+            self.tz,
+            &mut self.chip_editor,
+            &mut actions,
+        );
+        self.apply_all(actions);
     }
 
     fn banners(&mut self, ui: &mut egui::Ui) {
@@ -423,7 +948,7 @@ impl Shell {
                 ui.colored_label(ui.visuals().warn_fg_color, "case changed (new run)");
                 if ui.button("Refresh").clicked() {
                     self.apply(Action::RefreshCase);
-                    self.submitted = None;
+                    self.reset_submission_markers();
                 }
             } else if let Some(error) = self.fresh_error() {
                 ui.colored_label(ui.visuals().error_fg_color, error);
@@ -446,7 +971,7 @@ impl Shell {
                 return Some(message);
             }
         }
-        None
+        self.model.seek_error.clone()
     }
 
     fn has_banners(&self) -> bool {
@@ -547,6 +1072,25 @@ impl Shell {
         }
         match self.model.view() {
             View::Dashboard => self.dashboard(ui),
+            View::Timeline => {
+                let theme = self.active_theme();
+                let ctx = crate::widgets::ViewCtx {
+                    model: &self.model,
+                    theme: &theme,
+                    tz: self.tz,
+                };
+                let mut actions = Vec::new();
+                crate::views::timeline::show_timeline(
+                    ui,
+                    &ctx,
+                    &mut self.cache,
+                    &mut self.settings,
+                    &mut self.strip_state,
+                    &mut self.table_state,
+                    &mut actions,
+                );
+                self.apply_all(actions);
+            }
             view => {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
@@ -558,53 +1102,7 @@ impl Shell {
         }
     }
 
-    fn dashboard(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(24.0);
-            ui.heading(self.model.view().label());
-            ui.add_space(8.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_min_width(420.0);
-                let row = |ui: &mut egui::Ui, key: &str, value: String| {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Label::new(key).truncate());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.monospace(value);
-                        });
-                    });
-                };
-                row(ui, "case", self.case.display().to_string());
-                if let Ok(meta) = std::fs::metadata(&self.case) {
-                    row(ui, "size", bytes(meta.len()));
-                }
-                match self.model.bounds.status(self.model.generation) {
-                    LoadStatus::Ready => {
-                        if let Some(Some((first, last))) = self.model.bounds.value() {
-                            let fmt = |ts: i64| {
-                                fp_query::format_time(ts, "exact", self.tz, "%Y-%m-%d %H:%M")
-                            };
-                            row(ui, "timespan", format!("{} → {}", fmt(*first), fmt(*last)));
-                        } else {
-                            row(ui, "timespan", "no timed events".to_string());
-                        }
-                    }
-                    _ => {
-                        row(ui, "timespan", "…".to_string());
-                    }
-                }
-                if let Some(counts) = self.model.counts.value() {
-                    row(ui, "events in case", thousands(counts.in_case));
-                    if counts.in_scope != counts.in_case {
-                        row(ui, "events in scope", thousands(counts.in_scope));
-                    }
-                }
-            });
-        });
-    }
-}
-
-impl eframe::App for Shell {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    pub fn show_ui(&mut self, ui: &mut egui::Ui) {
         self.drain_worker();
         if let Some(error) = self.startup_error.clone() {
             ui.centered_and_justified(|ui| {
@@ -632,7 +1130,100 @@ impl eframe::App for Shell {
             .resizable(false)
             .default_size(96.0)
             .show(ui, |ui| self.rail(ui));
+
+        let show_facets_panel = self.model.view() == View::Timeline
+            && !self.settings.panels.facets_collapsed
+            && !self.case_missing;
+        if show_facets_panel {
+            let theme = self.active_theme();
+            let resp = egui::Panel::left("facets")
+                .resizable(true)
+                .default_size(self.settings.panels.facets_width)
+                .min_size(160.0)
+                .max_size(420.0)
+                .show(ui, |ui| {
+                    let mut actions = Vec::new();
+                    show_facets(
+                        ui,
+                        &self.model,
+                        &theme,
+                        &mut self.facets_state,
+                        &mut actions,
+                    );
+                    actions
+                });
+            self.settings.panels.facets_width = resp.response.rect.width();
+            self.apply_all(resp.inner);
+        }
+
+        if !self.settings.panels.inspector_collapsed && !self.case_missing {
+            let theme = self.active_theme();
+            let resp = egui::Panel::right("inspector")
+                .resizable(true)
+                .default_size(self.settings.panels.inspector_width)
+                .min_size(240.0)
+                .max_size(560.0)
+                .show(ui, |ui| {
+                    let mut actions = Vec::new();
+                    show_inspector(ui, &self.model, &theme, self.tz, &mut actions);
+                    actions
+                });
+            self.settings.panels.inspector_width = resp.response.rect.width();
+            self.apply_all(resp.inner);
+        }
+
         egui::CentralPanel::default().show(ui, |ui| self.main(ui));
+        self.ensure_requests();
+    }
+
+    fn dashboard(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(24.0);
+            ui.heading(self.model.view().label());
+            ui.add_space(8.0);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(420.0);
+                let row = |ui: &mut egui::Ui, key: &str, value: String| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(key).truncate());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.monospace(value);
+                        });
+                    });
+                };
+                row(ui, "case", self.case.display().to_string());
+                if let Ok(meta) = std::fs::metadata(&self.case) {
+                    row(ui, "size", bytes(meta.len()));
+                }
+                match self.model.bounds.status(self.model.generation) {
+                    LoadStatus::Ready => {
+                        if let Some(Some((first, last))) = self.model.bounds.value() {
+                            let fmt = |ts: i64| {
+                                fp_query::format_time(ts, "exact", self.tz, "%Y-%m-%d %H:%M")
+                            };
+                            row(ui, "timespan", format!("{} -> {}", fmt(*first), fmt(*last)));
+                        } else {
+                            row(ui, "timespan", "no timed events".to_string());
+                        }
+                    }
+                    _ => {
+                        row(ui, "timespan", "…".to_string());
+                    }
+                }
+                if let Some(counts) = self.model.counts.value() {
+                    row(ui, "events in case", thousands(counts.in_case));
+                    if counts.in_scope != counts.in_case {
+                        row(ui, "events in scope", thousands(counts.in_scope));
+                    }
+                }
+            });
+        });
+    }
+}
+
+impl eframe::App for Shell {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show_ui(ui);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

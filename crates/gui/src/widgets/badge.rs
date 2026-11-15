@@ -13,6 +13,16 @@ pub enum ConfidenceGlyph {
     Heuristic,
 }
 
+impl From<fp_core::Confidence> for ConfidenceGlyph {
+    fn from(c: fp_core::Confidence) -> Self {
+        match c {
+            fp_core::Confidence::Direct => Self::Direct,
+            fp_core::Confidence::Derived => Self::Derived,
+            fp_core::Confidence::Heuristic => Self::Heuristic,
+        }
+    }
+}
+
 /// Fixed-vocabulary verdicts and flags, each with its own shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusGlyph {
