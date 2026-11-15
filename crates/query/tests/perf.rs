@@ -102,3 +102,27 @@ fn budgets_at_1m_events() {
         ],
     );
 }
+
+#[test]
+#[ignore = "perf budgets: run explicitly in release"]
+fn budgets_at_5m_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("case.db");
+    bulk_case(&db, 5_000_000, 90, 7).unwrap();
+    check_budgets(
+        &db,
+        [
+            ("count", 1_500),
+            ("page", 150),
+            ("facet", 3_000),
+            ("histogram", 3_000),
+        ],
+    );
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("VmHWM:") || line.starts_with("VmRSS:") {
+                println!("{line}");
+            }
+        }
+    }
+}

@@ -164,25 +164,50 @@ pub fn histogram(
 
     let mut outside_window = None;
     let mut overflow = false;
-    store.visit_timed_events(
-        &EventFilter::from(filter),
-        window.start_utc,
-        window.end_utc,
-        |ts, kind| {
-            if let Some(bucket) = bucket_index(ts, window.start_utc, bucket_width_us, buckets.len())
-                .and_then(|index| buckets.get_mut(index))
-            {
-                let count = &mut bucket.counts[category(kind) as usize];
-                if let Some(next) = count.checked_add(1) {
-                    *count = next;
+    let span_delta = i128::from(window.end_utc) - i128::from(window.start_utc);
+    if span_delta <= i128::from(i64::MAX)
+        && let Ok(width_i64) = i64::try_from(bucket_width_us)
+    {
+        store.visit_histogram_buckets(
+            &EventFilter::from(filter),
+            window.start_utc,
+            window.end_utc,
+            width_i64,
+            |idx, kind, count| {
+                if let Some(bucket) = buckets.get_mut(idx) {
+                    let slot = &mut bucket.counts[category(kind) as usize];
+                    if let Some(next) = slot.checked_add(count) {
+                        *slot = next;
+                    } else {
+                        overflow = true;
+                    }
                 } else {
-                    overflow = true;
+                    outside_window = Some(window.end_utc);
                 }
-            } else {
-                outside_window = Some(ts);
-            }
-        },
-    )?;
+            },
+        )?;
+    } else {
+        store.visit_timed_events(
+            &EventFilter::from(filter),
+            window.start_utc,
+            window.end_utc,
+            |ts, kind| {
+                if let Some(bucket) =
+                    bucket_index(ts, window.start_utc, bucket_width_us, buckets.len())
+                        .and_then(|index| buckets.get_mut(index))
+                {
+                    let count = &mut bucket.counts[category(kind) as usize];
+                    if let Some(next) = count.checked_add(1) {
+                        *count = next;
+                    } else {
+                        overflow = true;
+                    }
+                } else {
+                    outside_window = Some(ts);
+                }
+            },
+        )?;
+    }
     if let Some(ts) = outside_window {
         return Err(OverviewError::EventOutsideWindow(ts));
     }

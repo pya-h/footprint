@@ -414,7 +414,94 @@ impl Store {
         end: i64,
         mut visit: impl FnMut(i64, &str),
     ) -> Result<(), StoreError> {
-        self.visit_timed_events_with_source(filter, start, end, |ts, kind, _| visit(ts, kind))
+        if start > end {
+            return Err(StoreError::InvalidTimeRange { start, end });
+        }
+        let (conditions, mut args) = Self::events_where(filter)?;
+        let ts_pred = Self::timed_range_predicate(filter);
+        let sql = format!(
+            "SELECT e.ts_utc, e.kind
+             FROM events e
+             JOIN sources s ON s.id = e.source_id{conditions}{ts_pred}"
+        );
+        args.extend([start.into(), end.into()]);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(args))?;
+        while let Some(row) = rows.next()? {
+            let ts = row.get(0)?;
+            let kind = col_str(row, 1)?;
+            visit(ts, kind);
+        }
+        Ok(())
+    }
+
+    /// Aggregates scoped timed events directly in SQL into `(bucket_idx, kind, count)` tuples
+    /// anchored at `start`, avoiding per-row FFI hops when `end - start` and `width_us` fit `i64`.
+    pub fn visit_histogram_buckets(
+        &self,
+        filter: &EventFilter,
+        start: i64,
+        end: i64,
+        width_us: i64,
+        mut visit: impl FnMut(usize, &str, u64),
+    ) -> Result<(), StoreError> {
+        if start > end {
+            return Err(StoreError::InvalidTimeRange { start, end });
+        }
+        let (conditions, mut args) = Self::events_where(filter)?;
+        let ts_pred = Self::timed_range_predicate(filter);
+        let sql = format!(
+            "SELECT (e.ts_utc - ?) / ? AS b, e.kind, COUNT(*)
+             FROM events e
+             JOIN sources s ON s.id = e.source_id{conditions}{ts_pred}
+             GROUP BY b, e.kind"
+        );
+        let mut all_args: Vec<Value> = Vec::with_capacity(args.len() + 4);
+        all_args.push(start.into());
+        all_args.push(width_us.into());
+        all_args.append(&mut args);
+        all_args.push(start.into());
+        all_args.push(end.into());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(params_from_iter(all_args))?;
+        while let Some(row) = rows.next()? {
+            let bucket: i64 = row.get(0)?;
+            let kind = col_str(row, 1)?;
+            let count: u64 = row.get(2)?;
+            if let Ok(idx) = usize::try_from(bucket) {
+                visit(idx, kind, count);
+            }
+        }
+        Ok(())
+    }
+
+    fn has_selective_predicate(filter: &EventFilter) -> bool {
+        filter.since.is_some()
+            || filter.until.is_some()
+            || !filter.hosts.is_empty()
+            || !filter.kinds.is_empty()
+            || !filter.sources.is_empty()
+            || filter.run_id.is_some()
+            || filter.ioc_only
+            || filter.match_text.is_some()
+    }
+
+    fn timed_range_predicate(filter: &EventFilter) -> &'static str {
+        if Self::has_selective_predicate(filter) {
+            " AND e.ts_precision != 'order_only' AND e.ts_utc >= ? AND e.ts_utc <= ?"
+        } else {
+            // sequential heap scans outperform random heap lookups through the non-covering `ev_ts` index
+            " AND e.ts_precision != 'order_only' AND +e.ts_utc >= ? AND +e.ts_utc <= ?"
+        }
+    }
+
+    fn group_expression(key: &str, indexed: bool, filter: &EventFilter) -> String {
+        if indexed && !Self::has_selective_predicate(filter) {
+            // unary `+` stops SQLite from walking `ev_host`/`ev_kind` with 1M random heap lookups
+            format!("+{key}")
+        } else {
+            key.to_string()
+        }
     }
 
     /// Visits scoped timed events `(ts_utc, kind, source_identity)` in an inclusive UTC
@@ -430,25 +517,19 @@ impl Store {
             return Err(StoreError::InvalidTimeRange { start, end });
         }
         let (conditions, mut args) = Self::events_where(filter)?;
+        let ts_pred = Self::timed_range_predicate(filter);
         let sql = format!(
             "SELECT e.ts_utc, e.kind, COALESCE(s.app || '/' || s.profile, s.app, s.kind) AS src
              FROM events e
-             JOIN sources s ON s.id = e.source_id{conditions}
-             AND e.ts_precision != 'order_only' AND e.ts_utc >= ? AND e.ts_utc <= ?"
+             JOIN sources s ON s.id = e.source_id{conditions}{ts_pred}"
         );
         args.extend([start.into(), end.into()]);
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params_from_iter(args))?;
         while let Some(row) = rows.next()? {
             let ts = row.get(0)?;
-            let kind_val = row.get_ref(1)?;
-            let kind = kind_val.as_str().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(1, kind_val.data_type(), Box::new(error))
-            })?;
-            let src_val = row.get_ref(2)?;
-            let src = src_val.as_str().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(2, src_val.data_type(), Box::new(error))
-            })?;
+            let kind = col_str(row, 1)?;
+            let src = col_str(row, 2)?;
             visit(ts, kind, src);
         }
         Ok(())
@@ -463,9 +544,13 @@ impl Store {
     ) -> Result<FacetPage, StoreError> {
         let limit = i64::try_from(limit).map_err(|_| StoreError::InvalidLimit(limit))?;
         let (conditions, mut args) = Self::events_where(filter)?;
-        let key = field.expression();
+        let group_expr = Self::group_expression(
+            field.expression(),
+            matches!(field, FacetField::Host | FacetField::Kind),
+            filter,
+        );
         let sql = format!(
-            "SELECT {key} AS k, COUNT(*) AS n, COUNT(*) OVER () FROM events e
+            "SELECT {group_expr} AS k, COUNT(*) AS n, COUNT(*) OVER () FROM events e
              JOIN sources s ON s.id = e.source_id{conditions}
              GROUP BY k ORDER BY n DESC, k LIMIT ?"
         );
@@ -496,10 +581,14 @@ impl Store {
             .map(|n| i64::try_from(n).map_err(|_| StoreError::InvalidLimit(n)))
             .transpose()?;
         let (conditions, mut args) = Self::events_where(filter)?;
-        let key = field.expression();
+        let group_expr = Self::group_expression(
+            field.expression(),
+            matches!(field, GroupField::Host | GroupField::Kind),
+            filter,
+        );
         let bound = if limit.is_some() { " LIMIT ?" } else { "" };
         let sql = format!(
-            "SELECT {key} AS k, COUNT(*) AS n,
+            "SELECT {group_expr} AS k, COUNT(*) AS n,
                     MIN(CASE WHEN e.ts_precision != 'order_only' THEN e.ts_utc END),
                     MAX(CASE WHEN e.ts_precision != 'order_only' THEN e.ts_utc END)
              FROM events e JOIN sources s ON s.id = e.source_id{conditions}
@@ -1126,6 +1215,13 @@ fn kind_pattern(kind: &str) -> String {
         Some(prefix) => format!("{}%", escape_like(prefix)),
         None => escape_like(kind),
     }
+}
+
+fn col_str<'r>(row: &'r Row<'_>, idx: usize) -> rusqlite::Result<&'r str> {
+    let val = row.get_ref(idx)?;
+    val.as_str().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(idx, val.data_type(), Box::new(error))
+    })
 }
 
 fn escape_like(s: &str) -> String {
