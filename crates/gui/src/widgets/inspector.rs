@@ -64,10 +64,7 @@ pub fn show_inspector(
             show_event_inspector(ui, id, model, theme, tz, actions);
         }
         Selection::State(id) => {
-            ui.label(format!("State record #{id}"));
-            ui.label(
-                egui::RichText::new("full state inspector arrives with State & Diff view").weak(),
-            );
+            show_state_inspector(ui, id, model, theme);
         }
         Selection::Ioc(id) => {
             ui.label(format!("IOC hit #{id}"));
@@ -254,6 +251,56 @@ fn show_event_inspector(
                 }
             });
         });
+}
+
+fn show_state_inspector(ui: &mut egui::Ui, rowid: i64, model: &Model, theme: &Theme) {
+    let Some(row) = model
+        .states
+        .value()
+        .and_then(|rows| rows.iter().find(|r| r.rowid == rowid))
+    else {
+        ui.label(egui::RichText::new("state record not in the current query").weak());
+        return;
+    };
+    ui.label(
+        egui::RichText::new(format!("{}  ·  run {}", row.kind.as_str(), row.run_id))
+            .small()
+            .color(theme.text_dim),
+    );
+    ui.label(egui::RichText::new(row.key.as_str()).monospace().strong());
+    if let Some(locator) = &row.locator {
+        ui.label(
+            egui::RichText::new(format!("source: {}", locator.as_str()))
+                .small()
+                .weak(),
+        );
+    }
+    if !row.flags.is_empty() {
+        ui.add_space(4.0);
+        let words: Vec<&str> = row.flags.iter().map(|f| f.as_str()).collect();
+        ui.label(
+            egui::RichText::new(format!("flags: [{}]", words.join(", ")))
+                .small()
+                .color(theme.warn),
+        );
+    }
+    let explanations = crate::views::state::explain_row(row);
+    if !explanations.is_empty() {
+        ui.add_space(2.0);
+        for line in &explanations {
+            ui.label(egui::RichText::new(line).small().weak());
+        }
+    }
+    ui.separator();
+    match &row.value {
+        crate::vm::SafeJson::Null => {
+            ui.label(egui::RichText::new("value did not parse as JSON; raw:").weak());
+            ui.monospace(row.raw.as_str());
+        }
+        value => {
+            show_json_tree(ui, "state_value", value, theme);
+        }
+    }
 }
 
 fn show_bidi_warning(ui: &mut egui::Ui, detail: &DetailVm, theme: &Theme) {

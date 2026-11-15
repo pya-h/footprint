@@ -168,6 +168,18 @@ pub enum Action {
         generation: Generation,
         result: Result<crate::vm::TraceVm, String>,
     },
+    /// the state view wants its rows re-queried (params live in the shell's view state)
+    RequestStateQuery,
+    States {
+        generation: Generation,
+        result: Result<Vec<crate::vm::StateRowVm>, String>,
+    },
+    /// pick the two runs the diff view compares
+    SetDiffRuns(u64, u64),
+    Diff {
+        generation: Generation,
+        result: Result<Vec<crate::vm::DiffEntryVm>, String>,
+    },
 }
 
 /// Consecutive `data_version` samples of the case file, from which the shell derives
@@ -257,6 +269,12 @@ pub struct Model {
     pub trace_gen: Generation,
     /// the trace target currently shown (path, URL, or event id); also the pending request
     pub pending_trace: Option<String>,
+    pub states: Slot<Vec<crate::vm::StateRowVm>>,
+    pub states_gen: Generation,
+    pub diff: Slot<Vec<crate::vm::DiffEntryVm>>,
+    pub diff_gen: Generation,
+    /// the two runs the diff view compares; `None` until the view picks a default
+    pub pending_diff: Option<(u64, u64)>,
 }
 
 impl Model {
@@ -518,6 +536,21 @@ impl Model {
             }
             Action::Trace { generation, result } => {
                 self.trace.absorb(generation, self.trace_gen, result);
+            }
+            Action::RequestStateQuery => {
+                self.states_gen += 1;
+            }
+            Action::States { generation, result } => {
+                self.states.absorb(generation, self.states_gen, result);
+            }
+            Action::SetDiffRuns(a, b) => {
+                if self.pending_diff != Some((a, b)) {
+                    self.pending_diff = Some((a, b));
+                    self.diff_gen += 1;
+                }
+            }
+            Action::Diff { generation, result } => {
+                self.diff.absorb(generation, self.diff_gen, result);
             }
             Action::DashboardSummary { generation, result } => {
                 self.dashboard_summary

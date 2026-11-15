@@ -13,12 +13,14 @@ use crate::model::{Action, Counts, LoadStatus, Model, ScopeAction, Selection, Vi
 use crate::settings::Settings;
 use crate::theme::{Theme, ThemeName};
 use crate::views::dashboard::{DashboardState, show_dashboard};
+use crate::views::diff::{DiffViewState, show_diff};
 use crate::views::hosts::{HOSTS_CAP, HostsState, show_hosts};
 use crate::views::lanes::{LanesState, show_lanes};
+use crate::views::state::{StateViewState, show_state};
 use crate::views::trace::{TraceState, show_trace};
 use crate::vm::{
-    DashboardSummaryVm, DetailVm, GroupRowVm, HostSummaryVm, LaneRowDensityVm, LanesDataVm, RowVm,
-    RunMarkerVm, SafeText, SourceIssueVm, TraceVm, UntimedLaneVm,
+    DashboardSummaryVm, DetailVm, DiffEntryVm, GroupRowVm, HostSummaryVm, LaneRowDensityVm,
+    LanesDataVm, RowVm, RunMarkerVm, SafeText, SourceIssueVm, StateRowVm, TraceVm, UntimedLaneVm,
 };
 use crate::widgets::chip::{ChipEditorState, show_scope_bar, thousands};
 use crate::widgets::event_table::TableState;
@@ -52,6 +54,8 @@ pub struct Shell {
     submitted_hosts: Option<(Generation, Generation, String)>,
     submitted_lanes: Option<(Generation, Generation, usize)>,
     submitted_trace: Option<(String, Generation)>,
+    submitted_states: Option<(Generation, Option<u64>, String)>,
+    submitted_diff: Option<(u64, u64, Generation)>,
     outstanding: HashSet<u64>,
     cache: BlockCache,
     chip_editor: ChipEditorState,
@@ -62,6 +66,8 @@ pub struct Shell {
     hosts_state: HostsState,
     lanes_state: LanesState,
     trace_state: TraceState,
+    state_state: StateViewState,
+    diff_state: DiffViewState,
     focus_search_next: bool,
 }
 
@@ -197,6 +203,10 @@ impl Shell {
             hosts_state: HostsState::default(),
             lanes_state: LanesState::default(),
             trace_state: TraceState::default(),
+            state_state: StateViewState::default(),
+            diff_state: DiffViewState::default(),
+            submitted_states: None,
+            submitted_diff: None,
             focus_search_next: false,
         }
     }
@@ -458,6 +468,20 @@ impl Shell {
                         result,
                     });
                 }
+                ReqKind::State => {
+                    let result = downcast::<Vec<StateRowVm>>(resp.result, "state");
+                    self.apply(Action::States {
+                        generation: resp.generation,
+                        result,
+                    });
+                }
+                ReqKind::Diff => {
+                    let result = downcast::<Vec<DiffEntryVm>>(resp.result, "diff");
+                    self.apply(Action::Diff {
+                        generation: resp.generation,
+                        result,
+                    });
+                }
                 _ => {}
             }
         }
@@ -478,6 +502,8 @@ impl Shell {
         self.submitted_hosts = None;
         self.submitted_lanes = None;
         self.submitted_trace = None;
+        self.submitted_states = None;
+        self.submitted_diff = None;
     }
 
     fn ensure_requests(&mut self) {
@@ -616,6 +642,42 @@ impl Shell {
                             Ok(Box::new(data))
                         },
                     );
+                    self.outstanding.insert(id);
+                }
+            }
+            View::State => {
+                let run = self.state_state.run;
+                let search = self.state_state.submitted_search.clone();
+                let states_gen = self.model.states_gen;
+                let key = (states_gen, run, search.clone());
+                if self.submitted_states.as_ref() != Some(&key) {
+                    self.submitted_states = Some(key);
+                    let id = worker.submit(ReqKind::State, None, states_gen, move |store| {
+                        let run_id = match run {
+                            Some(id) => id,
+                            None => store.last_run_id()?.unwrap_or(0),
+                        };
+                        let match_text = (!search.is_empty()).then_some(search.as_str());
+                        let rows = fp_query::state_records(store, Some(run_id), None, match_text)?;
+                        let vms: Vec<StateRowVm> = rows.iter().map(StateRowVm::from_view).collect();
+                        Ok(Box::new(vms))
+                    });
+                    self.outstanding.insert(id);
+                }
+            }
+            View::Diff => {
+                let Some((a, b)) = self.model.pending_diff else {
+                    return;
+                };
+                let diff_gen = self.model.diff_gen;
+                if self.submitted_diff != Some((a, b, diff_gen)) {
+                    self.submitted_diff = Some((a, b, diff_gen));
+                    let id = worker.submit(ReqKind::Diff, None, diff_gen, move |store| {
+                        let entries = fp_query::diff_runs(store, a, b)?;
+                        let vms: Vec<DiffEntryVm> =
+                            entries.iter().map(DiffEntryVm::from_entry).collect();
+                        Ok(Box::new(vms))
+                    });
                     self.outstanding.insert(id);
                 }
             }
@@ -1345,6 +1407,28 @@ impl Shell {
                 };
                 let mut actions = Vec::new();
                 show_trace(ui, &ctx, &mut self.trace_state, &mut actions);
+                self.apply_all(actions);
+            }
+            View::State => {
+                let theme = self.active_theme();
+                let ctx = crate::widgets::ViewCtx {
+                    model: &self.model,
+                    theme: &theme,
+                    tz: self.tz,
+                };
+                let mut actions = Vec::new();
+                show_state(ui, &ctx, &mut self.state_state, &mut actions);
+                self.apply_all(actions);
+            }
+            View::Diff => {
+                let theme = self.active_theme();
+                let ctx = crate::widgets::ViewCtx {
+                    model: &self.model,
+                    theme: &theme,
+                    tz: self.tz,
+                };
+                let mut actions = Vec::new();
+                show_diff(ui, &ctx, &mut self.diff_state, &mut actions);
                 self.apply_all(actions);
             }
             view => {

@@ -538,6 +538,104 @@ pub struct TraceVm {
     pub rows: Vec<TraceRowVm>,
 }
 
+#[derive(Debug, Clone)]
+pub struct StateRowVm {
+    pub rowid: i64,
+    pub run_id: u64,
+    pub kind: SafeText,
+    pub key: SafeText,
+    /// parsed value; `Null` when the stored JSON could not be parsed
+    pub value: SafeJson,
+    /// the raw value_json for unparsed rows
+    pub raw: SafeText,
+    /// one-line `state_details` strings, sanitized
+    pub details: Vec<String>,
+    pub flags: Vec<SafeText>,
+    pub integrity: Option<SafeText>,
+    pub locator: Option<SafeText>,
+}
+
+impl StateRowVm {
+    pub fn from_view(row: &fp_query::StateView) -> Self {
+        let parsed = row.parsed.as_ref();
+        let flags = parsed
+            .and_then(|v| v.get("flags"))
+            .and_then(|f| f.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str())
+                    .map(SafeText::new)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let integrity = parsed
+            .and_then(|v| v.get("integrity"))
+            .and_then(|i| i.as_str())
+            .map(SafeText::new);
+        Self {
+            rowid: row.rowid,
+            run_id: row.run_id,
+            kind: SafeText::new(&row.kind),
+            key: SafeText::new(&row.key),
+            value: SafeJson::from_value(parsed.unwrap_or(&serde_json::Value::Null)),
+            raw: SafeText::new(&row.value_json),
+            details: fp_query::state_details(parsed)
+                .into_iter()
+                .map(|d| fp_render::sanitize(&d))
+                .collect(),
+            flags,
+            integrity,
+            locator: row.locator.as_deref().map(SafeText::new),
+        }
+    }
+}
+
+/// Plain-language explanation for a state flag or integrity verdict; `None` for
+/// vocabulary the GUI does not know, so the caller shows the raw word alone.
+pub fn state_flag_help(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "unowned" => "no installed package claims this file",
+        "hash_mismatch" => "the file differs from the package's recorded hash",
+        "mismatch" => "the file differs from the package's recorded hash",
+        "missing" => "the package lists this file but it is gone",
+        "unverified" => "ownership is unknown or the hash was not checked",
+        "mtime_in_window" => "the file was modified inside the collected window",
+        "world_writable_path" => "a $PATH entry can be written by anyone",
+        "uid0_non_root" => "a non-root account has uid 0",
+        "unowned_module" => "a loaded kernel module has no owning package",
+        "deleted_binary" => "the process binary was deleted after it started",
+        "exec_in_hidden_dir" => "the process ran from a hidden directory",
+        "exec_in_tmp" => "the process ran from a temporary directory",
+        "listening" => "something is listening on this socket",
+        "tainted" => "the kernel reports a taint flag",
+        "firewall_disabled" => "the host firewall is off",
+        _ => return None,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct DiffEntryVm {
+    pub change: fp_query::DiffChange,
+    pub kind: SafeText,
+    pub key: SafeText,
+    pub detail: SafeText,
+    pub run_a: Option<SafeJson>,
+    pub run_b: Option<SafeJson>,
+}
+
+impl DiffEntryVm {
+    pub fn from_entry(entry: &fp_query::DiffEntry) -> Self {
+        Self {
+            change: entry.change,
+            kind: SafeText::new(&entry.kind),
+            key: SafeText::new(&entry.key),
+            detail: SafeText::new(&entry.detail),
+            run_a: entry.run_a.as_ref().map(SafeJson::from_value),
+            run_b: entry.run_b.as_ref().map(SafeJson::from_value),
+        }
+    }
+}
+
 impl TraceVm {
     pub fn from_tree(tree: &fp_correlate::trace::TraceTree) -> Self {
         use fp_correlate::trace::TraceHead;
