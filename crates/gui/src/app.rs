@@ -1847,7 +1847,7 @@ impl Shell {
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("rail")
             .resizable(false)
-            .default_size(96.0)
+            .default_size(112.0)
             .show(ui, |ui| self.rail(ui));
 
         let show_facets_panel = self.model.view() == View::Timeline

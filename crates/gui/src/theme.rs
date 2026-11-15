@@ -210,11 +210,15 @@ impl Theme {
             noninteractive: widget(self.bg1, self.text),
             inactive: widget(self.bg2, self.text),
             hovered: widget(self.bg2, self.text),
-            active: widget(self.accent, self.bg0),
+            active: WidgetVisuals {
+                bg_stroke: Stroke::new(2.0, self.accent),
+                ..widget(self.bg2, self.text)
+            },
             open: widget(self.bg2, self.text),
         };
         visuals.selection.bg_fill = self.accent;
-        visuals.selection.stroke = Stroke::new(2.0, self.accent);
+        // egui paints selected buttons and table rows using selection.stroke as text color
+        visuals.selection.stroke = Stroke::new(1.0, self.bg0);
         visuals.hyperlink_color = self.accent;
         visuals
     }
@@ -306,6 +310,22 @@ mod tests {
                     );
                 }
             }
+            let visuals = theme.visuals();
+            let strong_fg = visuals.strong_text_color();
+            for (bg_name, bg) in bgs {
+                let ratio = contrast(strong_fg, bg);
+                assert!(
+                    ratio >= MIN_CONTRAST,
+                    "{:?} strong_text_color on {bg_name}: {ratio:.2} < {MIN_CONTRAST}",
+                    theme.name
+                );
+            }
+            let sel_ratio = contrast(visuals.selection.stroke.color, visuals.selection.bg_fill);
+            assert!(
+                sel_ratio >= MIN_CONTRAST,
+                "{:?} selection fg on selection bg: {sel_ratio:.2} < {MIN_CONTRAST}",
+                theme.name
+            );
         }
     }
 
