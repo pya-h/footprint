@@ -100,15 +100,10 @@ fn timestamp_at(start: i64, offset: u128) -> Result<i64, OverviewError> {
     i64::try_from(timestamp).map_err(|_| OverviewError::BucketOverflow)
 }
 
-/// Aggregates scoped timed events into UTC buckets anchored at the window start.
-/// The scope's time bounds are intersected with the window; paging and order are ignored.
-/// Empty windows of data still return zero-filled buckets, and untimed events are excluded.
-pub fn histogram(
-    store: &Store,
-    filter: &TimelineFilter,
+fn prepare_buckets(
     window: TimeWindow,
     width_px: usize,
-) -> Result<Histogram, OverviewError> {
+) -> Result<(u128, Vec<(i64, i64)>), OverviewError> {
     if window.start_utc > window.end_utc {
         return Err(StoreError::InvalidTimeRange {
             start: window.start_utc,
@@ -123,16 +118,49 @@ pub fn histogram(
     if count > MAX_HISTOGRAM_BUCKETS {
         return Err(OverviewError::BucketOverflow);
     }
-    let mut buckets = Vec::with_capacity(count);
+    let mut bounds = Vec::with_capacity(count);
     for index in 0..count {
         let start = index as u128 * bucket_width_us;
         let end = (start + bucket_width_us).min(span) - 1;
-        buckets.push(HistogramBucket {
-            start_utc: timestamp_at(window.start_utc, start)?,
-            end_utc: timestamp_at(window.start_utc, end)?,
-            counts: [0; Category::ALL.len()],
-        });
+        bounds.push((
+            timestamp_at(window.start_utc, start)?,
+            timestamp_at(window.start_utc, end)?,
+        ));
     }
+    Ok((bucket_width_us, bounds))
+}
+
+fn bucket_index(
+    ts: i64,
+    start_utc: i64,
+    bucket_width_us: u128,
+    bucket_len: usize,
+) -> Option<usize> {
+    let offset = i128::from(ts) - i128::from(start_utc);
+    let idx = u128::try_from(offset)
+        .ok()
+        .and_then(|offset| usize::try_from(offset / bucket_width_us).ok())?;
+    (idx < bucket_len).then_some(idx)
+}
+
+/// Aggregates scoped timed events into UTC buckets anchored at the window start.
+/// The scope's time bounds are intersected with the window; paging and order are ignored.
+/// Empty windows of data still return zero-filled buckets, and untimed events are excluded.
+pub fn histogram(
+    store: &Store,
+    filter: &TimelineFilter,
+    window: TimeWindow,
+    width_px: usize,
+) -> Result<Histogram, OverviewError> {
+    let (bucket_width_us, bounds) = prepare_buckets(window, width_px)?;
+    let mut buckets: Vec<HistogramBucket> = bounds
+        .into_iter()
+        .map(|(start_utc, end_utc)| HistogramBucket {
+            start_utc,
+            end_utc,
+            counts: [0; Category::ALL.len()],
+        })
+        .collect();
 
     let mut outside_window = None;
     let mut overflow = false;
@@ -141,11 +169,9 @@ pub fn histogram(
         window.start_utc,
         window.end_utc,
         |ts, kind| {
-            let offset = i128::from(ts) - i128::from(window.start_utc);
-            let index = u128::try_from(offset)
-                .ok()
-                .and_then(|offset| usize::try_from(offset / bucket_width_us).ok());
-            if let Some(bucket) = index.and_then(|index| buckets.get_mut(index)) {
+            if let Some(bucket) = bucket_index(ts, window.start_utc, bucket_width_us, buckets.len())
+                .and_then(|index| buckets.get_mut(index))
+            {
                 let count = &mut bucket.counts[category(kind) as usize];
                 if let Some(next) = count.checked_add(1) {
                     *count = next;
@@ -393,4 +419,181 @@ pub fn hosts(
         return Err(OverviewError::InvalidLimit(limit));
     }
     Ok(store.host_summaries(&EventFilter::from(filter), sort, limit)?)
+}
+
+/// Host summary enriched with scoped category breakdown, distinct source labels, and
+/// `ioc_match` status for the page's hosts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostOverview {
+    pub summary: HostSummary,
+    pub category_counts: [u64; Category::ALL.len()],
+    pub sources: Vec<String>,
+    pub has_ioc: bool,
+}
+
+pub fn hosts_overview(
+    store: &Store,
+    filter: &TimelineFilter,
+    host_substr: Option<&str>,
+    sort: HostSort,
+    limit: usize,
+) -> Result<Vec<HostOverview>, OverviewError> {
+    if limit == 0 || limit > MAX_FACET_ROWS {
+        return Err(OverviewError::InvalidLimit(limit));
+    }
+    let event_filter = EventFilter::from(filter);
+    let summaries = store.host_summaries_matching(&event_filter, host_substr, sort, limit)?;
+    let host_refs: Vec<&str> = summaries.iter().map(|s| s.host.as_str()).collect();
+    let breakdown = store.host_breakdown(&event_filter, &host_refs)?;
+
+    let mut cats_by_host: HashMap<&str, [u64; Category::ALL.len()]> = HashMap::new();
+    for (host, kind, count) in &breakdown.kind_counts {
+        let entry = cats_by_host
+            .entry(host.as_str())
+            .or_insert([0; Category::ALL.len()]);
+        entry[category(kind) as usize] += count;
+    }
+
+    let mut srcs_by_host: HashMap<&str, Vec<String>> = HashMap::new();
+    for (host, src) in &breakdown.sources {
+        srcs_by_host
+            .entry(host.as_str())
+            .or_default()
+            .push(src.clone());
+    }
+
+    let ioc_set: std::collections::HashSet<&str> =
+        breakdown.ioc_hosts.iter().map(String::as_str).collect();
+
+    Ok(summaries
+        .into_iter()
+        .map(|summary| {
+            let category_counts = cats_by_host
+                .get(summary.host.as_str())
+                .copied()
+                .unwrap_or([0; Category::ALL.len()]);
+            let sources = srcs_by_host
+                .remove(summary.host.as_str())
+                .unwrap_or_default();
+            let has_ioc = ioc_set.contains(summary.host.as_str());
+            HostOverview {
+                summary,
+                category_counts,
+                sources,
+                has_ioc,
+            }
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum LaneMode {
+    #[default]
+    Source,
+    Category,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneHistogramRow {
+    pub label: String,
+    pub total: u64,
+    pub category_hint: Category,
+    pub buckets: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneHistogram {
+    pub mode: LaneMode,
+    pub window: TimeWindow,
+    pub bucket_width_us: u128,
+    pub bucket_bounds: Vec<(i64, i64)>,
+    pub lanes: Vec<LaneHistogramRow>,
+}
+
+/// Aggregates timed events in `window` into per-source or per-category density lanes.
+pub fn lane_histogram(
+    store: &Store,
+    filter: &TimelineFilter,
+    window: TimeWindow,
+    width_px: usize,
+    mode: LaneMode,
+) -> Result<LaneHistogram, OverviewError> {
+    let (bucket_width_us, bucket_bounds) = prepare_buckets(window, width_px)?;
+    let bucket_len = bucket_bounds.len();
+
+    struct Accum {
+        total: u64,
+        cat_counts: [u64; Category::ALL.len()],
+        buckets: Vec<u64>,
+    }
+    let mut by_lane: HashMap<String, Accum> = HashMap::new();
+    let mut outside_window = None;
+    let mut overflow = false;
+
+    store.visit_timed_events_with_source(
+        &EventFilter::from(filter),
+        window.start_utc,
+        window.end_utc,
+        |ts, kind, src| {
+            let Some(idx) = bucket_index(ts, window.start_utc, bucket_width_us, bucket_len) else {
+                outside_window = Some(ts);
+                return;
+            };
+            let cat = category(kind);
+            let lane_key = match mode {
+                LaneMode::Source => src,
+                LaneMode::Category => cat.label(),
+            };
+            let acc = by_lane
+                .entry(lane_key.to_string())
+                .or_insert_with(|| Accum {
+                    total: 0,
+                    cat_counts: [0; Category::ALL.len()],
+                    buckets: vec![0; bucket_len],
+                });
+            if let (Some(nt), Some(nb)) =
+                (acc.total.checked_add(1), acc.buckets[idx].checked_add(1))
+            {
+                acc.total = nt;
+                acc.buckets[idx] = nb;
+                acc.cat_counts[cat as usize] += 1;
+            } else {
+                overflow = true;
+            }
+        },
+    )?;
+
+    if let Some(ts) = outside_window {
+        return Err(OverviewError::EventOutsideWindow(ts));
+    }
+    if overflow {
+        return Err(OverviewError::CountOverflow);
+    }
+
+    let mut lanes: Vec<LaneHistogramRow> = by_lane
+        .into_iter()
+        .map(|(label, acc)| {
+            let dominant_idx = acc
+                .cat_counts
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, c)| *c)
+                .map_or(Category::Other as usize, |(i, _)| i);
+            LaneHistogramRow {
+                label,
+                total: acc.total,
+                category_hint: Category::ALL[dominant_idx],
+                buckets: acc.buckets,
+            }
+        })
+        .collect();
+    lanes.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.label.cmp(&b.label)));
+
+    Ok(LaneHistogram {
+        mode,
+        window,
+        bucket_width_us,
+        bucket_bounds,
+        lanes,
+    })
 }

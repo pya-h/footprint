@@ -654,3 +654,47 @@ fn cancel_collect_stops_the_run_before_the_next_source() {
         summary.errors
     );
 }
+
+#[test]
+fn hosts_overview_and_lane_histogram_work_on_fake_zoom() {
+    let case = setup();
+    let store = fp_store::Store::open(&case.db).unwrap();
+    let scope = fp_query::TimelineFilter::default();
+
+    let rows = fp_query::overview::hosts_overview(
+        &store,
+        &scope,
+        Some("zoom"),
+        fp_query::overview::HostSort::EventsDesc,
+        50,
+    )
+    .unwrap();
+    assert!(!rows.is_empty());
+    assert!(rows.iter().any(|h| h.summary.host == "us09-web-zoom.com"));
+    assert!(rows.iter().all(
+        |h| !h.sources.is_empty() && h.category_counts.iter().sum::<u64>() == h.summary.events
+    ));
+
+    let (start_utc, end_utc) = store.time_bounds().unwrap().unwrap();
+    let window = fp_query::overview::TimeWindow { start_utc, end_utc };
+    let lanes_src = fp_query::overview::lane_histogram(
+        &store,
+        &scope,
+        window,
+        640,
+        fp_query::overview::LaneMode::Source,
+    )
+    .unwrap();
+    let lanes_cat = fp_query::overview::lane_histogram(
+        &store,
+        &scope,
+        window,
+        640,
+        fp_query::overview::LaneMode::Category,
+    )
+    .unwrap();
+    let src_sum: u64 = lanes_src.lanes.iter().map(|l| l.total).sum();
+    let cat_sum: u64 = lanes_cat.lanes.iter().map(|l| l.total).sum();
+    assert_eq!(src_sum, cat_sum);
+    assert!(src_sum > 0);
+}

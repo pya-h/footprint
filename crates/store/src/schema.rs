@@ -414,12 +414,25 @@ impl Store {
         end: i64,
         mut visit: impl FnMut(i64, &str),
     ) -> Result<(), StoreError> {
+        self.visit_timed_events_with_source(filter, start, end, |ts, kind, _| visit(ts, kind))
+    }
+
+    /// Visits scoped timed events `(ts_utc, kind, source_identity)` in an inclusive UTC
+    /// microsecond range without paging, using the same source identity as `FacetField::Source`.
+    pub fn visit_timed_events_with_source(
+        &self,
+        filter: &EventFilter,
+        start: i64,
+        end: i64,
+        mut visit: impl FnMut(i64, &str, &str),
+    ) -> Result<(), StoreError> {
         if start > end {
             return Err(StoreError::InvalidTimeRange { start, end });
         }
         let (conditions, mut args) = Self::events_where(filter)?;
         let sql = format!(
-            "SELECT e.ts_utc, e.kind FROM events e
+            "SELECT e.ts_utc, e.kind, COALESCE(s.app || '/' || s.profile, s.app, s.kind) AS src
+             FROM events e
              JOIN sources s ON s.id = e.source_id{conditions}
              AND e.ts_precision != 'order_only' AND e.ts_utc >= ? AND e.ts_utc <= ?"
         );
@@ -428,11 +441,15 @@ impl Store {
         let mut rows = stmt.query(params_from_iter(args))?;
         while let Some(row) = rows.next()? {
             let ts = row.get(0)?;
-            let value = row.get_ref(1)?;
-            let kind = value.as_str().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(1, value.data_type(), Box::new(error))
+            let kind_val = row.get_ref(1)?;
+            let kind = kind_val.as_str().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(1, kind_val.data_type(), Box::new(error))
             })?;
-            visit(ts, kind);
+            let src_val = row.get_ref(2)?;
+            let src = src_val.as_str().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(2, src_val.data_type(), Box::new(error))
+            })?;
+            visit(ts, kind, src);
         }
         Ok(())
     }
@@ -515,8 +532,25 @@ impl Store {
         sort: HostSort,
         limit: usize,
     ) -> Result<Vec<HostSummary>, StoreError> {
+        self.host_summaries_matching(filter, None, sort, limit)
+    }
+
+    /// Like `host_summaries`, adding an optional case-insensitive substring filter over `subject_host`.
+    pub fn host_summaries_matching(
+        &self,
+        filter: &EventFilter,
+        host_substr: Option<&str>,
+        sort: HostSort,
+        limit: usize,
+    ) -> Result<Vec<HostSummary>, StoreError> {
         let limit = i64::try_from(limit).map_err(|_| StoreError::InvalidLimit(limit))?;
-        let (conditions, mut args) = Self::events_where(filter)?;
+        let (mut conditions, mut args) = Self::events_where(filter)?;
+        if let Some(pat) = host_substr
+            && !pat.trim().is_empty()
+        {
+            conditions.push_str(" AND e.subject_host LIKE ? ESCAPE '\\'");
+            args.push(format!("%{}%", escape_like(pat.trim())).into());
+        }
         let sql = format!(
             "SELECT e.subject_host AS host, COUNT(*) AS events,
                     MIN(CASE WHEN e.ts_precision != 'order_only' THEN e.ts_utc END) AS first_in_scope,
@@ -545,6 +579,65 @@ impl Store {
             .collect::<Result<_, _>>()?;
         self.fill_first_in_case(&mut summaries)?;
         Ok(summaries)
+    }
+
+    /// Kind distribution, source names, and IOC-match status for only the listed hosts.
+    pub fn host_breakdown(
+        &self,
+        filter: &EventFilter,
+        hosts: &[&str],
+    ) -> Result<HostBreakdown, StoreError> {
+        if hosts.is_empty() {
+            return Ok(HostBreakdown::default());
+        }
+        let placeholders = vec!["?"; hosts.len()].join(", ");
+        let (conditions, mut base_args) = Self::events_where(filter)?;
+        base_args.extend(hosts.iter().map(|h| Value::from((*h).to_string())));
+
+        let kind_sql = format!(
+            "SELECT e.subject_host, e.kind, COUNT(*) FROM events e
+             JOIN sources s ON s.id = e.source_id{conditions}
+             AND e.subject_host IN ({placeholders})
+             GROUP BY e.subject_host, e.kind"
+        );
+        let mut stmt = self.conn.prepare(&kind_sql)?;
+        let kind_counts = stmt
+            .query_map(params_from_iter(base_args.clone()), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<(String, String, u64)>, _>>()?;
+
+        let src_sql = format!(
+            "SELECT DISTINCT e.subject_host, COALESCE(s.app || '/' || s.profile, s.app, s.kind)
+             FROM events e
+             JOIN sources s ON s.id = e.source_id{conditions}
+             AND e.subject_host IN ({placeholders})
+             ORDER BY 1, 2"
+        );
+        let mut stmt = self.conn.prepare(&src_sql)?;
+        let sources = stmt
+            .query_map(params_from_iter(base_args), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<Vec<(String, String)>, _>>()?;
+
+        let ioc_sql = format!(
+            "SELECT DISTINCT e.subject_host FROM events e
+             JOIN links l ON l.src_type = 'event' AND l.src_id = e.id
+             WHERE l.rel = 'ioc_match' AND l.dst_type = 'ioc'
+             AND e.subject_host IN ({placeholders})"
+        );
+        let host_args = hosts.iter().map(|h| Value::from((*h).to_string()));
+        let mut stmt = self.conn.prepare(&ioc_sql)?;
+        let ioc_hosts = stmt
+            .query_map(params_from_iter(host_args), |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+
+        Ok(HostBreakdown {
+            kind_counts,
+            sources,
+            ioc_hosts,
+        })
     }
 
     /// Sets `first_in_case` on each summary from one `MIN(ts_utc)` query over the page's hosts.
@@ -1152,9 +1245,10 @@ pub struct GroupCount {
 
 /// Which column orders the hosts returned by `host_summaries`, and in which direction.
 /// Every variant breaks ties by host name so the page is deterministic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HostSort {
     /// Most events first: the lure a host matters by its activity.
+    #[default]
     EventsDesc,
     HostAsc,
     /// Earliest-active host in scope first.
@@ -1188,6 +1282,13 @@ pub struct HostSummary {
     pub first_in_case: Option<i64>,
     pub distinct_kinds: u64,
     pub distinct_sources: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HostBreakdown {
+    pub kind_counts: Vec<(String, String, u64)>,
+    pub sources: Vec<(String, String)>,
+    pub ioc_hosts: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2881,5 +2982,88 @@ mod tests {
             Store::open(&path),
             Err(StoreError::SchemaVersion { found: 0 })
         ));
+    }
+
+    #[test]
+    fn host_breakdown_and_search_work_on_returned_hosts() {
+        let (_dir, mut store) = open_case();
+        let (run_id, source_id) = run(&mut store);
+        let events = vec![
+            event(
+                run_id,
+                source_id,
+                100,
+                EventKind::WebVisit,
+                "https://us09-web-zoom.com/j/1",
+                Some("us09-web-zoom.com"),
+                "visits.id=1",
+            ),
+            event(
+                run_id,
+                source_id,
+                200,
+                EventKind::WebVisit,
+                "https://google.com",
+                Some("google.com"),
+                "visits.id=2",
+            ),
+        ];
+        let stats = store
+            .ingest(
+                run_id,
+                &Batch {
+                    source_identity: "Brave/Default",
+                    events: &events,
+                    states: &[],
+                    artifacts: &[],
+                },
+            )
+            .unwrap();
+        assert_eq!(stats.events_new, 2);
+
+        let ioc_id = store
+            .insert_ioc("domain", "us09-web-zoom.com", None)
+            .unwrap();
+        let zoom_id = store
+            .list_events(&EventFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|r| r.subject_host.as_deref() == Some("us09-web-zoom.com"))
+            .unwrap()
+            .id;
+        store
+            .insert_links(&[Link {
+                src_type: fp_core::LinkType::Event,
+                src_id: zoom_id,
+                rel: "ioc_match".into(),
+                dst_type: fp_core::LinkType::Ioc,
+                dst_id: ioc_id,
+                confidence: Confidence::Direct,
+                why: None,
+            }])
+            .unwrap();
+
+        let filtered = store
+            .host_summaries_matching(
+                &EventFilter::default(),
+                Some("zoom"),
+                HostSort::EventsDesc,
+                50,
+            )
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].host, "us09-web-zoom.com");
+
+        let bd = store
+            .host_breakdown(
+                &EventFilter::default(),
+                &["us09-web-zoom.com", "google.com"],
+            )
+            .unwrap();
+        assert_eq!(bd.ioc_hosts, vec!["us09-web-zoom.com"]);
+        assert!(
+            bd.sources
+                .contains(&("us09-web-zoom.com".into(), "Brave/Default".into()))
+        );
     }
 }
