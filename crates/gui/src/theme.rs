@@ -11,8 +11,10 @@ pub const MIN_CATEGORY_DELTA_E: f64 = 20.0;
 
 pub const CATEGORY_LETTERS: [char; 9] = ['W', 'D', 'P', 'A', 'S', 'F', 'R', 'E', 'O'];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ThemeName {
+    #[default]
     Dark,
     Light,
     HighContrast,

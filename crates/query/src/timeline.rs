@@ -4,7 +4,7 @@ use fp_correlate::match_event_iocs;
 use fp_store::{EventFilter, EventTiming, Store};
 
 /// Everything `list` filters on. Times are unix µs, UTC.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TimelineFilter {
     pub since: Option<i64>,
     pub until: Option<i64>,
