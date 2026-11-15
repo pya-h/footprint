@@ -16,6 +16,7 @@ pub enum ReqKind {
     Count,
     Bounds,
     Page,
+    Seek,
     Histogram,
     Facets,
     Hosts,
@@ -82,6 +83,7 @@ pub struct Resp {
     pub id: ReqId,
     pub generation: Generation,
     pub kind: ReqKind,
+    pub sub: Option<String>,
     pub result: Result<Payload, QueryError>,
 }
 

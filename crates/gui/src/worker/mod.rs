@@ -2,8 +2,10 @@
 //! a latest-wins queue keyed by request kind, and per-kind cancellation through
 //! SQLite interruption. The UI thread only submits closures and polls responses.
 
+pub mod cache;
 mod proto;
 
+pub use cache::BlockCache;
 pub use proto::{Generation, Payload, QueryError, ReqId, ReqKind, Resp, WriterJob};
 
 use std::collections::{HashMap, VecDeque};
@@ -16,9 +18,9 @@ struct State {
     next_id: ReqId,
     quit: bool,
     /// only the newest pending request per (kind, sub) runs; older ones drop here
-    pending: HashMap<(ReqKind, Option<String>), proto::Req>,
+    pending: HashMap<Key, proto::Req>,
     /// (kind, sub) → (request id, that reader's interrupt handle) while it runs
-    inflight: HashMap<(ReqKind, Option<String>), (ReqId, fp_store::InterruptHandle)>,
+    inflight: HashMap<Key, (ReqId, fp_store::InterruptHandle)>,
     writer_queue: VecDeque<WriterJob>,
     writer_running: bool,
 }
@@ -246,7 +248,8 @@ fn spawn_reader(
             let id = req.id;
             let generation = req.generation;
             let kind = req.kind;
-            let key = (kind, req.sub.clone());
+            let sub = req.sub.clone();
+            let key = (kind, req.sub);
             let interrupt = store.interrupt_handle();
             {
                 let mut state = lock(&shared.state);
@@ -277,6 +280,7 @@ fn spawn_reader(
                 id,
                 generation,
                 kind,
+                sub,
                 result,
             });
             on_response();
@@ -324,6 +328,7 @@ fn spawn_watcher(
                 id: next_id,
                 generation: 0,
                 kind: ReqKind::Watch,
+                sub: None,
                 result: Ok(Box::new(version)),
             });
             next_id += 1;
@@ -375,6 +380,7 @@ fn writer_loop(
             id,
             generation,
             kind,
+            sub: None,
             result,
         });
         on_response();

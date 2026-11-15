@@ -124,6 +124,13 @@ impl Scope {
         self.edit(|f| f.kinds_not = values);
     }
 
+    pub fn set_kind_filter(&mut self, kinds: Vec<String>, kinds_not: Vec<String>) {
+        self.edit(|f| {
+            f.kinds = kinds;
+            f.kinds_not = kinds_not;
+        });
+    }
+
     pub fn set_hosts(&mut self, values: Vec<String>) {
         self.edit(|f| f.hosts = values);
     }
@@ -132,12 +139,26 @@ impl Scope {
         self.edit(|f| f.hosts_not = values);
     }
 
+    pub fn set_host_filter(&mut self, hosts: Vec<String>, hosts_not: Vec<String>) {
+        self.edit(|f| {
+            f.hosts = hosts;
+            f.hosts_not = hosts_not;
+        });
+    }
+
     pub fn set_sources(&mut self, values: Vec<String>) {
         self.edit(|f| f.sources = values);
     }
 
     pub fn set_sources_not(&mut self, values: Vec<String>) {
         self.edit(|f| f.sources_not = values);
+    }
+
+    pub fn set_source_filter(&mut self, sources: Vec<String>, sources_not: Vec<String>) {
+        self.edit(|f| {
+            f.sources = sources;
+            f.sources_not = sources_not;
+        });
     }
 
     pub fn set_confidence(&mut self, values: Vec<fp_core::Confidence>) {
@@ -239,7 +260,7 @@ impl Scope {
             let start = f.since.map(fmt_us).unwrap_or_default();
             let end = f.until.map(fmt_us).unwrap_or_default();
             chips.push(Chip {
-                label: format!("time {start}→{end}"),
+                label: format!("time {start}..{end}"),
                 remove: ChipRemove::SinceUntil,
             });
         }
@@ -248,19 +269,19 @@ impl Scope {
             push(format!("kind {k}"), ChipRemove::Kind(i));
         }
         for (i, k) in f.kinds_not.iter().enumerate() {
-            push(format!("kind ≠ {k}"), ChipRemove::KindNot(i));
+            push(format!("kind != {k}"), ChipRemove::KindNot(i));
         }
         for (i, h) in f.hosts.iter().enumerate() {
             push(format!("host {h}"), ChipRemove::Host(i));
         }
         for (i, h) in f.hosts_not.iter().enumerate() {
-            push(format!("host ≠ {h}"), ChipRemove::HostNot(i));
+            push(format!("host != {h}"), ChipRemove::HostNot(i));
         }
         for (i, s) in f.sources.iter().enumerate() {
             push(format!("source {s}"), ChipRemove::Source(i));
         }
         for (i, s) in f.sources_not.iter().enumerate() {
-            push(format!("source ≠ {s}"), ChipRemove::SourceNot(i));
+            push(format!("source != {s}"), ChipRemove::SourceNot(i));
         }
         for (i, c) in f.confidence.iter().enumerate() {
             push(format!("confidence {c}"), ChipRemove::Confidence(i));
@@ -274,7 +295,7 @@ impl Scope {
             EventTiming::Any => {}
         }
         if f.ioc_only {
-            push("⚑ IOC hits only".to_string(), ChipRemove::IocOnly);
+            push("IOC hits only".to_string(), ChipRemove::IocOnly);
         }
         if let Some(text) = &f.match_text {
             push(format!("text \"{text}\""), ChipRemove::Text);

@@ -47,6 +47,7 @@ pub struct Panels {
 #[serde(default)]
 pub struct Table {
     pub columns: Vec<String>,
+    pub widths: std::collections::BTreeMap<String, f32>,
 }
 
 const UI_SCALE_MIN: f32 = 0.8;
@@ -81,9 +82,18 @@ impl Default for Panels {
 impl Default for Table {
     fn default() -> Self {
         Self {
-            columns: ["time", "source", "kind", "summary"]
-                .map(str::to_string)
-                .to_vec(),
+            columns: [
+                "confidence",
+                "time",
+                "source",
+                "kind",
+                "summary",
+                "host",
+                "ioc",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            widths: std::collections::BTreeMap::new(),
         }
     }
 }

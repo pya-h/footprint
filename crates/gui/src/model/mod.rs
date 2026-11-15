@@ -31,10 +31,22 @@ pub enum ScopeAction {
     ShowUntimed,
     SetKinds(Vec<String>),
     SetKindsNot(Vec<String>),
+    SetKindFilter {
+        kinds: Vec<String>,
+        kinds_not: Vec<String>,
+    },
     SetHosts(Vec<String>),
     SetHostsNot(Vec<String>),
+    SetHostFilter {
+        hosts: Vec<String>,
+        hosts_not: Vec<String>,
+    },
     SetSources(Vec<String>),
     SetSourcesNot(Vec<String>),
+    SetSourceFilter {
+        sources: Vec<String>,
+        sources_not: Vec<String>,
+    },
     SetConfidence(Vec<fp_core::Confidence>),
     SetRun(Option<u64>),
     SetTiming(fp_store::EventTiming),
@@ -49,6 +61,7 @@ pub enum Action {
     RedoScope,
     Go(View),
     Select(Selection),
+    JumpTo(Selection),
     NavBack,
     NavForward,
     Counts {
@@ -86,6 +99,44 @@ pub enum Action {
         generation: Generation,
         result: Result<fp_store::FacetPage, String>,
     },
+    DetailHistogram {
+        generation: Generation,
+        result: Result<fp_query::overview::Histogram, String>,
+    },
+    IocHistogram {
+        generation: Generation,
+        result: Result<fp_query::overview::Histogram, String>,
+    },
+    Runs {
+        generation: Generation,
+        result: Result<Vec<crate::vm::RunMarkerVm>, String>,
+    },
+    IocCount {
+        generation: Generation,
+        result: Result<u64, String>,
+    },
+    Detail {
+        generation: Generation,
+        result: Result<Option<Box<crate::vm::DetailVm>>, String>,
+    },
+    Around {
+        generation: Generation,
+        result: Result<Vec<crate::vm::RowVm>, String>,
+    },
+    Groups {
+        generation: Generation,
+        result: Result<Vec<crate::vm::GroupRowVm>, String>,
+    },
+    SetGroupBy(Option<fp_query::overview::GroupBy>),
+    SetReverse(bool),
+    TogglePinInspector,
+    ShowInContext(i64, u64),
+    RequestSeek(i64),
+    SeekResolved {
+        generation: Generation,
+        offset: Result<u64, String>,
+    },
+    ClearScrollTarget,
 }
 
 /// Consecutive `data_version` samples of the case file, from which the shell derives
@@ -129,6 +180,12 @@ pub struct Model {
     pub nav: Nav,
     /// bumped on every scope change; worker responses carry it and stale ones drop
     pub generation: Generation,
+    /// bumped whenever the inspected item changes (independent of scope)
+    pub selection_gen: Generation,
+    /// bumped on scope or group-by changes
+    pub group_gen: Generation,
+    /// bumped on each seek request
+    pub seek_gen: Generation,
     pub counts: Slot<Counts>,
     /// the case's timed timespan; `None` while the case has no timed events
     pub bounds: Slot<Option<(i64, i64)>>,
@@ -137,11 +194,24 @@ pub struct Model {
     pub untimed: Slot<u64>,
     pub watch: WatchState,
     pub histogram: Slot<fp_query::overview::Histogram>,
+    pub detail_histogram: Slot<fp_query::overview::Histogram>,
+    pub ioc_histogram: Slot<fp_query::overview::Histogram>,
+    pub runs: Slot<Vec<crate::vm::RunMarkerVm>>,
+    pub ioc_count: Slot<u64>,
     pub category: Slot<[u64; fp_query::category::Category::ALL.len()]>,
     pub timing: Slot<fp_query::overview::TimingCounts>,
     /// one page per value facet (kind/source/host/confidence/run), computed under
     /// the scope minus that facet's own selections
     pub facets: std::collections::HashMap<fp_query::overview::Facet, Slot<fp_store::FacetPage>>,
+    pub detail: Slot<Option<Box<crate::vm::DetailVm>>>,
+    pub around: Slot<Vec<crate::vm::RowVm>>,
+    pub groups: Slot<Vec<crate::vm::GroupRowVm>>,
+    pub group_by: Option<fp_query::overview::GroupBy>,
+    pub reverse: bool,
+    pub inspector_pin: Option<Selection>,
+    pub pending_seek: Option<i64>,
+    pub scroll_to_row: Option<usize>,
+    pub seek_error: Option<String>,
 }
 
 impl Model {
@@ -155,6 +225,12 @@ impl Model {
 
     pub fn selection(&self) -> Selection {
         self.nav.current().1
+    }
+
+    pub fn inspected(&self) -> Selection {
+        self.inspector_pin
+            .clone()
+            .unwrap_or_else(|| self.selection())
     }
 
     pub fn apply(&mut self, action: Action) {
@@ -185,6 +261,10 @@ impl Model {
                         self.scope.set_kinds_not(v);
                         true
                     }
+                    ScopeAction::SetKindFilter { kinds, kinds_not } => {
+                        self.scope.set_kind_filter(kinds, kinds_not);
+                        true
+                    }
                     ScopeAction::SetHosts(v) => {
                         self.scope.set_hosts(v);
                         true
@@ -193,12 +273,23 @@ impl Model {
                         self.scope.set_hosts_not(v);
                         true
                     }
+                    ScopeAction::SetHostFilter { hosts, hosts_not } => {
+                        self.scope.set_host_filter(hosts, hosts_not);
+                        true
+                    }
                     ScopeAction::SetSources(v) => {
                         self.scope.set_sources(v);
                         true
                     }
                     ScopeAction::SetSourcesNot(v) => {
                         self.scope.set_sources_not(v);
+                        true
+                    }
+                    ScopeAction::SetSourceFilter {
+                        sources,
+                        sources_not,
+                    } => {
+                        self.scope.set_source_filter(sources, sources_not);
                         true
                     }
                     ScopeAction::SetConfidence(v) => {
@@ -225,21 +316,46 @@ impl Model {
             }
             Action::UndoScope => {
                 if self.scope.undo() {
-                    self.generation += 1;
+                    self.scope_changed();
                 }
             }
             Action::RedoScope => {
                 if self.scope.redo() {
-                    self.generation += 1;
+                    self.scope_changed();
                 }
             }
-            Action::Go(view) => self.nav.navigate(view, Selection::None),
-            Action::Select(selection) => self.nav.select(selection),
+            Action::Go(view) => {
+                let prev = self.inspected();
+                self.nav.navigate(view, Selection::None);
+                if self.inspected() != prev {
+                    self.selection_gen += 1;
+                }
+            }
+            Action::Select(selection) => {
+                let prev = self.inspected();
+                self.nav.select(selection);
+                if self.inspected() != prev {
+                    self.selection_gen += 1;
+                }
+            }
+            Action::JumpTo(selection) => {
+                let prev = self.inspected();
+                self.nav.navigate(self.view(), selection);
+                if self.inspected() != prev {
+                    self.selection_gen += 1;
+                }
+            }
             Action::NavBack => {
-                self.nav.back();
+                let prev = self.inspected();
+                if self.nav.back() && self.inspected() != prev {
+                    self.selection_gen += 1;
+                }
             }
             Action::NavForward => {
-                self.nav.forward();
+                let prev = self.inspected();
+                if self.nav.forward() && self.inspected() != prev {
+                    self.selection_gen += 1;
+                }
             }
             Action::Counts { generation, result } => {
                 self.counts.absorb(generation, self.generation, result)
@@ -270,11 +386,93 @@ impl Model {
                 .entry(facet)
                 .or_default()
                 .absorb(generation, self.generation, result),
+            Action::DetailHistogram { generation, result } => {
+                self.detail_histogram
+                    .absorb(generation, self.generation, result);
+            }
+            Action::IocHistogram { generation, result } => {
+                self.ioc_histogram
+                    .absorb(generation, self.generation, result);
+            }
+            Action::Runs { generation, result } => {
+                self.runs.absorb(generation, self.generation, result);
+            }
+            Action::IocCount { generation, result } => {
+                self.ioc_count.absorb(generation, self.generation, result);
+            }
+            Action::Detail { generation, result } => {
+                self.detail.absorb(generation, self.selection_gen, result);
+            }
+            Action::Around { generation, result } => {
+                self.around.absorb(generation, self.selection_gen, result);
+            }
+            Action::Groups { generation, result } => {
+                self.groups.absorb(generation, self.group_gen, result);
+            }
+            Action::SetGroupBy(by) => {
+                if self.group_by != by {
+                    self.group_by = by;
+                    self.group_gen += 1;
+                }
+            }
+            Action::SetReverse(reverse) => {
+                self.reverse = reverse;
+            }
+            Action::TogglePinInspector => {
+                if self.inspector_pin.is_some() {
+                    self.inspector_pin = None;
+                } else if self.selection() != Selection::None {
+                    self.inspector_pin = Some(self.selection());
+                }
+                self.selection_gen += 1;
+            }
+            Action::ShowInContext(ts, event_id) => {
+                if self.scope.clear() {
+                    self.scope_changed();
+                }
+                let target = Selection::Event(event_id);
+                if self.view() != View::Timeline {
+                    self.nav.navigate(View::Timeline, target.clone());
+                } else {
+                    self.nav.select(target.clone());
+                }
+                if self.inspector_pin.is_some() {
+                    self.inspector_pin = Some(target);
+                }
+                self.selection_gen += 1;
+                self.group_by = None;
+                self.pending_seek = Some(ts);
+                self.seek_error = None;
+                self.seek_gen += 1;
+            }
+            Action::RequestSeek(ts) => {
+                self.pending_seek = Some(ts);
+                self.seek_error = None;
+                self.seek_gen += 1;
+            }
+            Action::SeekResolved { generation, offset } => {
+                if generation == self.seek_gen {
+                    self.pending_seek = None;
+                    match offset {
+                        Ok(row) => {
+                            self.scroll_to_row = usize::try_from(row).ok();
+                            self.seek_error = None;
+                        }
+                        Err(msg) => {
+                            self.seek_error = Some(msg);
+                        }
+                    }
+                }
+            }
+            Action::ClearScrollTarget => {
+                self.scroll_to_row = None;
+            }
         }
     }
 
     fn scope_changed(&mut self) {
         self.generation += 1;
+        self.group_gen += 1;
     }
 
     /// The count for the "untimed events hidden by the time window" notice,
