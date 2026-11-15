@@ -15,9 +15,10 @@ use crate::theme::{Theme, ThemeName};
 use crate::views::dashboard::{DashboardState, show_dashboard};
 use crate::views::hosts::{HOSTS_CAP, HostsState, show_hosts};
 use crate::views::lanes::{LanesState, show_lanes};
+use crate::views::trace::{TraceState, show_trace};
 use crate::vm::{
     DashboardSummaryVm, DetailVm, GroupRowVm, HostSummaryVm, LaneRowDensityVm, LanesDataVm, RowVm,
-    RunMarkerVm, SafeText, SourceIssueVm, UntimedLaneVm,
+    RunMarkerVm, SafeText, SourceIssueVm, TraceVm, UntimedLaneVm,
 };
 use crate::widgets::chip::{ChipEditorState, show_scope_bar, thousands};
 use crate::widgets::event_table::TableState;
@@ -50,6 +51,7 @@ pub struct Shell {
     submitted_dashboard_hosts: Option<Generation>,
     submitted_hosts: Option<(Generation, Generation, String)>,
     submitted_lanes: Option<(Generation, Generation, usize)>,
+    submitted_trace: Option<(String, Generation)>,
     outstanding: HashSet<u64>,
     cache: BlockCache,
     chip_editor: ChipEditorState,
@@ -59,6 +61,7 @@ pub struct Shell {
     dashboard_state: DashboardState,
     hosts_state: HostsState,
     lanes_state: LanesState,
+    trace_state: TraceState,
     focus_search_next: bool,
 }
 
@@ -183,6 +186,7 @@ impl Shell {
             submitted_dashboard_hosts: None,
             submitted_hosts: None,
             submitted_lanes: None,
+            submitted_trace: None,
             outstanding: HashSet::new(),
             cache: BlockCache::new(),
             chip_editor: ChipEditorState::default(),
@@ -192,6 +196,7 @@ impl Shell {
             dashboard_state: DashboardState::default(),
             hosts_state: HostsState::default(),
             lanes_state: LanesState::default(),
+            trace_state: TraceState::default(),
             focus_search_next: false,
         }
     }
@@ -446,6 +451,13 @@ impl Shell {
                     let result = downcast::<String>(resp.result, "ioc_write");
                     self.apply(Action::IocWriteDone(result));
                 }
+                ReqKind::Trace => {
+                    let result = downcast::<TraceVm>(resp.result, "trace");
+                    self.apply(Action::Trace {
+                        generation: resp.generation,
+                        result,
+                    });
+                }
                 _ => {}
             }
         }
@@ -465,6 +477,7 @@ impl Shell {
         self.submitted_dashboard_hosts = None;
         self.submitted_hosts = None;
         self.submitted_lanes = None;
+        self.submitted_trace = None;
     }
 
     fn ensure_requests(&mut self) {
@@ -483,6 +496,35 @@ impl Shell {
         self.submit_detail_queries();
         self.submit_group_and_seek();
         self.submit_view_queries(generation);
+        self.submit_trace_queries();
+    }
+
+    fn submit_trace_queries(&mut self) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let Some(target) = self.model.pending_trace.clone() else {
+            return;
+        };
+        let generation = self.model.trace_gen;
+        if self
+            .submitted_trace
+            .as_ref()
+            .is_some_and(|(t, g)| *t == target && *g == generation)
+        {
+            return;
+        }
+        self.submitted_trace = Some((target.clone(), generation));
+        let id = worker.submit(
+            ReqKind::Trace,
+            Some(target.clone()),
+            generation,
+            move |store| {
+                let tree = fp_correlate::trace::trace_tree(store, &target)?;
+                Ok(Box::new(TraceVm::from_tree(&tree)))
+            },
+        );
+        self.outstanding.insert(id);
     }
 
     fn submit_view_queries(&mut self, generation: Generation) {
@@ -1292,6 +1334,17 @@ impl Shell {
                 };
                 let mut actions = Vec::new();
                 show_lanes(ui, &ctx, &mut self.lanes_state, &mut actions);
+                self.apply_all(actions);
+            }
+            View::Trace => {
+                let theme = self.active_theme();
+                let ctx = crate::widgets::ViewCtx {
+                    model: &self.model,
+                    theme: &theme,
+                    tz: self.tz,
+                };
+                let mut actions = Vec::new();
+                show_trace(ui, &ctx, &mut self.trace_state, &mut actions);
                 self.apply_all(actions);
             }
             view => {

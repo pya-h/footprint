@@ -162,6 +162,12 @@ pub enum Action {
         offset: Result<u64, String>,
     },
     ClearScrollTarget,
+    /// open the causal trace rooted at `target` (artifact path, URL, or event id)
+    RequestTrace(String),
+    Trace {
+        generation: Generation,
+        result: Result<crate::vm::TraceVm, String>,
+    },
 }
 
 /// Consecutive `data_version` samples of the case file, from which the shell derives
@@ -247,6 +253,10 @@ pub struct Model {
     pub pending_seek: Option<i64>,
     pub scroll_to_row: Option<usize>,
     pub seek_error: Option<String>,
+    pub trace: Slot<crate::vm::TraceVm>,
+    pub trace_gen: Generation,
+    /// the trace target currently shown (path, URL, or event id); also the pending request
+    pub pending_trace: Option<String>,
 }
 
 impl Model {
@@ -501,6 +511,13 @@ impl Model {
             }
             Action::ClearScrollTarget => {
                 self.scroll_to_row = None;
+            }
+            Action::RequestTrace(target) => {
+                self.pending_trace = Some(target);
+                self.trace_gen += 1;
+            }
+            Action::Trace { generation, result } => {
+                self.trace.absorb(generation, self.trace_gen, result);
             }
             Action::DashboardSummary { generation, result } => {
                 self.dashboard_summary

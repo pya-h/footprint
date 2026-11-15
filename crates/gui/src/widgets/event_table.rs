@@ -537,6 +537,7 @@ fn show_row_context_menu(ui: &mut egui::Ui, row: &RowVm, model: &Model, actions:
     if ui.button("Trace").clicked() {
         actions.push(Action::Go(View::Trace));
         actions.push(Action::Select(Selection::Event(row.id)));
+        actions.push(Action::RequestTrace(row.id.to_string()));
         ui.close();
     }
     if ui.button("Show in context").clicked() {

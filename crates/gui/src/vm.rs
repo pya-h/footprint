@@ -504,6 +504,86 @@ pub struct LanesDataVm {
     pub untimed_lanes: Vec<UntimedLaneVm>,
 }
 
+#[derive(Debug, Clone)]
+pub enum TraceHeadVm {
+    Artifact {
+        id: u64,
+        path: SafeText,
+        sha256: Option<SafeText>,
+        size: Option<i64>,
+    },
+    Event {
+        id: u64,
+        ts_utc: i64,
+        source: SafeText,
+        kind: SafeText,
+        subject: SafeText,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct TraceRowVm {
+    pub arrow: fp_correlate::trace::TraceArrow,
+    pub rel: SafeText,
+    pub ts_utc: Option<i64>,
+    pub source: SafeText,
+    pub text: SafeText,
+    pub confidence: Option<Confidence>,
+    pub event_id: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraceVm {
+    pub head: TraceHeadVm,
+    pub rows: Vec<TraceRowVm>,
+}
+
+impl TraceVm {
+    pub fn from_tree(tree: &fp_correlate::trace::TraceTree) -> Self {
+        use fp_correlate::trace::TraceHead;
+        let head = match &tree.head {
+            TraceHead::Artifact {
+                id,
+                path,
+                sha256,
+                size,
+            } => TraceHeadVm::Artifact {
+                id: *id,
+                path: SafeText::new(path),
+                sha256: sha256.as_deref().map(SafeText::new),
+                size: *size,
+            },
+            TraceHead::Event {
+                id,
+                ts_utc,
+                source,
+                kind,
+                subject,
+            } => TraceHeadVm::Event {
+                id: *id,
+                ts_utc: *ts_utc,
+                source: SafeText::new(source),
+                kind: SafeText::new(kind),
+                subject: SafeText::new(subject),
+            },
+        };
+        let rows = tree
+            .rows
+            .iter()
+            .map(|row| TraceRowVm {
+                arrow: row.arrow,
+                rel: SafeText::new(&row.rel),
+                ts_utc: row.ts_utc,
+                source: SafeText::new(&row.source),
+                text: SafeText::new(&row.text),
+                confidence: row.confidence.as_deref().map(confidence),
+                event_id: row.event_id,
+            })
+            .collect();
+        Self { head, rows }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

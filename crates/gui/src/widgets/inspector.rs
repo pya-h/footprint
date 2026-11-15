@@ -240,6 +240,7 @@ fn show_event_inspector(
                 {
                     actions.push(Action::Go(View::Trace));
                     actions.push(Action::Select(Selection::Event(detail.id)));
+                    actions.push(Action::RequestTrace(detail.id.to_string()));
                 }
                 if ui
                     .button("Show in context")
