@@ -1381,7 +1381,7 @@ impl Shell {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("footprint").strong());
             let name = self
                 .case
@@ -1430,8 +1430,13 @@ impl Shell {
             if let Some(r) = next_run {
                 self.apply(Action::Scope(ScopeAction::SetRun(r)));
             }
+            let search_w = if ui.ctx().content_rect().width() < 1280.0 {
+                200.0
+            } else {
+                280.0
+            };
             let response = ui.add_sized(
-                [280.0, 20.0],
+                [search_w, 20.0],
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("search subjects, hosts, commands… (/)"),
             );
@@ -1848,7 +1853,10 @@ impl Shell {
         let show_facets_panel = self.model.view() == View::Timeline
             && !self.settings.panels.facets_collapsed
             && !self.case_missing;
-        if show_facets_panel {
+        let show_inspector_panel = !self.settings.panels.inspector_collapsed && !self.case_missing;
+        let narrow = ui.ctx().content_rect().width() < 1280.0;
+
+        if !narrow && show_facets_panel {
             let theme = self.active_theme();
             let resp = egui::Panel::left("facets")
                 .resizable(true)
@@ -1870,7 +1878,7 @@ impl Shell {
             self.apply_all(resp.inner);
         }
 
-        if !self.settings.panels.inspector_collapsed && !self.case_missing {
+        if !narrow && show_inspector_panel {
             let theme = self.active_theme();
             let resp = egui::Panel::right("inspector")
                 .resizable(true)
@@ -1886,7 +1894,69 @@ impl Shell {
             self.apply_all(resp.inner);
         }
 
-        egui::CentralPanel::default().show(ui, |ui| self.main(ui));
+        let central_resp = egui::CentralPanel::default().show(ui, |ui| self.main(ui));
+        if narrow && (show_facets_panel || show_inspector_panel) {
+            let theme = self.active_theme();
+            let area_rect = central_resp.response.rect;
+            if show_facets_panel {
+                let drawer_w = self.settings.panels.facets_width.clamp(220.0, 300.0);
+                let mut actions = Vec::new();
+                let mut close = false;
+                show_side_drawer(
+                    ui.ctx(),
+                    &theme,
+                    DrawerSpec {
+                        id: "facets_drawer",
+                        close_label: "close facets",
+                        pos: area_rect.min,
+                        width: drawer_w,
+                        height: area_rect.height(),
+                    },
+                    &mut close,
+                    |ui| {
+                        show_facets(
+                            ui,
+                            &self.model,
+                            &theme,
+                            &mut self.facets_state,
+                            &mut actions,
+                        );
+                    },
+                );
+                if close {
+                    self.settings.panels.facets_collapsed = true;
+                }
+                self.apply_all(actions);
+            }
+            if show_inspector_panel {
+                let drawer_w = self.settings.panels.inspector_width.clamp(280.0, 360.0);
+                let mut actions = Vec::new();
+                let mut close = false;
+                let anchor = egui::pos2(
+                    (area_rect.right() - drawer_w).max(area_rect.left()),
+                    area_rect.top(),
+                );
+                show_side_drawer(
+                    ui.ctx(),
+                    &theme,
+                    DrawerSpec {
+                        id: "inspector_drawer",
+                        close_label: "close inspector",
+                        pos: anchor,
+                        width: drawer_w,
+                        height: area_rect.height(),
+                    },
+                    &mut close,
+                    |ui| {
+                        show_inspector(ui, &self.model, &theme, self.tz, &mut actions);
+                    },
+                );
+                if close {
+                    self.settings.panels.inspector_collapsed = true;
+                }
+                self.apply_all(actions);
+            }
+        }
         {
             let theme = self.active_theme();
             let mut actions = Vec::new();
@@ -1911,6 +1981,42 @@ impl Shell {
         }
         self.ensure_requests();
     }
+}
+
+struct DrawerSpec<'a> {
+    id: &'a str,
+    close_label: &'a str,
+    pos: egui::Pos2,
+    width: f32,
+    height: f32,
+}
+
+fn show_side_drawer(
+    ctx: &egui::Context,
+    theme: &Theme,
+    spec: DrawerSpec<'_>,
+    close: &mut bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Area::new(egui::Id::NULL.with(spec.id))
+        .order(egui::Order::Middle)
+        .fixed_pos(spec.pos)
+        .show(ctx, |ui| {
+            egui::Frame::window(ui.style())
+                .fill(theme.bg1)
+                .stroke(egui::Stroke::new(1.0, theme.border))
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width((spec.width - 18.0).max(160.0));
+                    ui.set_height((spec.height - 18.0).max(160.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if ui.small_button(spec.close_label).clicked() {
+                            *close = true;
+                        }
+                    });
+                    add_contents(ui);
+                });
+        });
 }
 
 /// Resolves an IOC hit target to (kind, label) for display; unresolved targets

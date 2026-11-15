@@ -294,10 +294,19 @@ fn show_toolbar(
                         }
                     }
                     if let Some(pos) = settings.table.columns.iter().position(|c| c == id) {
-                        if pos > 0 && ui.small_button("^").clicked() {
+                        if pos > 0
+                            && ui
+                                .small_button("^")
+                                .on_hover_text("move column earlier")
+                                .clicked()
+                        {
                             settings.table.columns.swap(pos, pos - 1);
                         }
-                        if pos + 1 < settings.table.columns.len() && ui.small_button("v").clicked()
+                        if pos + 1 < settings.table.columns.len()
+                            && ui
+                                .small_button("v")
+                                .on_hover_text("move column later")
+                                .clicked()
                         {
                             settings.table.columns.swap(pos, pos + 1);
                         }

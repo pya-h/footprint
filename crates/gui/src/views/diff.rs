@@ -221,7 +221,7 @@ fn render_entry_list(
             .push((*idx, entry));
     }
     ui.vertical(|ui| {
-        let width = (ui.available_width() * 0.48).clamp(340.0, 580.0);
+        let width = (ui.available_width() * 0.45).clamp(300.0, 560.0);
         ui.set_width(width);
         egui::ScrollArea::both()
             .id_salt("diff_entries_scroll")
@@ -290,7 +290,7 @@ fn summarize_group(kind: &str, items: &[(usize, &DiffEntryVm)]) -> String {
 
 fn render_comparison(ui: &mut egui::Ui, theme: &Theme, entry: &DiffEntryVm) {
     ui.vertical(|ui| {
-        ui.set_min_width(420.0);
+        ui.set_min_width(360.0);
         ui.label(
             egui::RichText::new(format!("{}  {}", entry.kind.as_str(), entry.key.as_str()))
                 .monospace()

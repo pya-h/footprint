@@ -130,6 +130,9 @@ pub fn show_strip(
                 egui::vec2(avail_w, MINIMAP_HEIGHT),
                 egui::Sense::click_and_drag(),
             );
+            resp.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::Role::Slider, true, "Timeline overview strip")
+            });
 
             let minimap_band = BandData {
                 hist: model.histogram.value(),
@@ -147,6 +150,9 @@ pub fn show_strip(
                 let detail_w = ui.available_width().max(64.0);
                 let (detail_rect, detail_resp) = ui
                     .allocate_exact_size(egui::vec2(detail_w, DETAIL_HEIGHT), egui::Sense::click());
+                detail_resp.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::Role::Slider, true, "Zoomed timeline strip")
+                });
                 let detail_band = BandData {
                     hist: model.detail_histogram.value(),
                     ioc_hist: None,

@@ -255,6 +255,14 @@ fn render_axis_and_lanes(
         });
 }
 
+/// Attaches an accessible `Region` label for a lane track without colliding with the visible row label.
+fn lane_track_region(resp: &egui::Response, label: &str) {
+    let accessible = format!("lane track: {label}");
+    resp.widget_info(move || {
+        egui::WidgetInfo::labeled(egui::Role::Region, true, accessible.clone())
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_density_lanes(
     ui: &mut egui::Ui,
@@ -292,6 +300,7 @@ fn render_density_lanes(
                 egui::vec2(track_w, LANE_HEIGHT),
                 egui::Sense::click_and_drag(),
             );
+            lane_track_region(&resp, lane.label.as_str());
             paint_lane_bg(ui, rect, ctx.theme, state.drag_preview, bounds);
             paint_density_bars(
                 ui,
@@ -356,6 +365,7 @@ fn render_individual_lanes(
                 egui::vec2(track_w, LANE_HEIGHT),
                 egui::Sense::click_and_drag(),
             );
+            lane_track_region(&resp, &label);
             paint_lane_bg(ui, rect, ctx.theme, state.drag_preview, bounds);
 
             // Baseline across the track.

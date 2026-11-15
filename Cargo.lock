@@ -1740,6 +1740,7 @@ dependencies = [
  "egui_kittest",
  "fp-core",
  "fp-correlate",
+ "fp-fixtures",
  "fp-query",
  "fp-render",
  "fp-store",

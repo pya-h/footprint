@@ -214,6 +214,7 @@ impl Theme {
             open: widget(self.bg2, self.text),
         };
         visuals.selection.bg_fill = self.accent;
+        visuals.selection.stroke = Stroke::new(2.0, self.accent);
         visuals.hyperlink_color = self.accent;
         visuals
     }
