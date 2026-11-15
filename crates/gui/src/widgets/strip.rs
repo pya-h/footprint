@@ -169,15 +169,15 @@ pub fn show_strip(
         });
 }
 
-struct BandData<'a> {
-    hist: Option<&'a Histogram>,
-    ioc_hist: Option<&'a Histogram>,
-    runs: &'a [RunMarkerVm],
-    bounds: (i64, i64),
-    active_window: Option<(i64, i64)>,
+pub struct BandData<'a> {
+    pub hist: Option<&'a Histogram>,
+    pub ioc_hist: Option<&'a Histogram>,
+    pub runs: &'a [RunMarkerVm],
+    pub bounds: (i64, i64),
+    pub active_window: Option<(i64, i64)>,
 }
 
-fn paint_histogram_band(
+pub fn paint_histogram_band(
     ui: &egui::Ui,
     rect: egui::Rect,
     band: &BandData<'_>,

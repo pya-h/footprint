@@ -7,12 +7,18 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use eframe::egui;
-use fp_query::overview::{Facet, TimeWindow};
+use fp_query::overview::{Facet, HostSort, LaneMode, TimeWindow};
 
 use crate::model::{Action, Counts, LoadStatus, Model, ScopeAction, Selection, View};
 use crate::settings::Settings;
 use crate::theme::{Theme, ThemeName};
-use crate::vm::{DetailVm, GroupRowVm, RowVm, RunMarkerVm};
+use crate::views::dashboard::{DashboardState, show_dashboard};
+use crate::views::hosts::{HOSTS_CAP, HostsState, show_hosts};
+use crate::views::lanes::{LanesState, show_lanes};
+use crate::vm::{
+    DashboardSummaryVm, DetailVm, GroupRowVm, HostSummaryVm, LaneRowDensityVm, LanesDataVm, RowVm,
+    RunMarkerVm, SafeText, SourceIssueVm, UntimedLaneVm,
+};
 use crate::widgets::chip::{ChipEditorState, show_scope_bar, thousands};
 use crate::widgets::event_table::TableState;
 use crate::widgets::facets::{FacetsState, show_facets};
@@ -40,12 +46,19 @@ pub struct Shell {
     submitted_detail: Option<Generation>,
     submitted_groups: Option<Generation>,
     submitted_seek: Option<Generation>,
+    submitted_dashboard: Option<Generation>,
+    submitted_dashboard_hosts: Option<Generation>,
+    submitted_hosts: Option<(Generation, Generation, String)>,
+    submitted_lanes: Option<(Generation, Generation, usize)>,
     outstanding: HashSet<u64>,
     cache: BlockCache,
     chip_editor: ChipEditorState,
     strip_state: StripState,
     facets_state: FacetsState,
     table_state: TableState,
+    dashboard_state: DashboardState,
+    hosts_state: HostsState,
+    lanes_state: LanesState,
     focus_search_next: bool,
 }
 
@@ -125,21 +138,6 @@ fn facet_minus_self_filter(
     f
 }
 
-fn bytes(n: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut size = n as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n} B")
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
-    }
-}
-
 impl Shell {
     pub fn new(
         case: PathBuf,
@@ -181,12 +179,19 @@ impl Shell {
             submitted_detail: None,
             submitted_groups: None,
             submitted_seek: None,
+            submitted_dashboard: None,
+            submitted_dashboard_hosts: None,
+            submitted_hosts: None,
+            submitted_lanes: None,
             outstanding: HashSet::new(),
             cache: BlockCache::new(),
             chip_editor: ChipEditorState::default(),
             strip_state: StripState::default(),
             facets_state: FacetsState::default(),
             table_state: TableState::default(),
+            dashboard_state: DashboardState::default(),
+            hosts_state: HostsState::default(),
+            lanes_state: LanesState::default(),
             focus_search_next: false,
         }
     }
@@ -196,7 +201,31 @@ impl Shell {
     }
 
     pub fn apply(&mut self, action: Action) {
+        let is_refresh = matches!(action, Action::RefreshCase);
+        let is_ioc_ok = matches!(action, Action::IocWriteDone(Ok(_)));
         self.model.apply(action);
+        if let Some((ioc_type, value)) = self.model.pending_ioc_add.take() {
+            self.submit_ioc_add(ioc_type, value);
+        }
+        if is_refresh || is_ioc_ok {
+            self.reset_submission_markers();
+        }
+    }
+
+    fn submit_ioc_add(&mut self, ioc_type: String, value: String) {
+        let Some(worker) = &self.worker else {
+            self.model
+                .apply(Action::IocWriteDone(Err("worker not running".to_string())));
+            return;
+        };
+        let generation = self.model.generation;
+        let id = worker.submit_writer(ReqKind::IocWrite, generation, move |store| {
+            let label = format!("{ioc_type}:{value}");
+            fp_query::iocs::add_ioc(store, &ioc_type, &value, None)
+                .map_err(|e| QueryError::Message(e.to_string()))?;
+            Ok(Box::new(format!("Added IOC {label}")))
+        });
+        self.outstanding.insert(id);
     }
 
     fn apply_all(&mut self, actions: Vec<Action>) {
@@ -377,12 +406,45 @@ impl Shell {
                         result,
                     });
                 }
-                ReqKind::Groups => {
-                    let result = downcast::<Vec<GroupRowVm>>(resp.result, "groups");
-                    self.apply(Action::Groups {
+                ReqKind::Groups => match resp.sub.as_deref() {
+                    Some("lanes") => {
+                        let result = downcast::<LanesDataVm>(resp.result, "lanes");
+                        self.apply(Action::Lanes {
+                            generation: resp.generation,
+                            result,
+                        });
+                    }
+                    _ => {
+                        let result = downcast::<Vec<GroupRowVm>>(resp.result, "groups");
+                        self.apply(Action::Groups {
+                            generation: resp.generation,
+                            result,
+                        });
+                    }
+                },
+                ReqKind::Sources => {
+                    let result = downcast::<DashboardSummaryVm>(resp.result, "dashboard_summary");
+                    self.apply(Action::DashboardSummary {
                         generation: resp.generation,
                         result,
                     });
+                }
+                ReqKind::Hosts => {
+                    let result = downcast::<Vec<HostSummaryVm>>(resp.result, "hosts");
+                    match resp.sub.as_deref() {
+                        Some("dashboard") => self.apply(Action::DashboardHosts {
+                            generation: resp.generation,
+                            result,
+                        }),
+                        _ => self.apply(Action::Hosts {
+                            generation: resp.generation,
+                            result,
+                        }),
+                    }
+                }
+                ReqKind::IocWrite => {
+                    let result = downcast::<String>(resp.result, "ioc_write");
+                    self.apply(Action::IocWriteDone(result));
                 }
                 _ => {}
             }
@@ -399,6 +461,10 @@ impl Shell {
         self.submitted_detail = None;
         self.submitted_groups = None;
         self.submitted_seek = None;
+        self.submitted_dashboard = None;
+        self.submitted_dashboard_hosts = None;
+        self.submitted_hosts = None;
+        self.submitted_lanes = None;
     }
 
     fn ensure_requests(&mut self) {
@@ -416,6 +482,103 @@ impl Shell {
         self.submit_page_queries(generation);
         self.submit_detail_queries();
         self.submit_group_and_seek();
+        self.submit_view_queries(generation);
+    }
+
+    fn submit_view_queries(&mut self, generation: Generation) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let filter = self.model.scope.filter();
+        match self.model.view() {
+            View::Dashboard => {
+                if self.submitted_dashboard != Some(generation) {
+                    self.submitted_dashboard = Some(generation);
+                    let f = filter.clone();
+                    let id = worker.submit(
+                        ReqKind::Sources,
+                        Some("dashboard".to_string()),
+                        generation,
+                        move |store| {
+                            let summary = build_dashboard_summary(store, &f)?;
+                            Ok(Box::new(summary))
+                        },
+                    );
+                    self.outstanding.insert(id);
+                }
+                if self.submitted_dashboard_hosts != Some(generation) {
+                    self.submitted_dashboard_hosts = Some(generation);
+                    let id = worker.submit(
+                        ReqKind::Hosts,
+                        Some("dashboard".to_string()),
+                        generation,
+                        move |store| {
+                            let rows = fp_query::overview::hosts_overview(
+                                store,
+                                &filter,
+                                None,
+                                HostSort::EventsDesc,
+                                10,
+                            )
+                            .map_err(|e| QueryError::Message(e.to_string()))?;
+                            let vms: Vec<HostSummaryVm> =
+                                rows.iter().map(HostSummaryVm::from_overview).collect();
+                            Ok(Box::new(vms))
+                        },
+                    );
+                    self.outstanding.insert(id);
+                }
+            }
+            View::Hosts => {
+                let search = self.hosts_state.submitted_search.clone();
+                let key = (generation, self.model.hosts_gen, search.clone());
+                if self.submitted_hosts.as_ref() != Some(&key) {
+                    self.submitted_hosts = Some(key);
+                    let sort = self.model.host_sort;
+                    let hosts_gen = self.model.hosts_gen;
+                    let id = worker.submit(
+                        ReqKind::Hosts,
+                        Some("table".to_string()),
+                        hosts_gen,
+                        move |store| {
+                            let substr = (!search.is_empty()).then_some(search.as_str());
+                            let rows = fp_query::overview::hosts_overview(
+                                store, &filter, substr, sort, HOSTS_CAP,
+                            )
+                            .map_err(|e| QueryError::Message(e.to_string()))?;
+                            let vms: Vec<HostSummaryVm> =
+                                rows.iter().map(HostSummaryVm::from_overview).collect();
+                            Ok(Box::new(vms))
+                        },
+                    );
+                    self.outstanding.insert(id);
+                }
+            }
+            View::Lanes => {
+                if self.model.bounds.status(generation) != LoadStatus::Ready {
+                    return;
+                }
+                let bounds = self.model.bounds.value().copied().flatten();
+                let width_px = self.lanes_state.last_width_px.max(64);
+                let key = (generation, self.model.lanes_gen, width_px);
+                if self.submitted_lanes != Some(key) {
+                    self.submitted_lanes = Some(key);
+                    let mode = self.model.lanes_mode;
+                    let lanes_gen = self.model.lanes_gen;
+                    let id = worker.submit(
+                        ReqKind::Groups,
+                        Some("lanes".to_string()),
+                        lanes_gen,
+                        move |store| {
+                            let data = build_lanes_data(store, &filter, bounds, mode, width_px)?;
+                            Ok(Box::new(data))
+                        },
+                    );
+                    self.outstanding.insert(id);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn submit_scope_queries(&mut self, generation: Generation) {
@@ -1071,7 +1234,25 @@ impl Shell {
             return;
         }
         match self.model.view() {
-            View::Dashboard => self.dashboard(ui),
+            View::Dashboard => {
+                let theme = self.active_theme();
+                let ctx = crate::widgets::ViewCtx {
+                    model: &self.model,
+                    theme: &theme,
+                    tz: self.tz,
+                };
+                let case_size = std::fs::metadata(&self.case).ok().map(|m| m.len());
+                let mut actions = Vec::new();
+                show_dashboard(
+                    ui,
+                    &ctx,
+                    &self.case,
+                    case_size,
+                    &mut self.dashboard_state,
+                    &mut actions,
+                );
+                self.apply_all(actions);
+            }
             View::Timeline => {
                 let theme = self.active_theme();
                 let ctx = crate::widgets::ViewCtx {
@@ -1089,6 +1270,28 @@ impl Shell {
                     &mut self.table_state,
                     &mut actions,
                 );
+                self.apply_all(actions);
+            }
+            View::Hosts => {
+                let theme = self.active_theme();
+                let ctx = crate::widgets::ViewCtx {
+                    model: &self.model,
+                    theme: &theme,
+                    tz: self.tz,
+                };
+                let mut actions = Vec::new();
+                show_hosts(ui, &ctx, &mut self.hosts_state, &mut actions);
+                self.apply_all(actions);
+            }
+            View::Lanes => {
+                let theme = self.active_theme();
+                let ctx = crate::widgets::ViewCtx {
+                    model: &self.model,
+                    theme: &theme,
+                    tz: self.tz,
+                };
+                let mut actions = Vec::new();
+                show_lanes(ui, &ctx, &mut self.lanes_state, &mut actions);
                 self.apply_all(actions);
             }
             view => {
@@ -1175,50 +1378,203 @@ impl Shell {
         egui::CentralPanel::default().show(ui, |ui| self.main(ui));
         self.ensure_requests();
     }
+}
 
-    fn dashboard(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(24.0);
-            ui.heading(self.model.view().label());
-            ui.add_space(8.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_min_width(420.0);
-                let row = |ui: &mut egui::Ui, key: &str, value: String| {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Label::new(key).truncate());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.monospace(value);
-                        });
-                    });
-                };
-                row(ui, "case", self.case.display().to_string());
-                if let Ok(meta) = std::fs::metadata(&self.case) {
-                    row(ui, "size", bytes(meta.len()));
-                }
-                match self.model.bounds.status(self.model.generation) {
-                    LoadStatus::Ready => {
-                        if let Some(Some((first, last))) = self.model.bounds.value() {
-                            let fmt = |ts: i64| {
-                                fp_query::format_time(ts, "exact", self.tz, "%Y-%m-%d %H:%M")
-                            };
-                            row(ui, "timespan", format!("{} -> {}", fmt(*first), fmt(*last)));
-                        } else {
-                            row(ui, "timespan", "no timed events".to_string());
-                        }
-                    }
-                    _ => {
-                        row(ui, "timespan", "…".to_string());
-                    }
-                }
-                if let Some(counts) = self.model.counts.value() {
-                    row(ui, "events in case", thousands(counts.in_case));
-                    if counts.in_scope != counts.in_case {
-                        row(ui, "events in scope", thousands(counts.in_scope));
-                    }
-                }
-            });
+fn build_dashboard_summary(
+    store: &fp_store::Store,
+    filter: &fp_query::TimelineFilter,
+) -> Result<DashboardSummaryVm, QueryError> {
+    let runs = store.list_runs()?;
+    let host_name = runs
+        .last()
+        .and_then(|r| r.host.as_deref())
+        .map(SafeText::new);
+    let user_name = runs
+        .last()
+        .and_then(|r| r.user.as_deref())
+        .map(SafeText::new);
+
+    let ioc_filter = fp_query::TimelineFilter {
+        ioc_only: true,
+        ..filter.clone()
+    };
+    let ioc_event_hits = store.count_events(&fp_store::EventFilter::from(&ioc_filter))?;
+    let sample_ioc_hosts =
+        fp_query::overview::hosts_overview(store, &ioc_filter, None, HostSort::EventsDesc, 5)
+            .map_err(|e| QueryError::Message(e.to_string()))?
+            .into_iter()
+            .map(|h| SafeText::new(&h.summary.host))
+            .collect();
+
+    let state_rows = fp_query::state_records(store, filter.run_id, None, None)
+        .map_err(|e| QueryError::Message(e.to_string()))?;
+    let mut flagged_state_count = 0u64;
+    let mut flagged_state_kinds = Vec::new();
+    for row in &state_rows {
+        let has_flags = row
+            .parsed
+            .as_ref()
+            .and_then(|v| v.get("flags"))
+            .and_then(|f| f.as_array())
+            .is_some_and(|a| !a.is_empty());
+        if has_flags {
+            flagged_state_count += 1;
+            if !flagged_state_kinds
+                .iter()
+                .any(|k: &SafeText| k.as_str() == row.kind)
+            {
+                flagged_state_kinds.push(SafeText::new(&row.kind));
+            }
+        }
+    }
+
+    let source_rows =
+        fp_query::sources(store, filter.run_id).map_err(|e| QueryError::Message(e.to_string()))?;
+    let mut source_warnings = Vec::new();
+    for src in &source_rows {
+        if let Some(status) = &src.status
+            && !matches!(
+                status,
+                fp_core::Availability::Present
+                    | fp_core::Availability::NotInstalled
+                    | fp_core::Availability::Empty
+            )
+        {
+            source_warnings.push(SourceIssueVm::new(&src.label(), &status.to_string()));
+        }
+    }
+    let cov = fp_query::coverage(&source_rows);
+    let coverage_total = cov.len();
+    let coverage_covered = cov
+        .iter()
+        .filter(|c| matches!(c.status, fp_query::CoverageStatus::Covered))
+        .count();
+
+    let last_diff = if runs.len() >= 2 {
+        let r_a = runs[runs.len() - 2].id;
+        let r_b = runs[runs.len() - 1].id;
+        let diff =
+            fp_query::diff_runs(store, r_a, r_b).map_err(|e| QueryError::Message(e.to_string()))?;
+        let mut added = 0;
+        let mut removed = 0;
+        let mut changed = 0;
+        for entry in diff {
+            match entry.change {
+                fp_query::DiffChange::Added => added += 1,
+                fp_query::DiffChange::Removed => removed += 1,
+                fp_query::DiffChange::Changed => changed += 1,
+            }
+        }
+        Some((r_a, r_b, added, removed, changed))
+    } else {
+        None
+    };
+
+    Ok(DashboardSummaryVm {
+        host_name,
+        user_name,
+        ioc_event_hits,
+        sample_ioc_hosts,
+        flagged_state_count,
+        flagged_state_kinds,
+        source_warnings,
+        coverage_covered,
+        coverage_total,
+        last_diff,
+    })
+}
+
+fn build_lanes_data(
+    store: &fp_store::Store,
+    filter: &fp_query::TimelineFilter,
+    bounds: Option<(i64, i64)>,
+    mode: LaneMode,
+    width_px: usize,
+) -> Result<LanesDataVm, QueryError> {
+    const MAX_INDIVIDUAL_EVENTS: u64 = 5_000;
+    let (case_start, case_end) = bounds.unwrap_or((0, 1));
+    let span_end = case_end.max(case_start.saturating_add(1));
+    let win_start = filter.since.unwrap_or(case_start);
+    let win_end = filter
+        .until
+        .unwrap_or(span_end)
+        .max(win_start.saturating_add(1));
+    let window = TimeWindow {
+        start_utc: win_start,
+        end_utc: win_end,
+    };
+
+    let timed_filter = fp_query::TimelineFilter {
+        timing: fp_store::EventTiming::Timed,
+        reverse: false,
+        ..filter.clone()
+    };
+    let total_timed = store.count_events(&fp_store::EventFilter::from(&timed_filter))?;
+
+    let untimed_filter = fp_query::TimelineFilter {
+        since: None,
+        until: None,
+        timing: fp_store::EventTiming::Untimed,
+        ..filter.clone()
+    };
+    let untimed_total = store.count_events(&fp_store::EventFilter::from(&untimed_filter))?;
+    let untimed_lanes = if mode == LaneMode::Category {
+        let counts = fp_query::overview::category_counts(store, &untimed_filter)
+            .map_err(|e| QueryError::Message(e.to_string()))?;
+        fp_query::category::Category::ALL
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| counts[i] > 0)
+            .map(|(i, c)| UntimedLaneVm::new(c.label(), counts[i], true))
+            .collect()
+    } else {
+        let page = fp_query::overview::facets(
+            store,
+            &untimed_filter,
+            Facet::Source,
+            fp_query::overview::MAX_FACET_ROWS,
+        )
+        .map_err(|e| QueryError::Message(e.to_string()))?;
+        page.values
+            .into_iter()
+            .map(|r| UntimedLaneVm::new(r.key.as_deref().unwrap_or("(none)"), r.count, false))
+            .collect()
+    };
+
+    if total_timed > MAX_INDIVIDUAL_EVENTS {
+        let hist = fp_query::overview::lane_histogram(store, filter, window, width_px, mode)
+            .map_err(|e| QueryError::Message(e.to_string()))?;
+        let density_lanes = hist.lanes.iter().map(LaneRowDensityVm::from_row).collect();
+        return Ok(LanesDataVm {
+            mode,
+            window,
+            total_timed,
+            truncated_to_density: true,
+            bucket_bounds: hist.bucket_bounds,
+            density_lanes,
+            events: Vec::new(),
+            untimed_total,
+            untimed_lanes,
         });
     }
+
+    let list_filter = fp_query::TimelineFilter {
+        limit: Some(MAX_INDIVIDUAL_EVENTS as usize),
+        ..timed_filter
+    };
+    let raw = fp_query::timeline(store, &list_filter)?;
+    let events = raw.iter().map(RowVm::from_row).collect();
+    Ok(LanesDataVm {
+        mode,
+        window,
+        total_timed,
+        truncated_to_density: false,
+        bucket_bounds: Vec::new(),
+        density_lanes: Vec::new(),
+        events,
+        untimed_total,
+        untimed_lanes,
+    })
 }
 
 impl eframe::App for Shell {

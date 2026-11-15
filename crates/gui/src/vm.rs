@@ -5,7 +5,8 @@
 use std::fmt;
 
 use fp_core::Confidence;
-use fp_query::overview::GroupRow;
+use fp_query::category::Category;
+use fp_query::overview::{GroupRow, HostOverview, LaneHistogramRow, LaneMode, TimeWindow};
 use fp_query::{EventDetailView, LinkDirection, LinkView, RunView, TimelineRow};
 
 /// Text that has passed through `fp_render::sanitize`; widgets only ever see this.
@@ -367,6 +368,142 @@ impl RunMarkerVm {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct HostSummaryVm {
+    pub host: SafeText,
+    raw_host: String,
+    pub events: u64,
+    pub first_in_scope: Option<i64>,
+    pub last_in_scope: Option<i64>,
+    pub first_in_case: Option<i64>,
+    pub distinct_kinds: u64,
+    pub distinct_sources: u64,
+    pub category_counts: [u64; Category::ALL.len()],
+    pub sources: Vec<SafeText>,
+    pub has_ioc: bool,
+}
+
+impl HostSummaryVm {
+    pub fn from_overview(ov: &HostOverview) -> Self {
+        Self {
+            host: SafeText::new(&ov.summary.host),
+            raw_host: ov.summary.host.clone(),
+            events: ov.summary.events,
+            first_in_scope: ov.summary.first_in_scope,
+            last_in_scope: ov.summary.last_in_scope,
+            first_in_case: ov.summary.first_in_case,
+            distinct_kinds: ov.summary.distinct_kinds,
+            distinct_sources: ov.summary.distinct_sources,
+            category_counts: ov.category_counts,
+            sources: ov.sources.iter().map(|s| SafeText::new(s)).collect(),
+            has_ioc: ov.has_ioc,
+        }
+    }
+
+    pub fn host_key(&self) -> &str {
+        &self.raw_host
+    }
+
+    /// True when the host's earliest timed event in the whole case falls inside `window`.
+    pub fn is_new_in_window(&self, window: Option<(i64, i64)>) -> bool {
+        matches!(
+            (self.first_in_case, window),
+            (Some(first), Some((start, end))) if first >= start && first <= end
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceIssueVm {
+    pub label: SafeText,
+    pub status: SafeText,
+}
+
+impl SourceIssueVm {
+    pub fn new(label: &str, status: &str) -> Self {
+        Self {
+            label: SafeText::new(label),
+            status: SafeText::new(status),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DashboardSummaryVm {
+    pub host_name: Option<SafeText>,
+    pub user_name: Option<SafeText>,
+    pub ioc_event_hits: u64,
+    pub sample_ioc_hosts: Vec<SafeText>,
+    pub flagged_state_count: u64,
+    pub flagged_state_kinds: Vec<SafeText>,
+    pub source_warnings: Vec<SourceIssueVm>,
+    pub coverage_covered: usize,
+    pub coverage_total: usize,
+    /// `(older_run_id, newer_run_id, added, removed, changed)` across the latest two runs.
+    pub last_diff: Option<(u64, u64, usize, usize, usize)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LaneRowDensityVm {
+    pub label: SafeText,
+    raw_key: String,
+    pub total: u64,
+    pub category_hint: Category,
+    pub buckets: Vec<u64>,
+}
+
+impl LaneRowDensityVm {
+    pub fn from_row(row: &LaneHistogramRow) -> Self {
+        Self {
+            label: SafeText::new(&row.label),
+            raw_key: row.label.clone(),
+            total: row.total,
+            category_hint: row.category_hint,
+            buckets: row.buckets.clone(),
+        }
+    }
+
+    pub fn lane_key(&self) -> &str {
+        &self.raw_key
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UntimedLaneVm {
+    pub label: SafeText,
+    raw_key: String,
+    pub count: u64,
+    pub is_category: bool,
+}
+
+impl UntimedLaneVm {
+    pub fn new(raw_key: &str, count: u64, is_category: bool) -> Self {
+        Self {
+            label: SafeText::new(raw_key),
+            raw_key: raw_key.to_string(),
+            count,
+            is_category,
+        }
+    }
+
+    pub fn lane_key(&self) -> &str {
+        &self.raw_key
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LanesDataVm {
+    pub mode: LaneMode,
+    pub window: TimeWindow,
+    pub total_timed: u64,
+    pub truncated_to_density: bool,
+    pub bucket_bounds: Vec<(i64, i64)>,
+    pub density_lanes: Vec<LaneRowDensityVm>,
+    pub events: Vec<RowVm>,
+    pub untimed_total: u64,
+    pub untimed_lanes: Vec<UntimedLaneVm>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +648,43 @@ mod tests {
         let pretty = detail.attrs.expect("attrs").to_pretty_string();
         assert!(!pretty.contains('\u{202e}'));
         assert!(!pretty.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn g4_view_models_sanitize_hostile_strings_and_compute_new_badge() {
+        let overview = HostOverview {
+            summary: fp_store::HostSummary {
+                host: "bad\u{202e}host\x1b[31m.example".into(),
+                events: 4,
+                first_in_scope: Some(200),
+                last_in_scope: Some(300),
+                first_in_case: Some(200),
+                distinct_kinds: 1,
+                distinct_sources: 1,
+            },
+            category_counts: [4, 0, 0, 0, 0, 0, 0, 0, 0],
+            sources: vec!["src\u{0007}x".into()],
+            has_ioc: true,
+        };
+        let vm = HostSummaryVm::from_overview(&overview);
+        assert_clean(&vm.host);
+        assert_clean(&vm.sources[0]);
+        assert!(vm.is_new_in_window(Some((100, 300))));
+        assert!(!vm.is_new_in_window(Some((250, 300))));
+        assert!(!vm.is_new_in_window(None));
+
+        let issue = SourceIssueVm::new("src\u{202e}1", "err\x1b[0mor");
+        assert_clean(&issue.label);
+        assert_clean(&issue.status);
+
+        let lane = LaneRowDensityVm::from_row(&LaneHistogramRow {
+            label: "lane\x1b[1m".into(),
+            total: 3,
+            category_hint: Category::Web,
+            buckets: vec![3],
+        });
+        assert_clean(&lane.label);
+        let untimed = UntimedLaneVm::new("bash\u{202e}", 2, false);
+        assert_clean(&untimed.label);
     }
 }

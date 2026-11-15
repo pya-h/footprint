@@ -127,6 +127,31 @@ pub enum Action {
         generation: Generation,
         result: Result<Vec<crate::vm::GroupRowVm>, String>,
     },
+    DashboardSummary {
+        generation: Generation,
+        result: Result<crate::vm::DashboardSummaryVm, String>,
+    },
+    DashboardHosts {
+        generation: Generation,
+        result: Result<Vec<crate::vm::HostSummaryVm>, String>,
+    },
+    Hosts {
+        generation: Generation,
+        result: Result<Vec<crate::vm::HostSummaryVm>, String>,
+    },
+    Lanes {
+        generation: Generation,
+        result: Result<crate::vm::LanesDataVm, String>,
+    },
+    SetHostSort(fp_query::overview::HostSort),
+    RequestHostsQuery,
+    SetLanesMode(fp_query::overview::LaneMode),
+    AddIoc {
+        ioc_type: String,
+        value: String,
+    },
+    IocWriteDone(Result<String, String>),
+    DismissIocStatus,
     SetGroupBy(Option<fp_query::overview::GroupBy>),
     SetReverse(bool),
     TogglePinInspector,
@@ -206,6 +231,16 @@ pub struct Model {
     pub detail: Slot<Option<Box<crate::vm::DetailVm>>>,
     pub around: Slot<Vec<crate::vm::RowVm>>,
     pub groups: Slot<Vec<crate::vm::GroupRowVm>>,
+    pub dashboard_summary: Slot<crate::vm::DashboardSummaryVm>,
+    pub dashboard_hosts: Slot<Vec<crate::vm::HostSummaryVm>>,
+    pub hosts: Slot<Vec<crate::vm::HostSummaryVm>>,
+    pub lanes: Slot<crate::vm::LanesDataVm>,
+    pub hosts_gen: Generation,
+    pub lanes_gen: Generation,
+    pub host_sort: fp_query::overview::HostSort,
+    pub lanes_mode: fp_query::overview::LaneMode,
+    pub pending_ioc_add: Option<(String, String)>,
+    pub ioc_status: Option<Result<String, String>>,
     pub group_by: Option<fp_query::overview::GroupBy>,
     pub reverse: bool,
     pub inspector_pin: Option<Selection>,
@@ -467,12 +502,57 @@ impl Model {
             Action::ClearScrollTarget => {
                 self.scroll_to_row = None;
             }
+            Action::DashboardSummary { generation, result } => {
+                self.dashboard_summary
+                    .absorb(generation, self.generation, result);
+            }
+            Action::DashboardHosts { generation, result } => {
+                self.dashboard_hosts
+                    .absorb(generation, self.generation, result);
+            }
+            Action::Hosts { generation, result } => {
+                self.hosts.absorb(generation, self.hosts_gen, result);
+            }
+            Action::Lanes { generation, result } => {
+                self.lanes.absorb(generation, self.lanes_gen, result);
+            }
+            Action::SetHostSort(sort) => {
+                if self.host_sort != sort {
+                    self.host_sort = sort;
+                    self.hosts_gen += 1;
+                }
+            }
+            Action::RequestHostsQuery => {
+                self.hosts_gen += 1;
+            }
+            Action::SetLanesMode(mode) => {
+                if self.lanes_mode != mode {
+                    self.lanes_mode = mode;
+                    self.lanes_gen += 1;
+                }
+            }
+            Action::AddIoc { ioc_type, value } => {
+                self.pending_ioc_add = Some((ioc_type, value));
+            }
+            Action::IocWriteDone(result) => {
+                let ok = result.is_ok();
+                self.ioc_status = Some(result);
+                if ok {
+                    // Refresh scope & host/dashboard counts after the IOC correlation pass completes.
+                    self.scope_changed();
+                }
+            }
+            Action::DismissIocStatus => {
+                self.ioc_status = None;
+            }
         }
     }
 
     fn scope_changed(&mut self) {
         self.generation += 1;
         self.group_gen += 1;
+        self.hosts_gen += 1;
+        self.lanes_gen += 1;
     }
 
     /// The count for the "untimed events hidden by the time window" notice,
