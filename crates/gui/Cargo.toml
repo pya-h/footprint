@@ -1,0 +1,18 @@
+[package]
+name = "fp-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    "glow", "wayland", "x11", "default_fonts", "system_fonts", "accesskit", "clipboard",
+] } # the window toolkit; glow (OpenGL) keeps the tree smaller than wgpu; system-font fallback for non-latin evidence; clipboard is copy-only
+egui_extras = { version = "0.37", default-features = false } # virtualized table for the timeline
+fp-core = { path = "../core" }
+fp-store = { path = "../store" } # read-only case opens inside worker threads
+fp-query = { path = "../query" } # the read model; the gui crate holds no SQL
+fp-render = { path = "../render" } # sanitize and export
+fp-correlate = { path = "../correlate" } # trace tree types
+anyhow = "1"

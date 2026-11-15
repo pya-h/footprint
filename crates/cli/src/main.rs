@@ -57,6 +57,8 @@ enum Command {
     Explain { finding: String },
     /// Interactive terminal UI (default: the case at --case)
     Tui,
+    /// Desktop GUI (only in builds with the `gui` feature)
+    Gui,
 }
 
 #[derive(Args)]
@@ -339,7 +341,19 @@ fn main() -> Result<()> {
         Command::Export(args) => export(&cli.case, args, tz),
         Command::Explain { finding } => explain(&finding),
         Command::Tui => fp_tui::run(&cli.case, tz),
+        Command::Gui => gui(&cli.case, tz),
     }
+}
+
+#[cfg(feature = "gui")]
+fn gui(case: &Path, tz: fp_query::Tz) -> Result<()> {
+    fp_gui::run(case, tz)
+}
+
+#[cfg(not(feature = "gui"))]
+fn gui(_case: &Path, _tz: fp_query::Tz) -> Result<()> {
+    eprintln!("this build has no GUI; rebuild with `--features gui`; or use `footprint tui`");
+    std::process::exit(2);
 }
 
 fn collect(case: &Path, args: CollectArgs) -> Result<()> {
