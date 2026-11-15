@@ -162,6 +162,20 @@ pub enum Action {
     ImportIocs(String),
     /// remove an IOC and rebuild the IOC pass so its hits disappear too
     RemoveIoc(u64),
+    /// start a collect with the collect view's form (handled by the shell)
+    StartCollect,
+    /// ask the running collect to stop after the current source
+    CancelCollect,
+    /// write the current scope to a file (handled by the shell)
+    ExportScope {
+        path: std::path::PathBuf,
+        format: String,
+        redact: bool,
+    },
+    /// switch the colour theme by name (handled by the shell)
+    SetTheme(String),
+    /// open the export dialog (handled by the shell)
+    OpenExport,
     IocWriteDone(Result<String, String>),
     DismissIocStatus,
     SetGroupBy(Option<fp_query::overview::GroupBy>),
@@ -637,6 +651,9 @@ impl Model {
             Action::DismissIocStatus => {
                 self.ioc_status = None;
             }
+            // handled by the shell before they reach the model
+            Action::StartCollect | Action::CancelCollect | Action::ExportScope { .. } => {}
+            Action::SetTheme(_) | Action::OpenExport => {}
         }
     }
 

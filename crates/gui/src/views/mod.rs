@@ -1,8 +1,12 @@
+pub mod collect;
 pub mod dashboard;
 pub mod diff;
+pub mod export;
+pub mod help;
 pub mod hosts;
 pub mod ioc;
 pub mod lanes;
+pub mod palette;
 pub mod sources;
 pub mod state;
 pub mod timeline;

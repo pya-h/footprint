@@ -17,7 +17,8 @@ mod state;
 mod timeline;
 
 pub use collect::{
-    CollectEvent, CollectParams, CollectSummary, cancel_collect, run_collect, selected,
+    CollectEvent, CollectParams, CollectSummary, IngestTotals, cancel_collect, run_collect,
+    selected,
 };
 pub use detail::{EventDetailView, LinkDirection, LinkView, event_detail};
 pub use diff::{DiffChange, DiffEntry, diff_runs};

@@ -12,11 +12,17 @@ use fp_query::overview::{Facet, HostSort, LaneMode, TimeWindow};
 use crate::model::{Action, Counts, LoadStatus, Model, ScopeAction, Selection, View};
 use crate::settings::Settings;
 use crate::theme::{Theme, ThemeName};
+use crate::views::collect::{
+    CollectRun, CollectViewState, InstanceRow, InstanceState, show_collect,
+};
 use crate::views::dashboard::{DashboardState, show_dashboard};
 use crate::views::diff::{DiffViewState, show_diff};
+use crate::views::export::{ExportDialog, show_export_dialog, spawn_export};
+use crate::views::help::show_help;
 use crate::views::hosts::{HOSTS_CAP, HostsState, show_hosts};
 use crate::views::ioc::{IocViewState, show_iocs};
 use crate::views::lanes::{LanesState, show_lanes};
+use crate::views::palette::{PaletteState, show_palette, toggle as palette_toggle};
 use crate::views::sources::show_sources;
 use crate::views::state::{StateViewState, show_state};
 use crate::views::trace::{TraceState, show_trace};
@@ -34,6 +40,7 @@ use crate::worker::cache::BLOCK_SIZE;
 use crate::worker::{BlockCache, Generation, QueryError, ReqKind, Worker};
 
 pub struct Shell {
+    ctx: egui::Context,
     case: PathBuf,
     tz: fp_query::Tz,
     theme: ThemeName,
@@ -75,6 +82,10 @@ pub struct Shell {
     state_state: StateViewState,
     diff_state: DiffViewState,
     ioc_state: IocViewState,
+    collect_state: CollectViewState,
+    export_dialog: ExportDialog,
+    palette: PaletteState,
+    help_open: bool,
     focus_search_next: bool,
 }
 
@@ -86,6 +97,15 @@ fn apply_theme(name: ThemeName, ui_scale: f32, ctx: &egui::Context) {
     }
     .apply(ctx);
     ctx.set_zoom_factor(ui_scale.clamp(0.8, 1.6));
+}
+
+fn parse_theme(name: &str) -> Option<ThemeName> {
+    match name.to_lowercase().replace(['_', '-'], " ").as_str() {
+        "dark" => Some(ThemeName::Dark),
+        "light" => Some(ThemeName::Light),
+        "high contrast" | "hc" => Some(ThemeName::HighContrast),
+        _ => None,
+    }
 }
 
 fn view_from_label(label: &str) -> Option<View> {
@@ -177,6 +197,7 @@ impl Shell {
             model.nav.navigate(view, Selection::None);
         }
         Self {
+            ctx: ctx.clone(),
             case,
             tz,
             theme: settings.theme,
@@ -213,6 +234,10 @@ impl Shell {
             state_state: StateViewState::default(),
             diff_state: DiffViewState::default(),
             ioc_state: IocViewState::default(),
+            collect_state: CollectViewState::default(),
+            export_dialog: ExportDialog::default(),
+            palette: PaletteState::default(),
+            help_open: false,
             submitted_states: None,
             submitted_diff: None,
             submitted_iocs: None,
@@ -229,6 +254,43 @@ impl Shell {
     pub fn apply(&mut self, action: Action) {
         let is_refresh = matches!(action, Action::RefreshCase);
         let is_ioc_ok = matches!(action, Action::IocWriteDone(Ok(_)));
+        if matches!(action, Action::StartCollect) {
+            self.start_collect();
+            return;
+        }
+        if matches!(action, Action::CancelCollect) {
+            fp_query::cancel_collect();
+            return;
+        }
+        if let Action::SetTheme(name) = &action {
+            if let Some(theme) = parse_theme(name) {
+                self.theme = theme;
+                let ctx = self.ctx.clone();
+                apply_theme(self.theme, self.settings.ui_scale, &ctx);
+            }
+            return;
+        }
+        if matches!(action, Action::OpenExport) {
+            self.export_dialog.open_default(&self.case);
+            return;
+        }
+        if let Action::ExportScope {
+            path,
+            format,
+            redact,
+        } = &action
+        {
+            let rx = spawn_export(
+                self.case.clone(),
+                fp_store::EventFilter::from(&self.model.scope.filter()),
+                format.clone(),
+                path.clone(),
+                *redact,
+                self.tz,
+            );
+            self.export_dialog.running = Some(rx);
+            return;
+        }
         self.model.apply(action);
         if let Some(request) = self.model.pending_ioc_write.take() {
             self.submit_ioc_write(request);
@@ -269,6 +331,95 @@ impl Shell {
             Ok(Box::new(message))
         });
         self.outstanding.insert(id);
+    }
+
+    fn start_collect(&mut self) {
+        if self.collect_state.run.is_some() {
+            return;
+        }
+        let params = self.collect_state.params();
+        let case = self.case.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = fp_query::run_collect(&case, &params, Some(&tx));
+            if let Err(err) = result {
+                let _ = tx.send(fp_query::CollectEvent::Failed(err.to_string()));
+            }
+        });
+        self.collect_state.run = Some(CollectRun {
+            rx,
+            planned_total: None,
+            done: 0,
+            rows: Vec::new(),
+            totals: fp_query::IngestTotals::default(),
+            finished: None,
+            run_id: None,
+        });
+    }
+
+    fn drain_collect(&mut self) {
+        let Some(run) = self.collect_state.run.as_mut() else {
+            return;
+        };
+        let mut finished = None;
+        for event in run.rx.try_iter() {
+            match event {
+                fp_query::CollectEvent::Planned { total } => run.planned_total = Some(total),
+                fp_query::CollectEvent::InstanceStarted { label } => run.rows.push(InstanceRow {
+                    label,
+                    state: InstanceState::Reading,
+                }),
+                fp_query::CollectEvent::InstanceDone {
+                    label,
+                    totals,
+                    warnings,
+                    status,
+                } => {
+                    run.done += 1;
+                    run.totals.events_new += totals.events_new;
+                    run.totals.events_known += totals.events_known;
+                    run.totals.states += totals.states;
+                    run.totals.artifacts += totals.artifacts;
+                    if let Some(row) = run.rows.iter_mut().find(|r| r.label == label) {
+                        row.state = InstanceState::Done {
+                            events_new: totals.events_new,
+                            status: status.to_string(),
+                            warnings,
+                        };
+                    }
+                }
+                fp_query::CollectEvent::InstanceError { label, error } => {
+                    run.done += 1;
+                    if let Some(row) = run.rows.iter_mut().find(|r| r.label == label) {
+                        row.state = InstanceState::Error(error);
+                    }
+                }
+                fp_query::CollectEvent::CorrelateFailed(err) => {
+                    run.rows.push(InstanceRow {
+                        label: "correlation".to_string(),
+                        state: InstanceState::Error(err),
+                    });
+                }
+                fp_query::CollectEvent::Finished(summary) => {
+                    run.run_id = Some(summary.run_id);
+                    finished = Some(format!(
+                        "done: {} sources, +{} new, {} errors",
+                        summary.sources_read,
+                        summary.totals.events_new,
+                        summary.errors.len()
+                    ));
+                }
+                fp_query::CollectEvent::Failed(err) => {
+                    finished = Some(format!("collect failed: {err}"));
+                }
+            }
+        }
+        if let Some(message) = finished {
+            run.finished = Some(message);
+            // the case changed under the pool's readers: drop every stale marker
+            // so the next ensure_requests round re-queries it
+            self.reset_submission_markers();
+        }
     }
 
     fn apply_all(&mut self, actions: Vec<Action>) {
@@ -1142,6 +1293,14 @@ impl Shell {
         if ui.input(|i| i.key_pressed(egui::Key::I) && !i.modifiers.any()) {
             self.settings.panels.inspector_collapsed = !self.settings.panels.inspector_collapsed;
         }
+        if ui.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl && !i.modifiers.shift) {
+            palette_toggle(&mut self.palette);
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::F1))
+            || ui.input(|i| i.key_pressed(egui::Key::Slash) && i.modifiers.shift)
+        {
+            self.help_open = !self.help_open;
+        }
         if ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) {
             self.apply(Action::NavBack);
         }
@@ -1265,6 +1424,13 @@ impl Shell {
                 tz_resp.response.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Time zone")
                 });
+                if ui
+                    .small_button("export")
+                    .on_hover_text("write the events in the current scope to a file")
+                    .clicked()
+                {
+                    self.export_dialog.open_default(&self.case);
+                }
                 if ui
                     .selectable_label(!self.settings.panels.inspector_collapsed, "inspector")
                     .on_hover_text("toggle inspector (i)")
@@ -1562,19 +1728,23 @@ impl Shell {
                 show_sources(ui, &ctx, &mut actions);
                 self.apply_all(actions);
             }
-            view => {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.heading(view.label());
-                        ui.label("this view is built in a later milestone");
-                    });
-                });
+            View::Collect => {
+                let theme = self.active_theme();
+                let ctx = crate::widgets::ViewCtx {
+                    model: &self.model,
+                    theme: &theme,
+                    tz: self.tz,
+                };
+                let mut actions = Vec::new();
+                show_collect(ui, &ctx, &mut self.collect_state, &mut actions);
+                self.apply_all(actions);
             }
         }
     }
 
     pub fn show_ui(&mut self, ui: &mut egui::Ui) {
         self.drain_worker();
+        self.drain_collect();
         if let Some(error) = self.startup_error.clone() {
             ui.centered_and_justified(|ui| {
                 ui.vertical_centered(|ui| {
@@ -1644,6 +1814,27 @@ impl Shell {
         }
 
         egui::CentralPanel::default().show(ui, |ui| self.main(ui));
+        {
+            let theme = self.active_theme();
+            let mut actions = Vec::new();
+            let in_scope = self.model.counts.value().map(|c| c.in_scope);
+            show_export_dialog(
+                ui.ctx(),
+                &theme,
+                &mut self.export_dialog,
+                in_scope,
+                &mut actions,
+            );
+            let hosts: Vec<String> = self
+                .model
+                .hosts
+                .value()
+                .map(|rows| rows.iter().map(|h| h.host.as_str().to_string()).collect())
+                .unwrap_or_default();
+            show_palette(ui.ctx(), &theme, &mut self.palette, &hosts, &mut actions);
+            show_help(ui.ctx(), &theme, &mut self.help_open);
+            self.apply_all(actions);
+        }
         self.ensure_requests();
     }
 }
