@@ -34,6 +34,23 @@ pub enum StoreError {
     InvalidTimeRange { start: i64, end: i64 },
 }
 
+impl StoreError {
+    /// True when SQLite aborted the statement because its connection was interrupted;
+    /// callers treat this as "cancelled", not as a failure.
+    pub fn is_interruption(&self) -> bool {
+        matches!(
+            self,
+            Self::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::OperationInterrupted,
+                    ..
+                },
+                _
+            ))
+        )
+    }
+}
+
 pub struct Store {
     conn: Connection,
     path: PathBuf,
