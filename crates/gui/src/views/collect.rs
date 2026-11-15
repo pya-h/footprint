@@ -9,22 +9,20 @@ use eframe::egui;
 use fp_query::{CollectEvent, CollectParams};
 
 use crate::model::{Action, View};
-use crate::theme::Theme;
 use crate::widgets::ViewCtx;
 use crate::widgets::chip::thousands;
 
-/// form families ↔ source-kind prefixes; opt-ins are excluded from `--sources all`
-const FAMILIES: &[(&str, &[&str], bool)] = &[
-    ("Browsers", &["chromium", "firefox"], false),
-    ("Downloads", &["dlmgr"], false),
-    ("Packages", &["pkg"], false),
-    ("Privilege", &["auth"], false),
-    ("Shell", &["shell"], false),
-    ("Desktop", &["desktop"], false),
-    ("Filesystem", &["fs"], false),
-    ("Persistence", &["persist"], false),
-    ("Live state (--with-live)", &["live"], true),
-    ("Scanners (--with-scanners)", &["scan"], true),
+/// standard form families ↔ source-kind prefixes; opt-ins (`with_live`,
+/// `with_scanners`) live in their own toggles so `--sources all` excludes them
+const FAMILIES: &[(&str, &[&str])] = &[
+    ("Browsers", &["chromium", "firefox"]),
+    ("Downloads", &["dlmgr"]),
+    ("Packages", &["pkg"]),
+    ("Privilege", &["auth"]),
+    ("Shell", &["shell"]),
+    ("Desktop", &["desktop"]),
+    ("Filesystem", &["fs"]),
+    ("Persistence", &["persist"]),
 ];
 
 const PRESETS: &[(&str, &str)] = &[
@@ -37,7 +35,7 @@ pub struct CollectViewState {
     pub preset: String,
     pub since: String,
     pub until: String,
-    /// checked families by name; empty = `--sources all`
+    /// checked standard families by name; empty or all = `--sources all`
     pub families: Vec<String>,
     pub with_live: bool,
     pub with_scanners: bool,
@@ -57,13 +55,13 @@ pub struct CollectRun {
     pub done: usize,
     pub rows: Vec<InstanceRow>,
     pub totals: fp_query::IngestTotals,
-    pub finished: Option<String>,
+    pub finished: Option<crate::vm::SafeText>,
     pub run_id: Option<u64>,
 }
 
 #[derive(Debug)]
 pub struct InstanceRow {
-    pub label: String,
+    pub label: crate::vm::SafeText,
     pub state: InstanceState,
 }
 
@@ -72,10 +70,10 @@ pub enum InstanceState {
     Reading,
     Done {
         events_new: usize,
-        status: String,
-        warnings: Vec<String>,
+        status: crate::vm::SafeText,
+        warnings: Vec<crate::vm::SafeText>,
     },
-    Error(String),
+    Error(crate::vm::SafeText),
 }
 
 impl Default for CollectViewState {
@@ -86,8 +84,7 @@ impl Default for CollectViewState {
             until: String::new(),
             families: FAMILIES
                 .iter()
-                .filter(|(_, _, opt_in)| !opt_in)
-                .map(|(name, _, _)| name.to_string())
+                .map(|(name, _)| (*name).to_string())
                 .collect(),
             with_live: false,
             with_scanners: false,
@@ -110,10 +107,15 @@ impl CollectViewState {
         } else {
             Some(self.preset.clone())
         };
+        let all_standard = FAMILIES
+            .iter()
+            .all(|(name, _)| self.families.iter().any(|f| f == name));
         let mut sources: Vec<String> = Vec::new();
-        for (name, prefixes, _) in FAMILIES {
-            if self.families.iter().any(|f| f == name) {
-                sources.extend(prefixes.iter().map(|p| p.to_string()));
+        if !all_standard {
+            for (name, prefixes) in FAMILIES {
+                if self.families.iter().any(|f| f == name) {
+                    sources.extend(prefixes.iter().map(|p| (*p).to_string()));
+                }
             }
         }
         CollectParams {
@@ -200,7 +202,7 @@ pub fn show_collect(
     ui.add_space(6.0);
 
     if state.run.is_some() {
-        render_progress(ui, ctx.theme, state, actions);
+        render_progress(ui, ctx, state, actions);
         return;
     }
 
@@ -269,20 +271,23 @@ fn render_window(ui: &mut egui::Ui, state: &mut CollectViewState) {
 fn render_sources(ui: &mut egui::Ui, state: &mut CollectViewState) {
     ui.label(egui::RichText::new("SOURCES").small().strong());
     ui.horizontal_wrapped(|ui| {
-        for (name, _, opt_in) in FAMILIES {
+        for (name, _) in FAMILIES {
             let mut checked = state.families.iter().any(|f| f == name);
-            let mut label = (*name).to_string();
-            if *opt_in && checked && name.contains("Scanners") {
-                label.push_str("  (runs clamscan/rkhunter)");
-            }
-            if ui.checkbox(&mut checked, label).changed() {
+            if ui.checkbox(&mut checked, *name).changed() {
                 if checked {
-                    state.families.push(name.to_string());
+                    state.families.push((*name).to_string());
                 } else {
                     state.families.retain(|f| f != name);
                 }
             }
         }
+        ui.checkbox(&mut state.with_live, "Live state (--with-live)");
+        let scanner_label = if state.with_scanners {
+            "Scanners (--with-scanners)  (runs clamscan/rkhunter)"
+        } else {
+            "Scanners (--with-scanners)"
+        };
+        ui.checkbox(&mut state.with_scanners, scanner_label);
     });
     if state.families.is_empty() {
         ui.label(
@@ -321,13 +326,18 @@ fn render_advanced(ui: &mut egui::Ui, state: &mut CollectViewState) {
 
 fn render_progress(
     ui: &mut egui::Ui,
-    theme: &Theme,
+    ctx: &ViewCtx<'_>,
     state: &mut CollectViewState,
     actions: &mut Vec<Action>,
 ) {
+    let theme = ctx.theme;
     let Some(run) = state.run.as_mut() else {
         return;
     };
+    if run.finished.is_none() {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(80));
+    }
     if let Some(total) = run.planned_total {
         let progress = run.done as f32 / total.max(1) as f32;
         ui.add(egui::ProgressBar::new(progress).text(format!("{} / {} sources", run.done, total)));
@@ -389,7 +399,7 @@ fn render_progress(
                     } else {
                         ui.spinner();
                     }
-                    ui.label(egui::RichText::new(&row.label).monospace());
+                    ui.label(egui::RichText::new(row.label.as_str()).monospace());
                     match &row.state {
                         InstanceState::Reading => {
                             ui.label(egui::RichText::new("reading…").small().weak());
@@ -400,14 +410,26 @@ fn render_progress(
                             warnings,
                         } => {
                             ui.label(
-                                egui::RichText::new(format!("{events_new} new · {status}")).small(),
+                                egui::RichText::new(format!(
+                                    "{events_new} new · {}",
+                                    status.as_str()
+                                ))
+                                .small(),
                             );
                             for warning in warnings {
-                                ui.label(egui::RichText::new(warning).small().color(theme.warn));
+                                ui.label(
+                                    egui::RichText::new(warning.as_str())
+                                        .small()
+                                        .color(theme.warn),
+                                );
                             }
                         }
                         InstanceState::Error(err) => {
-                            ui.label(egui::RichText::new(err).small().color(theme.danger));
+                            ui.label(
+                                egui::RichText::new(err.as_str())
+                                    .small()
+                                    .color(theme.danger),
+                            );
                         }
                     }
                 });
@@ -416,9 +438,14 @@ fn render_progress(
 
     if let Some(summary) = &run.finished {
         ui.separator();
-        ui.label(summary);
-        // the last run id is unknown here; the shell fills `last_run_id` when starting
+        ui.label(summary.as_str());
         if let Some(run_id) = run.run_id {
+            let prev_id = ctx
+                .model
+                .runs
+                .value()
+                .and_then(|runs| runs.windows(2).find(|w| w[1].id == run_id).map(|w| w[0].id))
+                .or_else(|| (run_id > 1).then_some(run_id - 1));
             ui.horizontal(|ui| {
                 if ui.button("View what's new").clicked() {
                     actions.push(Action::Scope(crate::model::ScopeAction::SetRun(Some(
@@ -426,11 +453,36 @@ fn render_progress(
                     ))));
                     actions.push(Action::Go(View::Timeline));
                 }
-                if run_id > 1 && ui.button("Diff vs previous").clicked() {
-                    actions.push(Action::SetDiffRuns(run_id - 1, run_id));
+                if let Some(prev) = prev_id
+                    && ui.button("Diff vs previous").clicked()
+                {
+                    actions.push(Action::SetDiffRuns(prev, run_id));
                     actions.push(Action::Go(View::Diff));
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equivalent_command_handles_defaults_subsets_and_opt_ins() {
+        let mut state = CollectViewState::default();
+        assert_eq!(state.equivalent_command(), "footprint collect --since -7d");
+
+        state.with_live = true;
+        state.with_scanners = true;
+        let cmd = state.equivalent_command();
+        assert!(cmd.contains("--with-live"));
+        assert!(cmd.contains("--with-scanners"));
+        assert!(!cmd.contains("--sources"));
+
+        state.families.retain(|f| f == "Browsers");
+        let subset = state.equivalent_command();
+        assert!(subset.contains("--sources chromium,firefox"));
+        assert!(subset.contains("--with-live"));
     }
 }

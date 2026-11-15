@@ -10,6 +10,7 @@ use crate::model::{Action, LoadStatus, Model, ScopeAction, Selection, View};
 use crate::theme::Theme;
 use crate::vm::DetailVm;
 use crate::widgets::badge::{ConfidenceGlyph, confidence_disc};
+use crate::widgets::chip::thousands;
 use crate::widgets::json_tree::show_json_tree;
 
 pub fn show_inspector(
@@ -60,22 +61,17 @@ pub fn show_inspector(
                 );
             });
         }
-        Selection::Event(id) => {
+        Selection::Event(id) | Selection::TraceNode(id) => {
             show_event_inspector(ui, id, model, theme, tz, actions);
         }
         Selection::State(id) => {
             show_state_inspector(ui, id, model, theme);
         }
         Selection::Ioc(id) => {
-            ui.label(format!("IOC hit #{id}"));
-            ui.label(egui::RichText::new("full IOC inspector arrives with IOC hits view").weak());
+            show_ioc_inspector(ui, id, model, theme, actions);
         }
         Selection::Source(id) => {
             show_source_inspector(ui, id, model, theme);
-        }
-        Selection::TraceNode(id) => {
-            ui.label(format!("Trace node #{id}"));
-            ui.label(egui::RichText::new("full trace inspector arrives with Trace view").weak());
         }
     }
 }
@@ -249,6 +245,55 @@ fn show_event_inspector(
         });
 }
 
+fn show_ioc_inspector(
+    ui: &mut egui::Ui,
+    ioc_id: u64,
+    model: &Model,
+    theme: &Theme,
+    actions: &mut Vec<Action>,
+) {
+    let Some(ioc) = model
+        .iocs
+        .value()
+        .and_then(|rows| rows.iter().find(|r| r.id == ioc_id))
+    else {
+        ui.label(egui::RichText::new("indicator not in the current query").weak());
+        return;
+    };
+    ui.label(
+        egui::RichText::new(format!("indicator · {}", ioc.ioc_type.as_str()))
+            .small()
+            .color(theme.text_dim),
+    );
+    ui.label(egui::RichText::new(ioc.value.as_str()).monospace().strong());
+    if let Some(note) = &ioc.note {
+        ui.label(egui::RichText::new(note.as_str()).small());
+    }
+    ui.label(
+        egui::RichText::new(format!("{} linked hits", thousands(ioc.hits)))
+            .small()
+            .color(if ioc.hits > 0 {
+                theme.ioc
+            } else {
+                theme.text_dim
+            }),
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.small_button("copy value").clicked() {
+            ui.ctx().copy_text(ioc.value.as_str().to_string());
+        }
+        if ui
+            .small_button("show hits in timeline")
+            .on_hover_text("scope the timeline to events matching an IOC")
+            .clicked()
+        {
+            actions.push(Action::Scope(crate::model::ScopeAction::SetIocOnly(true)));
+            actions.push(Action::Go(crate::model::View::Timeline));
+        }
+    });
+}
+
 fn show_source_inspector(ui: &mut egui::Ui, source_id: u64, model: &Model, theme: &Theme) {
     let Some(row) = model
         .sources
@@ -269,7 +314,11 @@ fn show_source_inspector(ui: &mut egui::Ui, source_id: u64, model: &Model, theme
             };
             let text = cell
                 .as_ref()
-                .map(|a| a.to_string())
+                .map(|a| {
+                    crate::vm::SafeText::new(&a.to_string())
+                        .as_str()
+                        .to_string()
+                })
                 .unwrap_or_else(|| "did not run".to_string());
             let color = match cell {
                 Some(fp_core::Availability::Present) => theme.ok,

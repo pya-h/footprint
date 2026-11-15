@@ -84,15 +84,25 @@ fn palette_help_and_collect_form() {
         );
     pump_until(&mut harness, |s| s.model().counts.value().is_some());
 
-    // Ctrl+K opens the palette; Enter on the first hit runs it
+    // Ctrl+K opens the palette; clicking a command executes it
     harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::K);
     harness.step();
     harness.step();
     harness.get_by_label("Command palette");
-    harness.key_press(egui::Key::Enter);
+    harness.get_by_label("go hosts").click();
     harness.step();
     harness.step();
-    assert_eq!(harness.state().model().view(), View::Dashboard);
+    assert_eq!(harness.state().model().view(), View::Hosts);
+
+    // Escape closes the open palette or help overlay without touching selection behind it
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::K);
+    harness.step();
+    harness.step();
+    harness.get_by_label("Command palette");
+    harness.key_press(egui::Key::Escape);
+    harness.step();
+    harness.step();
+    assert_eq!(harness.query_all_by_label("Command palette").count(), 0);
 
     // F1 opens the help overlay with the keyboard map and the legend
     harness.key_press(egui::Key::F1);
@@ -158,4 +168,22 @@ fn export_dialog_writes_the_scoped_events() {
     pump_until(&mut harness, |_| out.exists());
     let content = std::fs::read_to_string(&out).expect("read export");
     assert!(content.contains("us09-web-zoom.com"));
+
+    // missing cases still allow navigating to Collect
+    let missing = dir.path().join("does_not_exist.db");
+    let mut harness_missing = Harness::builder()
+        .with_size(egui::vec2(1280.0, 900.0))
+        .with_step_dt(1.0 / 60.0)
+        .build_ui_state(
+            |ui, state| {
+                state.show_ui(ui);
+            },
+            new_shell(&missing),
+        );
+    harness_missing.step();
+    harness_missing.step();
+    harness_missing.get_by_label("Open Collect").click();
+    harness_missing.step();
+    harness_missing.step();
+    harness_missing.get_by_label("Start");
 }

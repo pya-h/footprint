@@ -31,11 +31,16 @@ pub fn show_sources(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Acti
         return;
     };
 
-    render_coverage_cards(ui, ctx.theme, data);
-    ui.add_space(10.0);
-    render_health_matrix(ui, ctx, data, actions);
-    ui.add_space(10.0);
-    render_runs_table(ui, ctx, actions);
+    egui::ScrollArea::vertical()
+        .id_salt("sources_page")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            render_coverage_cards(ui, ctx.theme, data);
+            ui.add_space(10.0);
+            render_health_matrix(ui, ctx, data, actions);
+            ui.add_space(10.0);
+            render_runs_table(ui, ctx, actions);
+        });
 }
 
 fn render_coverage_cards(ui: &mut egui::Ui, theme: &Theme, data: &SourcesDataVm) {
@@ -84,7 +89,9 @@ fn render_health_matrix(
     ui.label(egui::RichText::new("Source health by run").strong());
     ui.add_space(4.0);
     egui::ScrollArea::both()
+        .id_salt("source_health_matrix")
         .auto_shrink([false, false])
+        .max_height(280.0)
         .show(ui, |ui| {
             egui::Grid::new("source_health_grid").show(ui, |ui| {
                 ui.label(
@@ -113,14 +120,15 @@ fn render_health_matrix(
                     );
                     for (run_idx, cell) in row.cells.iter().enumerate() {
                         let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(28.0, 16.0), egui::Sense::click());
+                            ui.allocate_exact_size(egui::vec2(28.0, 16.0), egui::Sense::hover());
                         if let Some(avail) = cell {
                             paint_availability(ui.painter(), rect, avail, theme);
+                            let safe_avail = crate::vm::SafeText::new(&avail.to_string());
                             let text = format!(
                                 "{} — run {}: {}",
                                 row.label.as_str(),
                                 data.run_ids[run_idx],
-                                avail
+                                safe_avail
                             );
                             let resp = ui.interact(
                                 rect,
@@ -159,7 +167,9 @@ fn render_runs_table(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Act
         .auto_shrink([false, false])
         .max_height(240.0)
         .show(ui, |ui| {
-            for run in runs.iter().rev() {
+            for idx in (0..runs.len()).rev() {
+                let run = &runs[idx];
+                let prev_id = idx.checked_sub(1).map(|p| runs[p].id);
                 ui.horizontal(|ui| {
                     ui.monospace(format!("run {:<3}", run.id));
                     ui.monospace(fp_query::format_time(
@@ -186,13 +196,13 @@ fn render_runs_table(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Act
                     if let Some(args) = &run.args {
                         ui.label(egui::RichText::new(args.as_str()).small().weak());
                     }
-                    if run.id > 1
+                    if let Some(prev) = prev_id
                         && ui
                             .small_button("diff vs previous")
                             .on_hover_text("open the diff of this run against the previous one")
                             .clicked()
                     {
-                        actions.push(Action::SetDiffRuns(run.id - 1, run.id));
+                        actions.push(Action::SetDiffRuns(prev, run.id));
                         actions.push(Action::Go(View::Diff));
                     }
                     if ui

@@ -62,10 +62,15 @@ pub fn show_trace(
         let text = render_trace_text(trace, &|ts| {
             fp_query::format_time(ts, "second", ctx.tz, "%H:%M:%S")
         });
+        if ui.button("copy text").clicked() {
+            ui.ctx().copy_text(text.clone());
+        }
+        ui.add_space(4.0);
         // the bundled fonts lack ◄/►; the display substitutes ASCII arrows while
         // the copy button still carries the exact `footprint trace` characters
         let display = text.replace('◄', "<").replace('►', ">");
         egui::ScrollArea::vertical()
+            .id_salt("trace_text_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add(
@@ -74,11 +79,9 @@ pub fn show_trace(
                         .desired_width(f32::INFINITY),
                 );
             });
-        if ui.button("copy text").clicked() {
-            ui.ctx().copy_text(text);
-        }
     } else {
         egui::ScrollArea::vertical()
+            .id_salt("trace_chain_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 show_chain(ui, ctx.theme, ctx.tz, trace, state, actions);
@@ -495,7 +498,8 @@ pub fn render_trace_text(trace: &TraceVm, time: &dyn Fn(i64) -> String) -> Strin
                 })
                 .unwrap_or_default();
             let size_display = size
-                .map(|s| format!("{} B", thousands(s as u64)))
+                .and_then(|s| u64::try_from(s).ok())
+                .map(|s| format!("{} B", thousands(s)))
                 .unwrap_or_default();
             out.push_str(&format!("artifact  {path}  {sha_display}{size_display}\n"));
         }

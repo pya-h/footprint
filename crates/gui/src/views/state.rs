@@ -161,25 +161,30 @@ fn render_kind_tree(
                 .strong()
                 .color(theme.text_dim),
         );
-        let all_selected = state.selected_kind.is_none();
-        let total: usize = kinds.values().map(|(count, _)| count).sum();
-        if ui
-            .selectable_label(all_selected, format!("all ({total})"))
-            .clicked()
-        {
-            state.selected_kind = None;
-        }
-        for (kind, (count, flagged)) in kinds {
-            let selected = state.selected_kind.as_deref() == Some(kind);
-            let mut text = format!("{kind}  {count}");
-            if flagged > 0 {
-                // ⚑ has no bundled-font glyph; the exclamation keeps it ASCII-safe
-                text.push_str(&format!("  !{flagged}"));
-            }
-            if ui.selectable_label(selected, text).clicked() {
-                state.selected_kind = Some(kind.to_string());
-            }
-        }
+        egui::ScrollArea::vertical()
+            .id_salt("state_kind_tree")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let all_selected = state.selected_kind.is_none();
+                let total: usize = kinds.values().map(|(count, _)| count).sum();
+                if ui
+                    .selectable_label(all_selected, format!("all ({total})"))
+                    .clicked()
+                {
+                    state.selected_kind = None;
+                }
+                for (kind, (count, flagged)) in kinds {
+                    let selected = state.selected_kind.as_deref() == Some(kind);
+                    let mut text = format!("{kind}  {count}");
+                    if flagged > 0 {
+                        // ⚑ has no bundled-font glyph; the exclamation keeps it ASCII-safe
+                        text.push_str(&format!("  !{flagged}"));
+                    }
+                    if ui.selectable_label(selected, text).clicked() {
+                        state.selected_kind = Some(kind.to_string());
+                    }
+                }
+            });
     });
 }
 

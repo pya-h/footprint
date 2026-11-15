@@ -339,12 +339,14 @@ impl Shell {
         }
         let params = self.collect_state.params();
         let case = self.case.clone();
+        let ctx = self.ctx.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = fp_query::run_collect(&case, &params, Some(&tx));
             if let Err(err) = result {
                 let _ = tx.send(fp_query::CollectEvent::Failed(err.to_string()));
             }
+            ctx.request_repaint();
         });
         self.collect_state.run = Some(CollectRun {
             rx,
@@ -366,7 +368,7 @@ impl Shell {
             match event {
                 fp_query::CollectEvent::Planned { total } => run.planned_total = Some(total),
                 fp_query::CollectEvent::InstanceStarted { label } => run.rows.push(InstanceRow {
-                    label,
+                    label: SafeText::new(&label),
                     state: InstanceState::Reading,
                 }),
                 fp_query::CollectEvent::InstanceDone {
@@ -380,42 +382,56 @@ impl Shell {
                     run.totals.events_known += totals.events_known;
                     run.totals.states += totals.states;
                     run.totals.artifacts += totals.artifacts;
-                    if let Some(row) = run.rows.iter_mut().find(|r| r.label == label) {
+                    let safe_label = SafeText::new(&label);
+                    let safe_status = SafeText::new(&status.to_string());
+                    let safe_warnings = warnings.iter().map(|w| SafeText::new(w)).collect();
+                    if let Some(row) = run.rows.iter_mut().rev().find(|r| {
+                        r.label.as_str() == safe_label.as_str()
+                            && matches!(r.state, InstanceState::Reading)
+                    }) {
                         row.state = InstanceState::Done {
                             events_new: totals.events_new,
-                            status: status.to_string(),
-                            warnings,
+                            status: safe_status,
+                            warnings: safe_warnings,
                         };
                     }
                 }
                 fp_query::CollectEvent::InstanceError { label, error } => {
                     run.done += 1;
-                    if let Some(row) = run.rows.iter_mut().find(|r| r.label == label) {
-                        row.state = InstanceState::Error(error);
+                    let safe_label = SafeText::new(&label);
+                    let safe_err = SafeText::new(&error);
+                    if let Some(row) = run.rows.iter_mut().rev().find(|r| {
+                        r.label.as_str() == safe_label.as_str()
+                            && matches!(r.state, InstanceState::Reading)
+                    }) {
+                        row.state = InstanceState::Error(safe_err);
                     }
                 }
                 fp_query::CollectEvent::CorrelateFailed(err) => {
                     run.rows.push(InstanceRow {
-                        label: "correlation".to_string(),
-                        state: InstanceState::Error(err),
+                        label: SafeText::new("correlation"),
+                        state: InstanceState::Error(SafeText::new(&err)),
                     });
                 }
                 fp_query::CollectEvent::Finished(summary) => {
                     run.run_id = Some(summary.run_id);
-                    finished = Some(format!(
+                    finished = Some(SafeText::new(&format!(
                         "done: {} sources, +{} new, {} errors",
                         summary.sources_read,
                         summary.totals.events_new,
                         summary.errors.len()
-                    ));
+                    )));
                 }
                 fp_query::CollectEvent::Failed(err) => {
-                    finished = Some(format!("collect failed: {err}"));
+                    finished = Some(SafeText::new(&format!("collect failed: {err}")));
                 }
             }
         }
         if let Some(message) = finished {
             run.finished = Some(message);
+            if self.case.exists() {
+                self.case_missing = false;
+            }
             // the case changed under the pool's readers: drop every stale marker
             // so the next ensure_requests round re-queries it
             self.reset_submission_markers();
@@ -900,10 +916,13 @@ impl Shell {
                     });
                     self.outstanding.insert(id);
                 }
-                let selected = match self.model.selection() {
-                    Selection::Ioc(id) => Some(id),
-                    _ => None,
-                };
+                let selected =
+                    self.ioc_state
+                        .selected_ioc
+                        .or_else(|| match self.model.selection() {
+                            Selection::Ioc(id) => Some(id),
+                            _ => None,
+                        });
                 if self.submitted_ioc_hits != Some((generation, selected)) {
                     self.submitted_ioc_hits = Some((generation, selected));
                     let id = worker.submit(ReqKind::IocHits, None, generation, move |store| {
@@ -1259,11 +1278,26 @@ impl Shell {
 
     fn shortcuts(&mut self, ui: &egui::Ui) {
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.chip_editor.is_open() {
+            if self.palette.open {
+                self.palette.open = false;
+            } else if self.help_open {
+                self.help_open = false;
+            } else if self.export_dialog.open {
+                self.export_dialog.open = false;
+                self.export_dialog.running = None;
+            } else if self.ioc_state.dialog.is_some() {
+                self.ioc_state.dialog = None;
+            } else if self.chip_editor.is_open() {
                 self.chip_editor.close();
             } else if self.model.selection() != Selection::None {
                 self.apply(Action::Select(Selection::None));
             }
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl && !i.modifiers.shift) {
+            palette_toggle(&mut self.palette);
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.help_open = !self.help_open;
         }
         if ui.ctx().egui_wants_keyboard_input() {
             return;
@@ -1293,12 +1327,10 @@ impl Shell {
         if ui.input(|i| i.key_pressed(egui::Key::I) && !i.modifiers.any()) {
             self.settings.panels.inspector_collapsed = !self.settings.panels.inspector_collapsed;
         }
-        if ui.input(|i| i.key_pressed(egui::Key::K) && i.modifiers.ctrl && !i.modifiers.shift) {
-            palette_toggle(&mut self.palette);
-        }
-        if ui.input(|i| i.key_pressed(egui::Key::F1))
-            || ui.input(|i| i.key_pressed(egui::Key::Slash) && i.modifiers.shift)
-        {
+        if ui.input(|i| {
+            i.key_pressed(egui::Key::Questionmark)
+                || (i.key_pressed(egui::Key::Slash) && i.modifiers.shift)
+        }) {
             self.help_open = !self.help_open;
         }
         if ui.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) {
@@ -1310,7 +1342,9 @@ impl Shell {
         if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Minus)) {
             self.zoom_by(ui, -0.1);
         }
-        if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Equals)) {
+        if ui.input(|i| {
+            i.modifiers.ctrl && (i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus))
+        }) {
             self.zoom_by(ui, 0.1);
         }
         if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Num0)) {
@@ -1332,8 +1366,9 @@ impl Shell {
         .iter()
         .enumerate()
         {
-            if ui.input(|i| !i.modifiers.ctrl && !i.modifiers.alt && i.key_pressed(*key))
-                && let Some(view) = View::from_shortcut(i)
+            if ui.input(|i| {
+                !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.shift && i.key_pressed(*key)
+            }) && let Some(view) = View::from_shortcut(i)
             {
                 self.apply(Action::Go(view));
             }
@@ -1360,11 +1395,41 @@ impl Shell {
             {
                 ui.ctx().copy_text(self.case.display().to_string());
             }
-            ui.add_enabled_ui(false, |ui| {
-                let _ = ui.button("run: all");
-            })
-            .response
-            .on_hover_text("run filtering arrives with the sources view");
+            let current_run = self.model.scope.filter().run_id;
+            let run_text = current_run
+                .map(|r| format!("run: {r}"))
+                .unwrap_or_else(|| "run: all".to_string());
+            let mut next_run: Option<Option<u64>> = None;
+            let run_combo = egui::ComboBox::from_id_salt("top_run_combo")
+                .selected_text(run_text)
+                .width(86.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(current_run.is_none(), "run: all")
+                        .clicked()
+                    {
+                        next_run = Some(None);
+                    }
+                    if let Some(runs) = self.model.runs.value() {
+                        for r in runs.iter().rev() {
+                            if ui
+                                .selectable_label(
+                                    current_run == Some(r.id),
+                                    format!("run {}", r.id),
+                                )
+                                .clicked()
+                            {
+                                next_run = Some(Some(r.id));
+                            }
+                        }
+                    }
+                });
+            run_combo
+                .response
+                .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Run"));
+            if let Some(r) = next_run {
+                self.apply(Action::Scope(ScopeAction::SetRun(r)));
+            }
             let response = ui.add_sized(
                 [280.0, 20.0],
                 egui::TextEdit::singleline(&mut self.search)
@@ -1383,7 +1448,7 @@ impl Shell {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("Collect")
-                    .on_hover_text("collect arrives with the collect view")
+                    .on_hover_text("open the collect view (0)")
                     .clicked()
                 {
                     self.apply(Action::Go(View::Collect));
@@ -1591,26 +1656,34 @@ impl Shell {
     }
 
     fn main(&mut self, ui: &mut egui::Ui) {
-        if self.case_missing {
-            ui.centered_and_justified(|ui| {
-                ui.vertical_centered(|ui| {
-                    ui.heading("no case yet");
-                    ui.label(format!("{}", self.case.display()));
-                    ui.label(
-                        "run `footprint collect` to create it — the GUI picks it up automatically",
-                    );
+        if self.model.view() != View::Collect {
+            if self.case_missing {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("no case yet");
+                        ui.label(format!("{}", self.case.display()));
+                        ui.label(
+                            "run `footprint collect` to create it — the GUI picks it up automatically",
+                        );
+                        if ui.button("Open Collect").clicked() {
+                            self.apply(Action::Go(View::Collect));
+                        }
+                    });
                 });
-            });
-            return;
-        }
-        if self.model.counts.value().is_some_and(|c| c.in_case == 0) {
-            ui.centered_and_justified(|ui| {
-                ui.vertical_centered(|ui| {
-                    ui.heading("this case has no events yet");
-                    ui.label("run `footprint collect`, then watch the totals appear");
+                return;
+            }
+            if self.model.counts.value().is_some_and(|c| c.in_case == 0) {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("this case has no events yet");
+                        ui.label("run `footprint collect`, then watch the totals appear");
+                        if ui.button("Open Collect").clicked() {
+                            self.apply(Action::Go(View::Collect));
+                        }
+                    });
                 });
-            });
-            return;
+                return;
+            }
         }
         match self.model.view() {
             View::Dashboard => {
@@ -1829,6 +1902,7 @@ impl Shell {
                 .model
                 .hosts
                 .value()
+                .or_else(|| self.model.dashboard_hosts.value())
                 .map(|rows| rows.iter().map(|h| h.host.as_str().to_string()).collect())
                 .unwrap_or_default();
             show_palette(ui.ctx(), &theme, &mut self.palette, &hosts, &mut actions);
@@ -1861,10 +1935,11 @@ fn build_sources_view(store: &fp_store::Store) -> Result<SourcesDataVm, QueryErr
         .collect();
     let mut rows: Vec<SourceHealthVm> = Vec::new();
     for source in &all_sources {
-        if let Some(existing) = rows
-            .iter_mut()
-            .find(|r| r.label.as_str() == source.label() && r.kind.as_str() == source.kind)
-        {
+        let safe_label = SafeText::new(&source.label());
+        let safe_kind = SafeText::new(&source.kind);
+        if let Some(existing) = rows.iter_mut().find(|r| {
+            r.label.as_str() == safe_label.as_str() && r.kind.as_str() == safe_kind.as_str()
+        }) {
             if let Some(pos) = run_ids.iter().position(|id| *id == source.run_id) {
                 existing.cells[pos] = source.status.clone();
             }
@@ -1875,8 +1950,8 @@ fn build_sources_view(store: &fp_store::Store) -> Result<SourcesDataVm, QueryErr
             }
             rows.push(SourceHealthVm {
                 source_id: source.id,
-                label: SafeText::new(&source.label()),
-                kind: SafeText::new(&source.kind),
+                label: safe_label,
+                kind: safe_kind,
                 cells,
             });
         }

@@ -215,4 +215,54 @@ fn diff_view_groups_entries_and_compares_values() {
         harness.query_all_by_label_contains("new.service").count(),
         0
     );
+
+    // jumping to Diff from another view (e.g. Sources) preserves its run pair instead
+    // of being overwritten back to the default pair on render
+    let dir2 = tempfile::tempdir().expect("tempdir 2");
+    let db2 = dir2.path().join("case2.db");
+    build_state_case(&db2);
+    {
+        let mut store = Store::open_or_create(&db2).expect("reopen rw");
+        let run3 = store
+            .insert_run(&fp_store::NewRun {
+                host: "workstation",
+                user: "paya",
+                uid: 1000,
+                euid: 1000,
+                version: "0.1.0",
+                tz: "UTC",
+                args: "collect --run 3",
+            })
+            .expect("insert run 3");
+        store
+            .conn()
+            .execute(
+                "INSERT INTO state (run_id, kind, key, value_json) VALUES (?1, 'ufw.status', 'firewall', '{\"active\":true}')",
+                rusqlite::params![run3],
+            )
+            .expect("insert run 3 state");
+    }
+    let mut shell2 = new_shell(&db2, View::Dashboard);
+    shell2.apply(Action::SetDiffRuns(1, 2));
+    shell2.apply(Action::Go(View::Diff));
+    let mut harness2 = Harness::builder()
+        .with_size(egui::vec2(1280.0, 820.0))
+        .with_step_dt(1.0 / 60.0)
+        .build_ui_state(
+            |ui, state| {
+                state.show_ui(ui);
+            },
+            shell2,
+        );
+    pump_until(&mut harness2, |s| s.model().diff.value().is_some());
+    assert_eq!(harness2.state().model().pending_diff, Some((1, 2)));
+
+    // changing Run B keeps Run A first and updates pending_diff to (1, 3) rather than (3, 1)
+    harness2.get_by_label("Run B").click();
+    harness2.step();
+    harness2.step();
+    harness2.get_by_label_contains("run 3").click();
+    harness2.step();
+    harness2.step();
+    assert_eq!(harness2.state().model().pending_diff, Some((1, 3)));
 }

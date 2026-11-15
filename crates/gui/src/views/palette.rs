@@ -87,11 +87,16 @@ pub fn show_palette(
                 palette.selected = 0;
             }
 
+            let id_jump = id_query_action(palette.query.trim());
             let commands = build_commands(hosts);
-            let matches: Vec<&Command> = commands
-                .iter()
-                .filter(|c| fuzzy(&palette.query, &c.title))
-                .collect();
+            let matches: Vec<&Command> = if id_jump.is_some() {
+                Vec::new()
+            } else {
+                commands
+                    .iter()
+                    .filter(|c| fuzzy(&palette.query, &c.title))
+                    .collect()
+            };
             palette.selected = palette.selected.min(matches.len().saturating_sub(1));
 
             ui.add_space(4.0);
@@ -100,6 +105,21 @@ pub fn show_palette(
                 .auto_shrink([false, false])
                 .max_height(280.0)
                 .show(ui, |ui| {
+                    if let Some(id_action) = &id_jump {
+                        let resp = ui.selectable_label(
+                            true,
+                            egui::RichText::new(format!("jump to event {}", palette.query.trim()))
+                                .monospace(),
+                        );
+                        if resp.clicked() {
+                            actions_out.push(match id_action {
+                                Action::Select(sel) => Action::Select(sel.clone()),
+                                _ => Action::Select(Selection::None),
+                            });
+                            close = true;
+                        }
+                        return;
+                    }
                     for (idx, command) in matches.iter().enumerate() {
                         let selected = idx == palette.selected;
                         let resp = ui
@@ -110,6 +130,7 @@ pub fn show_palette(
                             .on_hover_text(&command.hint);
                         if resp.clicked() {
                             palette.selected = idx;
+                            actions_out.extend(command.run.actions());
                             close = true;
                         }
                     }
@@ -128,9 +149,8 @@ pub fn show_palette(
                 palette.selected = (palette.selected + matches.len() - 1) % matches.len();
             }
             if enter {
-                // `#123` jumps straight to that event
-                if let Some(id_action) = id_query_action(palette.query.trim()) {
-                    actions_out.push(id_action);
+                if let Some(action) = id_jump {
+                    actions_out.push(action);
                     close = true;
                 } else if let Some(command) = matches.get(palette.selected) {
                     actions_out.extend(command.run.actions());

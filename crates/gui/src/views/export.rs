@@ -57,11 +57,13 @@ pub fn show_export_dialog(
     if !dialog.open {
         return;
     }
-    if let Some(rx) = &dialog.running
-        && let Ok(result) = rx.try_recv()
-    {
-        dialog.status = Some(result);
-        dialog.running = None;
+    if let Some(rx) = &dialog.running {
+        if let Ok(result) = rx.try_recv() {
+            dialog.status = Some(result);
+            dialog.running = None;
+        } else {
+            ui.request_repaint_after(std::time::Duration::from_millis(80));
+        }
     }
     let mut keep_open = true;
     let mut close = false;

@@ -102,7 +102,7 @@ fn ioc_view_lists_counts_selects_hits_and_removes() {
     harness.step();
     harness.get_by_label_contains("1 hits");
 
-    // select the IOC: its hits render on the right
+    // select the IOC: its hits render on the right and its summary appears in the inspector
     harness
         .get_by_label_contains("domain  us09-web-zoom.com")
         .click();
@@ -110,12 +110,16 @@ fn ioc_view_lists_counts_selects_hits_and_removes() {
     harness.step();
     harness.get_by_label_contains("web.visit · 1 ·");
     harness.get_by_label_contains("matched: us09-web-zoom.com");
+    harness.get_by_label("indicator · domain");
+    harness.get_by_label("1 linked hits");
 
-    // clicking a hit selects the event for the inspector
+    // clicking a hit selects the event for the inspector while keeping the IOC filter active
     harness.get_by_label_contains("web.visit · 1 ·").click();
     harness.step();
     harness.step();
     assert_eq!(harness.state().model().selection(), Selection::Event(1));
+    harness.get_by_label("HITS");
+    harness.get_by_label("show all");
 
     // the add dialog opens and closes
     harness.get_by_label("+ Add").click();

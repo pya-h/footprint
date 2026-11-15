@@ -14,8 +14,7 @@ use crate::widgets::ViewCtx;
 use crate::widgets::json_tree::show_json_diff;
 
 pub struct DiffViewState {
-    pub run_a: Option<u64>,
-    pub run_b: Option<u64>,
+    pub last_pair: Option<(u64, u64)>,
     pub show_added: bool,
     pub show_removed: bool,
     pub show_changed: bool,
@@ -25,8 +24,7 @@ pub struct DiffViewState {
 impl Default for DiffViewState {
     fn default() -> Self {
         Self {
-            run_a: None,
-            run_b: None,
+            last_pair: None,
             // the chips double as filters; everything starts visible
             show_added: true,
             show_removed: true,
@@ -42,17 +40,17 @@ pub fn show_diff(
     state: &mut DiffViewState,
     actions: &mut Vec<Action>,
 ) {
-    // default the pickers to the last two runs once runs are known
-    if state.run_b.is_none()
+    // default the pickers to the last two runs only if nothing selected a pair yet
+    if ctx.model.pending_diff.is_none()
         && let Some(runs) = ctx.model.runs.value()
         && runs.len() >= 2
     {
-        state.run_a = Some(runs[runs.len() - 2].id);
-        state.run_b = Some(runs[runs.len() - 1].id);
-        actions.push(Action::SetDiffRuns(
-            runs[runs.len() - 2].id,
-            runs[runs.len() - 1].id,
-        ));
+        let pair = (runs[runs.len() - 2].id, runs[runs.len() - 1].id);
+        actions.push(Action::SetDiffRuns(pair.0, pair.1));
+    }
+    if state.last_pair != ctx.model.pending_diff {
+        state.last_pair = ctx.model.pending_diff;
+        state.selected = None;
     }
 
     render_toolbar(ui, ctx, state, actions);
@@ -96,7 +94,7 @@ pub fn show_diff(
         return;
     }
 
-    ui.horizontal(|ui| {
+    ui.horizontal_top(|ui| {
         render_entry_list(ui, ctx.theme, &filtered, state);
         if let Some((_, entry)) = state
             .selected
@@ -119,27 +117,20 @@ fn render_toolbar(
         ui.label(egui::RichText::new("Diff").strong());
         ui.add_space(8.0);
         let runs = model.runs.value().map(Vec::as_slice).unwrap_or(&[]);
+        let (mut run_a, mut run_b) = model
+            .pending_diff
+            .map(|(a, b)| (Some(a), Some(b)))
+            .unwrap_or((None, None));
         ui.label("Run A:");
-        run_picker(
-            ui,
-            "diff_run_a",
-            &mut state.run_a,
-            state.run_b,
-            runs,
-            ctx.tz,
-            actions,
-        );
+        let changed_a = run_picker(ui, "diff_run_a", "Run A", &mut run_a, run_b, runs, ctx.tz);
         ui.label("<->");
         ui.label("Run B:");
-        run_picker(
-            ui,
-            "diff_run_b",
-            &mut state.run_b,
-            state.run_a,
-            runs,
-            ctx.tz,
-            actions,
-        );
+        let changed_b = run_picker(ui, "diff_run_b", "Run B", &mut run_b, run_a, runs, ctx.tz);
+        if (changed_a || changed_b)
+            && let (Some(a), Some(b)) = (run_a, run_b)
+        {
+            actions.push(Action::SetDiffRuns(a, b));
+        }
 
         ui.add_space(8.0);
         if model.diff.value().is_some() {
@@ -152,16 +143,16 @@ fn render_toolbar(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_picker(
     ui: &mut egui::Ui,
     id: &str,
+    a11y_label: &str,
     selected: &mut Option<u64>,
     other: Option<u64>,
     runs: &[crate::vm::RunMarkerVm],
     tz: fp_query::Tz,
-    actions: &mut Vec<Action>,
-) {
+) -> bool {
+    let mut changed = false;
     let picker = egui::ComboBox::from_id_salt(id)
         .width(160.0)
         .selected_text(match selected {
@@ -183,15 +174,14 @@ fn run_picker(
                     .clicked()
                 {
                     *selected = Some(run.id);
-                    if let (Some(a), Some(b)) = (*selected, other) {
-                        actions.push(Action::SetDiffRuns(a, b));
-                    }
+                    changed = true;
                 }
             }
         });
     picker
         .response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Diff run"));
+        .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, a11y_label));
+    changed
 }
 
 fn chip(ui: &mut egui::Ui, label: &str, count: usize, on: &mut bool) {
@@ -231,36 +221,44 @@ fn render_entry_list(
             .push((*idx, entry));
     }
     ui.vertical(|ui| {
-        ui.set_min_width(360.0);
-        for (kind, items) in groups {
-            let header = summarize_group(kind, &items);
-            egui::CollapsingHeader::new(egui::RichText::new(header).monospace().color(theme.text))
-                .default_open(true)
-                .show(ui, |ui| {
-                    for (idx, entry) in items {
-                        let marker = match entry.change {
-                            DiffChange::Added => ("+", theme.ok),
-                            DiffChange::Removed => ("-", theme.danger),
-                            DiffChange::Changed => ("~", theme.warn),
-                        };
-                        let is_selected = state.selected == Some(idx);
-                        let text = format!(
-                            "{}  {}  {}",
-                            marker.0,
-                            entry.key.as_str(),
-                            entry.detail.as_str()
-                        );
-                        let resp = ui.selectable_label(
-                            is_selected,
-                            egui::RichText::new(text).monospace().color(marker.1),
-                        );
-                        if resp.clicked() {
-                            state.selected = Some(idx);
+        let width = (ui.available_width() * 0.48).clamp(340.0, 580.0);
+        ui.set_width(width);
+        egui::ScrollArea::both()
+            .id_salt("diff_entries_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (kind, items) in groups {
+                    let header = summarize_group(kind, &items);
+                    egui::CollapsingHeader::new(
+                        egui::RichText::new(header).monospace().color(theme.text),
+                    )
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for (idx, entry) in items {
+                            let marker = match entry.change {
+                                DiffChange::Added => ("+", theme.ok),
+                                DiffChange::Removed => ("-", theme.danger),
+                                DiffChange::Changed => ("~", theme.warn),
+                            };
+                            let is_selected = state.selected == Some(idx);
+                            let text = format!(
+                                "{}  {}  {}",
+                                marker.0,
+                                entry.key.as_str(),
+                                entry.detail.as_str()
+                            );
+                            let resp = ui.selectable_label(
+                                is_selected,
+                                egui::RichText::new(text).monospace().color(marker.1),
+                            );
+                            if resp.clicked() {
+                                state.selected = Some(idx);
+                            }
+                            resp.on_hover_text("click to compare the two values");
                         }
-                        resp.on_hover_text("click to compare the two values");
-                    }
-                });
-        }
+                    });
+                }
+            });
     });
 }
 
@@ -299,27 +297,30 @@ fn render_comparison(ui: &mut egui::Ui, theme: &Theme, entry: &DiffEntryVm) {
                 .strong(),
         );
         ui.add_space(4.0);
-        match (&entry.run_a, &entry.run_b) {
-            (Some(a), Some(b)) => {
-                ui.label(
-                    egui::RichText::new("A on the left, B on the right; marked leaves differ")
-                        .small()
-                        .weak(),
-                );
-                show_json_diff(ui, "diff_values", a, b, theme);
-            }
-            (None, Some(b)) => {
-                ui.label(egui::RichText::new("added in run B:").small().weak());
-                crate::widgets::json_tree::show_json_tree(ui, "diff_added", b, theme);
-            }
-            (Some(a), None) => {
-                ui.label(egui::RichText::new("removed after run A:").small().weak());
-                crate::widgets::json_tree::show_json_tree(ui, "diff_removed", a, theme);
-            }
-            (None, None) => {
-                ui.label(egui::RichText::new("both values failed to parse").weak());
-            }
-        }
+        egui::ScrollArea::vertical()
+            .id_salt("diff_compare_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| match (&entry.run_a, &entry.run_b) {
+                (Some(a), Some(b)) => {
+                    ui.label(
+                        egui::RichText::new("A on the left, B on the right; marked leaves differ")
+                            .small()
+                            .weak(),
+                    );
+                    show_json_diff(ui, "diff_values", a, b, theme);
+                }
+                (None, Some(b)) => {
+                    ui.label(egui::RichText::new("added in run B:").small().weak());
+                    crate::widgets::json_tree::show_json_tree(ui, "diff_added", b, theme);
+                }
+                (Some(a), None) => {
+                    ui.label(egui::RichText::new("removed after run A:").small().weak());
+                    crate::widgets::json_tree::show_json_tree(ui, "diff_removed", a, theme);
+                }
+                (None, None) => {
+                    ui.label(egui::RichText::new("both values failed to parse").weak());
+                }
+            });
     });
 }
 

@@ -15,6 +15,8 @@ pub struct IocViewState {
     pub dialog: Option<IocDialog>,
     /// the remove button arms itself once, then fires on the second click
     pub pending_remove: Option<u64>,
+    /// which IOC filters the right-hand hits panel; survives clicking a hit row to inspect its event
+    pub selected_ioc: Option<u64>,
 }
 
 pub enum IocDialog {
@@ -66,14 +68,21 @@ pub fn show_iocs(
         return;
     };
 
-    let selected_id = match ctx.model.selection() {
-        Selection::Ioc(id) => Some(id),
-        _ => None,
-    };
+    if let Selection::Ioc(id) = ctx.model.selection()
+        && iocs.iter().any(|i| i.id == id)
+    {
+        state.selected_ioc = Some(id);
+    }
+    if let Some(id) = state.selected_ioc
+        && !iocs.iter().any(|i| i.id == id)
+    {
+        state.selected_ioc = None;
+    }
+    let selected_id = state.selected_ioc;
     ui.horizontal(|ui| {
         render_ioc_list(ui, ctx.theme, iocs, selected_id, state, actions);
         ui.separator();
-        render_hits(ui, ctx, actions);
+        render_hits(ui, ctx, state, actions);
     });
 
     if let Some(dialog) = state.dialog.as_mut() {
@@ -129,57 +138,84 @@ fn render_ioc_list(
             ui.label(egui::RichText::new("no indicators yet — add or import some").weak());
             return;
         }
-        for ioc in iocs {
-            let selected = selected_id == Some(ioc.id);
-            ui.horizontal(|ui| {
-                let label = format!(
-                    "{}  {}   {} hits",
-                    ioc.ioc_type.as_str(),
-                    ioc.value.as_str(),
-                    thousands(ioc.hits)
-                );
-                let resp = ui.selectable_label(
-                    selected,
-                    egui::RichText::new(label)
-                        .monospace()
-                        .color(if ioc.hits > 0 { theme.ioc } else { theme.text }),
-                );
-                if resp.clicked() {
-                    actions.push(Action::Select(Selection::Ioc(ioc.id)));
-                }
-                resp.on_hover_text(ioc.note.as_ref().map(|n| n.as_str()).unwrap_or(""));
+        egui::ScrollArea::vertical()
+            .id_salt("ioc_list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for ioc in iocs {
+                    let selected = selected_id == Some(ioc.id);
+                    ui.horizontal(|ui| {
+                        let label = format!(
+                            "{}  {}   {} hits",
+                            ioc.ioc_type.as_str(),
+                            ioc.value.as_str(),
+                            thousands(ioc.hits)
+                        );
+                        let resp = ui.selectable_label(
+                            selected,
+                            egui::RichText::new(label)
+                                .monospace()
+                                .color(if ioc.hits > 0 { theme.ioc } else { theme.text }),
+                        );
+                        if resp.clicked() {
+                            if selected {
+                                state.selected_ioc = None;
+                                actions.push(Action::Select(Selection::None));
+                            } else {
+                                state.selected_ioc = Some(ioc.id);
+                                actions.push(Action::Select(Selection::Ioc(ioc.id)));
+                            }
+                        }
+                        resp.on_hover_text(ioc.note.as_ref().map(|n| n.as_str()).unwrap_or(""));
 
-                let armed = state.pending_remove == Some(ioc.id);
-                let button = egui::Button::new(if armed { "sure?" } else { "×" }).small();
-                if ui
-                    .add(button)
-                    .on_hover_text("remove this indicator and its hits")
-                    .clicked()
-                {
-                    if armed {
-                        state.pending_remove = None;
-                        actions.push(Action::RemoveIoc(ioc.id));
-                    } else {
-                        state.pending_remove = Some(ioc.id);
-                    }
+                        let armed = state.pending_remove == Some(ioc.id);
+                        let button = egui::Button::new(if armed { "sure?" } else { "×" }).small();
+                        if ui
+                            .add(button)
+                            .on_hover_text("remove this indicator and its hits")
+                            .clicked()
+                        {
+                            if armed {
+                                state.pending_remove = None;
+                                if state.selected_ioc == Some(ioc.id) {
+                                    state.selected_ioc = None;
+                                }
+                                actions.push(Action::RemoveIoc(ioc.id));
+                            } else {
+                                state.pending_remove = Some(ioc.id);
+                            }
+                        }
+                    });
                 }
             });
-        }
     });
 }
 
-fn render_hits(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Action>) {
+fn render_hits(
+    ui: &mut egui::Ui,
+    ctx: &ViewCtx<'_>,
+    state: &mut IocViewState,
+    actions: &mut Vec<Action>,
+) {
     let model = ctx.model;
     ui.vertical(|ui| {
         ui.set_min_width(420.0);
-        let selected = matches!(model.selection(), Selection::Ioc(_));
-        let title = if selected { "HITS" } else { "HITS (all IOCs)" };
-        ui.label(
-            egui::RichText::new(title)
-                .small()
-                .strong()
-                .color(ctx.theme.text_dim),
-        );
+        ui.horizontal(|ui| {
+            let title = if state.selected_ioc.is_some() {
+                "HITS"
+            } else {
+                "HITS (all IOCs)"
+            };
+            ui.label(
+                egui::RichText::new(title)
+                    .small()
+                    .strong()
+                    .color(ctx.theme.text_dim),
+            );
+            if state.selected_ioc.is_some() && ui.small_button("show all").clicked() {
+                state.selected_ioc = None;
+            }
+        });
         let Some(hits) = model.ioc_hits.value() else {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -192,6 +228,7 @@ fn render_hits(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Action>) 
             return;
         }
         egui::ScrollArea::vertical()
+            .id_salt("ioc_hits_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for hit in hits {
