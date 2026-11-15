@@ -1,7 +1,9 @@
 pub mod dashboard;
 pub mod diff;
 pub mod hosts;
+pub mod ioc;
 pub mod lanes;
+pub mod sources;
 pub mod state;
 pub mod timeline;
 pub mod trace;

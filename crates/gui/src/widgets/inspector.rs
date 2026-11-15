@@ -71,11 +71,7 @@ pub fn show_inspector(
             ui.label(egui::RichText::new("full IOC inspector arrives with IOC hits view").weak());
         }
         Selection::Source(id) => {
-            ui.label(format!("Source #{id}"));
-            ui.label(
-                egui::RichText::new("full source inspector arrives with Runs & Sources view")
-                    .weak(),
-            );
+            show_source_inspector(ui, id, model, theme);
         }
         Selection::TraceNode(id) => {
             ui.label(format!("Trace node #{id}"));
@@ -251,6 +247,44 @@ fn show_event_inspector(
                 }
             });
         });
+}
+
+fn show_source_inspector(ui: &mut egui::Ui, source_id: u64, model: &Model, theme: &Theme) {
+    let Some(row) = model
+        .sources
+        .value()
+        .and_then(|data| data.health_rows.iter().find(|r| r.source_id == source_id))
+    else {
+        ui.label(egui::RichText::new("source not in the current query").weak());
+        return;
+    };
+    ui.label(
+        egui::RichText::new(format!("{}  ·  {}", row.label.as_str(), row.kind.as_str())).strong(),
+    );
+    if let Some(data) = model.sources.value() {
+        ui.add_space(4.0);
+        for (run_idx, cell) in row.cells.iter().enumerate() {
+            let Some(run_id) = data.run_ids.get(run_idx) else {
+                continue;
+            };
+            let text = cell
+                .as_ref()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "did not run".to_string());
+            let color = match cell {
+                Some(fp_core::Availability::Present) => theme.ok,
+                Some(fp_core::Availability::NotInstalled) | Some(fp_core::Availability::Empty) => {
+                    theme.text_dim
+                }
+                Some(_) => theme.warn,
+                None => theme.text_dim,
+            };
+            ui.horizontal(|ui| {
+                ui.monospace(format!("run {run_id:<3}"));
+                ui.colored_label(color, text);
+            });
+        }
+    }
 }
 
 fn show_state_inspector(ui: &mut egui::Ui, rowid: i64, model: &Model, theme: &Theme) {

@@ -15,12 +15,15 @@ use crate::theme::{Theme, ThemeName};
 use crate::views::dashboard::{DashboardState, show_dashboard};
 use crate::views::diff::{DiffViewState, show_diff};
 use crate::views::hosts::{HOSTS_CAP, HostsState, show_hosts};
+use crate::views::ioc::{IocViewState, show_iocs};
 use crate::views::lanes::{LanesState, show_lanes};
+use crate::views::sources::show_sources;
 use crate::views::state::{StateViewState, show_state};
 use crate::views::trace::{TraceState, show_trace};
 use crate::vm::{
     DashboardSummaryVm, DetailVm, DiffEntryVm, GroupRowVm, HostSummaryVm, LaneRowDensityVm,
-    LanesDataVm, RowVm, RunMarkerVm, SafeText, SourceIssueVm, StateRowVm, TraceVm, UntimedLaneVm,
+    LanesDataVm, RowVm, RunMarkerVm, SafeText, SourceHealthVm, SourceIssueVm, SourcesDataVm,
+    StateRowVm, TraceVm, UntimedLaneVm,
 };
 use crate::widgets::chip::{ChipEditorState, show_scope_bar, thousands};
 use crate::widgets::event_table::TableState;
@@ -56,6 +59,9 @@ pub struct Shell {
     submitted_trace: Option<(String, Generation)>,
     submitted_states: Option<(Generation, Option<u64>, String)>,
     submitted_diff: Option<(u64, u64, Generation)>,
+    submitted_iocs: Option<Generation>,
+    submitted_ioc_hits: Option<(Generation, Option<u64>)>,
+    submitted_sources: Option<Generation>,
     outstanding: HashSet<u64>,
     cache: BlockCache,
     chip_editor: ChipEditorState,
@@ -68,6 +74,7 @@ pub struct Shell {
     trace_state: TraceState,
     state_state: StateViewState,
     diff_state: DiffViewState,
+    ioc_state: IocViewState,
     focus_search_next: bool,
 }
 
@@ -205,8 +212,12 @@ impl Shell {
             trace_state: TraceState::default(),
             state_state: StateViewState::default(),
             diff_state: DiffViewState::default(),
+            ioc_state: IocViewState::default(),
             submitted_states: None,
             submitted_diff: None,
+            submitted_iocs: None,
+            submitted_ioc_hits: None,
+            submitted_sources: None,
             focus_search_next: false,
         }
     }
@@ -219,15 +230,15 @@ impl Shell {
         let is_refresh = matches!(action, Action::RefreshCase);
         let is_ioc_ok = matches!(action, Action::IocWriteDone(Ok(_)));
         self.model.apply(action);
-        if let Some((ioc_type, value)) = self.model.pending_ioc_add.take() {
-            self.submit_ioc_add(ioc_type, value);
+        if let Some(request) = self.model.pending_ioc_write.take() {
+            self.submit_ioc_write(request);
         }
         if is_refresh || is_ioc_ok {
             self.reset_submission_markers();
         }
     }
 
-    fn submit_ioc_add(&mut self, ioc_type: String, value: String) {
+    fn submit_ioc_write(&mut self, request: crate::model::IocWriteRequest) {
         let Some(worker) = &self.worker else {
             self.model
                 .apply(Action::IocWriteDone(Err("worker not running".to_string())));
@@ -235,10 +246,27 @@ impl Shell {
         };
         let generation = self.model.generation;
         let id = worker.submit_writer(ReqKind::IocWrite, generation, move |store| {
-            let label = format!("{ioc_type}:{value}");
-            fp_query::iocs::add_ioc(store, &ioc_type, &value, None)
-                .map_err(|e| QueryError::Message(e.to_string()))?;
-            Ok(Box::new(format!("Added IOC {label}")))
+            let message = match &request {
+                crate::model::IocWriteRequest::Add { ioc_type, value } => {
+                    fp_query::iocs::add_ioc(store, ioc_type, value, None)
+                        .map_err(|e| QueryError::Message(e.to_string()))?;
+                    format!("Added IOC {ioc_type}:{value}")
+                }
+                crate::model::IocWriteRequest::Import { content } => {
+                    let n = fp_query::iocs::import_iocs(store, content)
+                        .map_err(|e| QueryError::Message(e.to_string()))?;
+                    format!("Imported {n} IOCs")
+                }
+                crate::model::IocWriteRequest::Remove { id } => {
+                    if !store.delete_ioc(*id)? {
+                        return Err(QueryError::Message(format!("IOC #{id} not found")));
+                    }
+                    // rebuild the pass so the removed IOC's links disappear too
+                    fp_correlate::correlate_iocs(store)?;
+                    format!("Removed IOC #{id}")
+                }
+            };
+            Ok(Box::new(message))
         });
         self.outstanding.insert(id);
     }
@@ -437,13 +465,6 @@ impl Shell {
                         });
                     }
                 },
-                ReqKind::Sources => {
-                    let result = downcast::<DashboardSummaryVm>(resp.result, "dashboard_summary");
-                    self.apply(Action::DashboardSummary {
-                        generation: resp.generation,
-                        result,
-                    });
-                }
                 ReqKind::Hosts => {
                     let result = downcast::<Vec<HostSummaryVm>>(resp.result, "hosts");
                     match resp.sub.as_deref() {
@@ -482,6 +503,37 @@ impl Shell {
                         result,
                     });
                 }
+                ReqKind::Iocs => {
+                    let result = downcast::<Vec<crate::vm::IocSummaryVm>>(resp.result, "iocs");
+                    self.apply(Action::IocList {
+                        generation: resp.generation,
+                        result,
+                    });
+                }
+                ReqKind::IocHits => {
+                    let result = downcast::<Vec<crate::vm::IocHitVm>>(resp.result, "ioc_hits");
+                    self.apply(Action::IocHits {
+                        generation: resp.generation,
+                        result,
+                    });
+                }
+                ReqKind::Sources => {
+                    // "dashboard" is the summary payload; anything else is the Sources view
+                    if resp.sub.as_deref() == Some("dashboard") {
+                        let result =
+                            downcast::<DashboardSummaryVm>(resp.result, "dashboard_summary");
+                        self.apply(Action::DashboardSummary {
+                            generation: resp.generation,
+                            result,
+                        });
+                    } else {
+                        let result = downcast::<crate::vm::SourcesDataVm>(resp.result, "sources");
+                        self.apply(Action::SourcesView {
+                            generation: resp.generation,
+                            result,
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -504,6 +556,9 @@ impl Shell {
         self.submitted_trace = None;
         self.submitted_states = None;
         self.submitted_diff = None;
+        self.submitted_iocs = None;
+        self.submitted_ioc_hits = None;
+        self.submitted_sources = None;
     }
 
     fn ensure_requests(&mut self) {
@@ -680,6 +735,60 @@ impl Shell {
                     });
                     self.outstanding.insert(id);
                 }
+            }
+            View::Ioc => {
+                if self.submitted_iocs != Some(generation) {
+                    self.submitted_iocs = Some(generation);
+                    let id = worker.submit(ReqKind::Iocs, None, generation, |store| {
+                        let rows = fp_query::iocs::ioc_summary(store)?;
+                        let vms: Vec<crate::vm::IocSummaryVm> = rows
+                            .iter()
+                            .map(crate::vm::IocSummaryVm::from_summary)
+                            .collect();
+                        Ok(Box::new(vms))
+                    });
+                    self.outstanding.insert(id);
+                }
+                let selected = match self.model.selection() {
+                    Selection::Ioc(id) => Some(id),
+                    _ => None,
+                };
+                if self.submitted_ioc_hits != Some((generation, selected)) {
+                    self.submitted_ioc_hits = Some((generation, selected));
+                    let id = worker.submit(ReqKind::IocHits, None, generation, move |store| {
+                        let hits = fp_query::iocs::ioc_hits_page(store, selected, 0, 500)?;
+                        let iocs = fp_query::iocs::ioc_summary(store)?;
+                        let vms: Vec<crate::vm::IocHitVm> = hits
+                            .iter()
+                            .map(|hit| {
+                                let (kind, label) = resolve_hit_target(store, hit);
+                                crate::vm::IocHitVm {
+                                    ioc_id: hit.ioc_id,
+                                    ioc_value: iocs
+                                        .iter()
+                                        .find(|s| s.ioc.id == hit.ioc_id)
+                                        .map(|s| SafeText::new(&s.ioc.value))
+                                        .unwrap_or_else(|| SafeText::new("?")),
+                                    target_type: SafeText::new(&hit.target_type),
+                                    target_id: hit.target_id,
+                                    target_kind: SafeText::new(&kind),
+                                    target_label: SafeText::new(&label),
+                                    why: hit.why.as_deref().map(SafeText::new),
+                                }
+                            })
+                            .collect();
+                        Ok(Box::new(vms))
+                    });
+                    self.outstanding.insert(id);
+                }
+            }
+            View::Sources if self.submitted_sources != Some(generation) => {
+                self.submitted_sources = Some(generation);
+                let id = worker.submit(ReqKind::Sources, None, generation, |store| {
+                    let data = build_sources_view(store)?;
+                    Ok(Box::new(data))
+                });
+                self.outstanding.insert(id);
             }
             _ => {}
         }
@@ -1431,6 +1540,28 @@ impl Shell {
                 show_diff(ui, &ctx, &mut self.diff_state, &mut actions);
                 self.apply_all(actions);
             }
+            View::Ioc => {
+                let theme = self.active_theme();
+                let ctx = crate::widgets::ViewCtx {
+                    model: &self.model,
+                    theme: &theme,
+                    tz: self.tz,
+                };
+                let mut actions = Vec::new();
+                show_iocs(ui, &ctx, &mut self.ioc_state, &mut actions);
+                self.apply_all(actions);
+            }
+            View::Sources => {
+                let theme = self.active_theme();
+                let ctx = crate::widgets::ViewCtx {
+                    model: &self.model,
+                    theme: &theme,
+                    tz: self.tz,
+                };
+                let mut actions = Vec::new();
+                show_sources(ui, &ctx, &mut actions);
+                self.apply_all(actions);
+            }
             view => {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
@@ -1515,6 +1646,55 @@ impl Shell {
         egui::CentralPanel::default().show(ui, |ui| self.main(ui));
         self.ensure_requests();
     }
+}
+
+/// Resolves an IOC hit target to (kind, label) for display; unresolved targets
+/// fall back to the target type and an empty label.
+fn resolve_hit_target(store: &fp_store::Store, hit: &fp_store::IocHitLink) -> (String, String) {
+    if hit.target_type == "event"
+        && let Ok(Some(ev)) = store.get_event(hit.target_id)
+    {
+        return (ev.kind, ev.subject.unwrap_or_default());
+    }
+    (hit.target_type.clone(), String::new())
+}
+
+/// Coverage cards plus the per-source, per-run health matrix for the Sources view.
+fn build_sources_view(store: &fp_store::Store) -> Result<SourcesDataVm, QueryError> {
+    let runs = store.list_runs()?;
+    let run_ids: Vec<u64> = runs.iter().map(|r| r.id).collect();
+    let all_sources = fp_query::sources(store, None)?;
+    let coverage = fp_query::coverage(&all_sources)
+        .into_iter()
+        .map(|row| SourcesDataVm::coverage_card(&row))
+        .collect();
+    let mut rows: Vec<SourceHealthVm> = Vec::new();
+    for source in &all_sources {
+        if let Some(existing) = rows
+            .iter_mut()
+            .find(|r| r.label.as_str() == source.label() && r.kind.as_str() == source.kind)
+        {
+            if let Some(pos) = run_ids.iter().position(|id| *id == source.run_id) {
+                existing.cells[pos] = source.status.clone();
+            }
+        } else {
+            let mut cells = vec![None; run_ids.len()];
+            if let Some(pos) = run_ids.iter().position(|id| *id == source.run_id) {
+                cells[pos] = source.status.clone();
+            }
+            rows.push(SourceHealthVm {
+                source_id: source.id,
+                label: SafeText::new(&source.label()),
+                kind: SafeText::new(&source.kind),
+                cells,
+            });
+        }
+    }
+    Ok(SourcesDataVm {
+        coverage,
+        health_rows: rows,
+        run_ids,
+    })
 }
 
 fn build_dashboard_summary(

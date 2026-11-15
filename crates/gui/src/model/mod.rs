@@ -54,6 +54,14 @@ pub enum ScopeAction {
     Clear,
 }
 
+/// A mutating IOC operation queued for the worker's writer thread.
+#[derive(Debug)]
+pub enum IocWriteRequest {
+    Add { ioc_type: String, value: String },
+    Import { content: String },
+    Remove { id: u64 },
+}
+
 #[derive(Debug)]
 pub enum Action {
     Scope(ScopeAction),
@@ -150,6 +158,10 @@ pub enum Action {
         ioc_type: String,
         value: String,
     },
+    /// import one IOC per line (type value [note], csv, or bare auto-detected values)
+    ImportIocs(String),
+    /// remove an IOC and rebuild the IOC pass so its hits disappear too
+    RemoveIoc(u64),
     IocWriteDone(Result<String, String>),
     DismissIocStatus,
     SetGroupBy(Option<fp_query::overview::GroupBy>),
@@ -176,6 +188,18 @@ pub enum Action {
     },
     /// pick the two runs the diff view compares
     SetDiffRuns(u64, u64),
+    IocList {
+        generation: Generation,
+        result: Result<Vec<crate::vm::IocSummaryVm>, String>,
+    },
+    IocHits {
+        generation: Generation,
+        result: Result<Vec<crate::vm::IocHitVm>, String>,
+    },
+    SourcesView {
+        generation: Generation,
+        result: Result<crate::vm::SourcesDataVm, String>,
+    },
     Diff {
         generation: Generation,
         result: Result<Vec<crate::vm::DiffEntryVm>, String>,
@@ -257,7 +281,10 @@ pub struct Model {
     pub lanes_gen: Generation,
     pub host_sort: fp_query::overview::HostSort,
     pub lanes_mode: fp_query::overview::LaneMode,
-    pub pending_ioc_add: Option<(String, String)>,
+    pub iocs: Slot<Vec<crate::vm::IocSummaryVm>>,
+    pub ioc_hits: Slot<Vec<crate::vm::IocHitVm>>,
+    pub sources: Slot<crate::vm::SourcesDataVm>,
+    pub pending_ioc_write: Option<IocWriteRequest>,
     pub ioc_status: Option<Result<String, String>>,
     pub group_by: Option<fp_query::overview::GroupBy>,
     pub reverse: bool,
@@ -552,6 +579,15 @@ impl Model {
             Action::Diff { generation, result } => {
                 self.diff.absorb(generation, self.diff_gen, result);
             }
+            Action::IocList { generation, result } => {
+                self.iocs.absorb(generation, self.generation, result);
+            }
+            Action::IocHits { generation, result } => {
+                self.ioc_hits.absorb(generation, self.generation, result);
+            }
+            Action::SourcesView { generation, result } => {
+                self.sources.absorb(generation, self.generation, result);
+            }
             Action::DashboardSummary { generation, result } => {
                 self.dashboard_summary
                     .absorb(generation, self.generation, result);
@@ -582,7 +618,13 @@ impl Model {
                 }
             }
             Action::AddIoc { ioc_type, value } => {
-                self.pending_ioc_add = Some((ioc_type, value));
+                self.pending_ioc_write = Some(IocWriteRequest::Add { ioc_type, value });
+            }
+            Action::ImportIocs(content) => {
+                self.pending_ioc_write = Some(IocWriteRequest::Import { content });
+            }
+            Action::RemoveIoc(id) => {
+                self.pending_ioc_write = Some(IocWriteRequest::Remove { id });
             }
             Action::IocWriteDone(result) => {
                 let ok = result.is_ok();

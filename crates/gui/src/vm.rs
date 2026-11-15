@@ -350,6 +350,8 @@ pub struct RunMarkerVm {
     pub id: u64,
     pub started_utc: i64,
     pub finished_utc: Option<i64>,
+    /// wall time of a finished run in microseconds; `None` while still running
+    pub duration_utc: Option<i64>,
     pub args: Option<SafeText>,
     pub events_new: u64,
     pub error_count: usize,
@@ -361,6 +363,7 @@ impl RunMarkerVm {
             id: view.id,
             started_utc: view.started_utc,
             finished_utc: view.finished_utc,
+            duration_utc: view.duration_utc,
             args: view.args.as_deref().map(SafeText::new),
             events_new: view.events_new,
             error_count: view.errors.len(),
@@ -864,5 +867,74 @@ mod tests {
         assert_clean(&lane.label);
         let untimed = UntimedLaneVm::new("bash\u{202e}", 2, false);
         assert_clean(&untimed.label);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IocSummaryVm {
+    pub id: u64,
+    pub ioc_type: SafeText,
+    pub value: SafeText,
+    pub note: Option<SafeText>,
+    pub hits: u64,
+}
+
+impl IocSummaryVm {
+    pub fn from_summary(summary: &fp_query::iocs::IocSummary) -> Self {
+        Self {
+            id: summary.ioc.id,
+            ioc_type: SafeText::new(&summary.ioc.ioc_type),
+            value: SafeText::new(&summary.ioc.value),
+            note: summary.ioc.note.as_deref().map(SafeText::new),
+            hits: summary.hits,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IocHitVm {
+    pub ioc_id: u64,
+    pub ioc_value: SafeText,
+    pub target_type: SafeText,
+    pub target_id: u64,
+    /// event kind when the target is an event, the target type otherwise
+    pub target_kind: SafeText,
+    /// event subject/URL when the target is an event
+    pub target_label: SafeText,
+    pub why: Option<SafeText>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageCardVm {
+    pub category: &'static str,
+    pub status: fp_query::CoverageStatus,
+    pub answering: Vec<SafeText>,
+    pub notes: Vec<SafeText>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceHealthVm {
+    pub source_id: u64,
+    pub label: SafeText,
+    pub kind: SafeText,
+    /// one cell per run, oldest first; `None` = the source did not run there
+    pub cells: Vec<Option<fp_core::Availability>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourcesDataVm {
+    pub coverage: Vec<CoverageCardVm>,
+    pub health_rows: Vec<SourceHealthVm>,
+    pub run_ids: Vec<u64>,
+}
+
+impl SourcesDataVm {
+    pub fn coverage_card(row: &fp_query::CoverageRow) -> CoverageCardVm {
+        CoverageCardVm {
+            category: row.category,
+            status: row.status,
+            answering: row.answering.iter().map(|s| SafeText::new(s)).collect(),
+            notes: row.notes.iter().map(|s| SafeText::new(s)).collect(),
+        }
     }
 }
