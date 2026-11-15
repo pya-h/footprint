@@ -736,6 +736,8 @@ name = "fp-fixtures"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "fp-core",
+ "fp-store",
  "rusqlite",
  "serde_json",
  "tempfile",

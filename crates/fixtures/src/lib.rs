@@ -491,6 +491,168 @@ pub fn firefox_profile(base: &Path) -> io::Result<PathBuf> {
     Ok(profile)
 }
 
+/// Deterministic generator (SplitMix64) so bulk cases and perf runs reproduce exactly.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
+/// a fixed base instant (2023-11-14T22:13:20Z) so generated cases never depend on the wall clock
+const BASE_UTC_US: i64 = 1_700_000_000_000_000;
+
+const BULK_KINDS: &[(&str, u32)] = &[
+    ("web.visit", 40),
+    ("web.redirect", 12),
+    ("dl.manager_download", 5),
+    ("shell.command", 25),
+    ("pkg.install", 6),
+    ("file.created", 10),
+    ("net.listen", 2),
+];
+
+fn bulk_kind(kind: &str) -> fp_core::EventKind {
+    match kind {
+        "web.visit" => fp_core::EventKind::WebVisit,
+        "web.redirect" => fp_core::EventKind::WebRedirect,
+        "dl.manager_download" => fp_core::EventKind::DlManagerDownload,
+        "shell.command" => fp_core::EventKind::ShellCommand,
+        "pkg.install" => fp_core::EventKind::PkgInstall,
+        "file.created" => fp_core::EventKind::FileCreated,
+        _ => fp_core::EventKind::NetListen,
+    }
+}
+
+fn weighted_kind(rng: &mut Rng) -> &'static str {
+    let total: u32 = BULK_KINDS.iter().map(|(_, w)| w).sum();
+    let mut pick = rng.below(total as usize) as u32;
+    for (kind, weight) in BULK_KINDS {
+        if pick < *weight {
+            return kind;
+        }
+        pick -= weight;
+    }
+    BULK_KINDS[0].0
+}
+
+fn flush(
+    store: &mut fp_store::Store,
+    run_id: u64,
+    batch: &mut Vec<fp_core::Event>,
+    source_identity: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !batch.is_empty() {
+        store.ingest(
+            run_id,
+            &fp_store::Batch {
+                source_identity,
+                events: batch,
+                states: &[],
+                artifacts: &[],
+            },
+        )?;
+        batch.clear();
+    }
+    Ok(())
+}
+
+/// Writes `events` realistic mixed-kind events spread over `days` days into a new case at
+/// `path` (replaced if present), deterministically from `seed`. Roughly 10% are untimed.
+/// Used by the ignored perf tests; not part of any scenario assertion.
+pub fn bulk_case(
+    path: &Path,
+    events: usize,
+    days: u32,
+    seed: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    let mut store = fp_store::Store::open_or_create(path)?;
+    let run_id = store.insert_run(&fp_store::NewRun {
+        host: "bulk",
+        user: "u",
+        uid: 1000,
+        euid: 1000,
+        version: "0",
+        tz: "UTC",
+        args: "bulk_case",
+    })?;
+
+    let mut sources = Vec::new();
+    for (kind, app) in [
+        ("chromium.history", "Brave"),
+        ("shell.history", "bash"),
+        ("xdm.downloads", "xdm"),
+        ("dpkg.log", "dpkg"),
+    ] {
+        let inst = fp_core::SourceInstance::new(kind, app, None, "/bulk".into());
+        sources.push((store.insert_source(run_id, &inst)?, kind));
+    }
+
+    let mut rng = Rng(seed);
+    let span = i128::from(days.max(1)) * i128::from(DAY_US);
+    let mut batch = Vec::with_capacity(20_000);
+    for ordinal in 0..events {
+        let (source_id, source_kind) = sources[rng.below(sources.len())];
+        let untimed = rng.below(10) == 0;
+        let kind = weighted_kind(&mut rng);
+        let host = format!("host{}.example", rng.below(1000));
+        let ts = if untimed {
+            0
+        } else {
+            let offset = rng.next() % span as u64;
+            (BASE_UTC_US as i128 + i128::from(offset) - span / 2) as i64
+        };
+        batch.push(fp_core::Event {
+            run_id,
+            source_kind: source_kind.into(),
+            ts_utc: ts,
+            ts_precision: if untimed {
+                fp_core::TimePrecision::OrderOnly
+            } else {
+                fp_core::TimePrecision::Second
+            },
+            ts_raw: (ts / 1_000_000).to_string(),
+            ts_raw_format: fp_core::time::TimeFormat::UnixSeconds,
+            ts_tz_assumed: None,
+            source_inst: source_id,
+            kind: bulk_kind(kind),
+            actor: None,
+            subject: format!("https://{host}/{ordinal}"),
+            subject_host: Some(host),
+            summary: format!("bulk event {ordinal}"),
+            attrs: serde_json::json!({}),
+            provenance: fp_core::Provenance {
+                file: "/bulk".into(),
+                file_sha256: None,
+                locator: ordinal.to_string(),
+            },
+            confidence: if untimed {
+                fp_core::Confidence::Derived
+            } else {
+                fp_core::Confidence::Direct
+            },
+        });
+        if batch.len() == 20_000 {
+            flush(&mut store, run_id, &mut batch, source_kind)?;
+        }
+    }
+    flush(&mut store, run_id, &mut batch, sources[0].1)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
