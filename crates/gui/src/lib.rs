@@ -1,6 +1,11 @@
 //! The desktop GUI (egui/eframe). The CLI builds it only with `--features gui`; this
 //! crate is a leaf like `fp-tui` and holds no SQL — everything goes through `fp-query`.
 
+pub mod theme;
+pub mod widgets;
+
+pub use theme::Theme;
+
 use std::path::Path;
 
 /// Opens the case in a window. Blocks until the window closes.
