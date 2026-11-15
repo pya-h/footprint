@@ -64,7 +64,7 @@ footprint show 1832
 | `ioc add\|import\|check\|list`, `export --format jsonl\|csv\|html --out FILE [--redact] [list filters]` | indicators of compromise and reports |
 | `explain <finding>` | known false positives of scanner findings, with a read-only command that proves them |
 | `tui` | interactive terminal UI: timeline with live filters, detail, trace tree, state/diff, IOC hits, sources/coverage, collect with per-source progress (`NO_COLOR` respected) |
-| `gui` *(build with `--features gui`)* | desktop interface over the same read model: scope chips with undo/redo, case header and totals, worker threads keep the UI thread free *(shell in place; the timeline/table views are still being built)* |
+| `gui` *(build with `--features gui`)* | optional desktop GUI over the shared read model: 10 views (Dashboard, Timeline with faceted filtering/minimap strip/table & inspector, Lanes, Hosts, Trace, State, Diff, IOC, Sources/coverage, Collect), scope chips with undo/redo + Copy-as-CLI, command palette (`Ctrl+K`), export dialog, help overlay (`F1`/`?`), responsive narrow-viewport drawers, and 3 WCAG AA themes (Dark, Light, High Contrast) |
 
 Times accept `2026-10-16T20:40`, `20:40` (today), `-24h`, `-30d`, `yesterday`, `@1792172917`.
 Every read command takes `--tz local|UTC|+03:30` to render times in another zone.
@@ -96,7 +96,7 @@ It runs as your user. Some sources (the full journal, root's crontab, `/root`) n
 - **Redaction**: passwords typed inline in shell/REPL history or sudo command lines (`PASSWORD '…'`, `PGPASSWORD=…`, `--password …`, `user:pass@host`, `Authorization: …`) are masked as `***` before they are stored.
 - **Evidence is untrusted**: size limits (including gunzip), only regular files are read (a FIFO can't stall a run), parsers are smoke-tested against mutated input, and nothing found is ever executed. External tools run from absolute paths with a fixed argv. Control, ANSI and bidi-override characters are stripped before anything is printed; CSV cells can't start a spreadsheet formula, and the HTML report forbids network fetches.
 - **No network**, ever (CI fails the build if a network crate enters the GUI's dependency tree).
-- **The GUI is read-only**: workers open the case read-only; evidence strings are sanitized at the view-model boundary, the clipboard is copy-only, and settings hold UI preferences, never evidence.
+- **The GUI is view-only by default**: reader workers open the case `READ_ONLY` (writes occur only when explicitly managing IOCs via the serialized writer thread or running Collect); evidence strings are sanitized and bidi/control escapes surfaced at the view-model boundary, the clipboard is copy-only, and `gui.json` stores UI preferences, never evidence.
 - **The case file is private** (`0600`): it holds your browsing history.
 
 ## Limitations
@@ -122,10 +122,10 @@ crates/
   collect   Collector trait + one module per source family
   correlate links (redirect chains, download→install, anchoring), IOC matching, trace tree
   render    jsonl / csv / html export with redaction
-  query     the read model + collect runner the CLI and TUI call; the only place with SQL
+  query     the read model + collect runner shared by the CLI, TUI and GUI
   tui       interactive terminal UI (ratatui); terminal-independent state machine, tested headless
-  gui       optional desktop UI (egui/eframe, `--features gui`); model and view-models tested headless,
-            all SQL through worker threads that own read-only stores
+  gui       optional desktop UI (egui/eframe, `--features gui`); 10 views, command palette, export/help,
+            tested headless (`egui_kittest`) and under Xvfb, SQL isolated behind worker threads
   cli       footprint binary (clap)
   fixtures  synthetic evidence in the real formats, for tests (never real data)
 ```
@@ -143,5 +143,6 @@ crates/
 - interactive TUI (`footprint tui`)
 - Firefox family, live state, scanner import, polish
 - full review: fixes for bugs found on a real host, robustness, speed (a 2-day collect: 9 min → 33 s)
+- optional desktop GUI (`footprint gui`, opt-in `--features gui`) and scale query optimizations
 
 Linux only for now. The collector interface keeps Windows and macOS open, but they aren't being built.
