@@ -87,7 +87,7 @@ fn responses_carry_id_kind_gen_and_payload() {
     })
     .unwrap();
 
-    let id = worker.submit(ReqKind::Count, 7, |store| {
+    let id = worker.submit(ReqKind::Count, None, 7, |store| {
         Ok(Box::new(store.event_count()?))
     });
     let mut found = None;
@@ -122,13 +122,13 @@ fn pending_request_of_a_kind_is_superseded_by_the_latest() {
     // hold the single reader with a slow request of another kind
     let release = Arc::new(Barrier::new(2));
     let gate = Arc::clone(&release);
-    worker.submit(ReqKind::Trace, 1, move |_store| {
+    worker.submit(ReqKind::Trace, None, 1, move |_store| {
         gate.wait();
         Ok(Box::new(()))
     });
 
-    let first = worker.submit(ReqKind::Count, 1, |_store| Ok(Box::new("first")));
-    let latest = worker.submit(ReqKind::Count, 2, |_store| Ok(Box::new("latest")));
+    let first = worker.submit(ReqKind::Count, None, 1, |_store| Ok(Box::new("first")));
+    let latest = worker.submit(ReqKind::Count, None, 2, |_store| Ok(Box::new("latest")));
     assert_ne!(first, latest);
     release.wait();
 
@@ -146,11 +146,65 @@ fn pending_request_of_a_kind_is_superseded_by_the_latest() {
 }
 
 #[test]
+fn subs_of_one_kind_run_in_parallel_and_supersede_per_sub() {
+    let (_dir, db) = tiny_case();
+    let worker = Worker::spawn(&db, 2, || {}).unwrap();
+
+    // hold both readers with a slow request each, so pending requests queue up
+    // (two different kinds: same-kind requests share a sub key and supersede)
+    let release = Arc::new(Barrier::new(3));
+    let gate = Arc::clone(&release);
+    worker.submit(ReqKind::Trace, None, 1, move |_store| {
+        gate.wait();
+        Ok(Box::new(()))
+    });
+    let gate = Arc::clone(&release);
+    worker.submit(ReqKind::Detail, None, 1, move |_store| {
+        gate.wait();
+        Ok(Box::new(()))
+    });
+    let kind_a = worker.submit(ReqKind::Facets, Some("kind".into()), 1, |_store| {
+        Ok(Box::new("kind"))
+    });
+    let host_a = worker.submit(ReqKind::Facets, Some("host".into()), 1, |_store| {
+        Ok(Box::new("host"))
+    });
+    // a newer request of the same sub supersedes only that sub
+    let kind_b = worker.submit(ReqKind::Facets, Some("kind".into()), 1, |_store| {
+        Ok(Box::new("kind2"))
+    });
+    release.wait();
+
+    let mut seen = Vec::new();
+    wait_for(|| {
+        for resp in worker.poll() {
+            if resp.kind == ReqKind::Facets {
+                seen.push((
+                    resp.id,
+                    resp.result
+                        .as_ref()
+                        .unwrap()
+                        .as_ref()
+                        .downcast_ref::<&str>()
+                        .copied(),
+                ));
+            }
+        }
+        seen.len() == 2
+    });
+    let mut ids: Vec<u64> = seen.iter().map(|(id, _)| *id).collect();
+    ids.sort();
+    assert_eq!(ids, vec![host_a, kind_b]);
+    assert!(!ids.contains(&kind_a), "the superseded sub must not answer");
+    worker.shutdown();
+}
+
+#[test]
 fn cancel_interrupts_the_running_query_quietly() {
     let (_dir, db) = tiny_case();
     let worker = Worker::spawn(&db, 1, || {}).unwrap();
 
-    worker.submit(ReqKind::Count, 1, |store| {
+    worker.submit(ReqKind::Count, None, 1, |store| {
         // long enough to be interrupted; failure maps to Interrupted via From
         let total: rusqlite::Result<i64> = store.conn().query_row(
             "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100000000)
@@ -166,7 +220,7 @@ fn cancel_interrupts_the_running_query_quietly() {
     worker.cancel(ReqKind::Count);
 
     // the pool stays alive and answers the next request of that kind
-    let id = worker.submit(ReqKind::Count, 2, |store| {
+    let id = worker.submit(ReqKind::Count, None, 2, |store| {
         Ok(Box::new(store.event_count()?))
     });
     let mut answered = None;
@@ -193,8 +247,8 @@ fn a_panicking_query_becomes_an_error_and_the_reader_survives() {
     let (_dir, db) = tiny_case();
     let worker = Worker::spawn(&db, 1, || {}).unwrap();
 
-    worker.submit(ReqKind::Detail, 1, |_store| panic!("boom"));
-    worker.submit(ReqKind::Count, 1, |store| {
+    worker.submit(ReqKind::Detail, None, 1, |_store| panic!("boom"));
+    worker.submit(ReqKind::Count, None, 1, |store| {
         Ok(Box::new(store.event_count()?))
     });
 
@@ -362,7 +416,7 @@ fn a_case_appearing_after_spawn_is_opened_and_watched() {
     std::thread::sleep(Duration::from_millis(700));
     seed_case(&db);
 
-    let id = worker.submit(ReqKind::Count, 1, |store| {
+    let id = worker.submit(ReqKind::Count, None, 1, |store| {
         Ok(Box::new(store.event_count()?))
     });
     let mut count = None;

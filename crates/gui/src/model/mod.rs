@@ -29,6 +29,16 @@ pub enum ScopeAction {
     /// the "[show]" answer to "untimed events hidden by the time window": drop the
     /// window and look at the untimed events (their only order is file order)
     ShowUntimed,
+    SetKinds(Vec<String>),
+    SetKindsNot(Vec<String>),
+    SetHosts(Vec<String>),
+    SetHostsNot(Vec<String>),
+    SetSources(Vec<String>),
+    SetSourcesNot(Vec<String>),
+    SetConfidence(Vec<fp_core::Confidence>),
+    SetRun(Option<u64>),
+    SetTiming(fp_store::EventTiming),
+    SetIocOnly(bool),
     Clear,
 }
 
@@ -59,6 +69,23 @@ pub enum Action {
     },
     /// the user acknowledged the "case changed" banner: the current version becomes baseline
     RefreshCase,
+    Histogram {
+        generation: Generation,
+        result: Result<fp_query::overview::Histogram, String>,
+    },
+    Category {
+        generation: Generation,
+        result: Result<[u64; fp_query::category::Category::ALL.len()], String>,
+    },
+    Timing {
+        generation: Generation,
+        result: Result<fp_query::overview::TimingCounts, String>,
+    },
+    Facets {
+        facet: fp_query::overview::Facet,
+        generation: Generation,
+        result: Result<fp_store::FacetPage, String>,
+    },
 }
 
 /// Consecutive `data_version` samples of the case file, from which the shell derives
@@ -109,6 +136,12 @@ pub struct Model {
     /// "untimed hidden by the time window" notice so they are never silently dropped
     pub untimed: Slot<u64>,
     pub watch: WatchState,
+    pub histogram: Slot<fp_query::overview::Histogram>,
+    pub category: Slot<[u64; fp_query::category::Category::ALL.len()]>,
+    pub timing: Slot<fp_query::overview::TimingCounts>,
+    /// one page per value facet (kind/source/host/confidence/run), computed under
+    /// the scope minus that facet's own selections
+    pub facets: std::collections::HashMap<fp_query::overview::Facet, Slot<fp_store::FacetPage>>,
 }
 
 impl Model {
@@ -144,10 +177,50 @@ impl Model {
                         self.scope.show_untimed();
                         true
                     }
+                    ScopeAction::SetKinds(v) => {
+                        self.scope.set_kinds(v);
+                        true
+                    }
+                    ScopeAction::SetKindsNot(v) => {
+                        self.scope.set_kinds_not(v);
+                        true
+                    }
+                    ScopeAction::SetHosts(v) => {
+                        self.scope.set_hosts(v);
+                        true
+                    }
+                    ScopeAction::SetHostsNot(v) => {
+                        self.scope.set_hosts_not(v);
+                        true
+                    }
+                    ScopeAction::SetSources(v) => {
+                        self.scope.set_sources(v);
+                        true
+                    }
+                    ScopeAction::SetSourcesNot(v) => {
+                        self.scope.set_sources_not(v);
+                        true
+                    }
+                    ScopeAction::SetConfidence(v) => {
+                        self.scope.set_confidence(v);
+                        true
+                    }
+                    ScopeAction::SetRun(v) => {
+                        self.scope.set_run(v);
+                        true
+                    }
+                    ScopeAction::SetTiming(v) => {
+                        self.scope.set_timing(v);
+                        true
+                    }
+                    ScopeAction::SetIocOnly(v) => {
+                        self.scope.set_ioc_only(v);
+                        true
+                    }
                     ScopeAction::Clear => self.scope.clear(),
                 };
                 if changed {
-                    self.generation += 1;
+                    self.scope_changed();
                 }
             }
             Action::UndoScope => {
@@ -179,7 +252,29 @@ impl Model {
             }
             Action::Observed { version } => self.watch.observe(version),
             Action::RefreshCase => self.watch.refresh(),
+            Action::Histogram { generation, result } => {
+                self.histogram.absorb(generation, self.generation, result)
+            }
+            Action::Category { generation, result } => {
+                self.category.absorb(generation, self.generation, result)
+            }
+            Action::Timing { generation, result } => {
+                self.timing.absorb(generation, self.generation, result)
+            }
+            Action::Facets {
+                facet,
+                generation,
+                result,
+            } => self
+                .facets
+                .entry(facet)
+                .or_default()
+                .absorb(generation, self.generation, result),
         }
+    }
+
+    fn scope_changed(&mut self) {
+        self.generation += 1;
     }
 
     /// The count for the "untimed events hidden by the time window" notice,

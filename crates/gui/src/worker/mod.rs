@@ -15,18 +15,24 @@ use std::time::{Duration, Instant};
 struct State {
     next_id: ReqId,
     quit: bool,
-    /// only the newest pending request per kind runs; older ones are dropped here
-    pending: HashMap<ReqKind, proto::Req>,
-    /// kind → (request id, that reader's interrupt handle) while it runs
-    inflight: HashMap<ReqKind, (ReqId, fp_store::InterruptHandle)>,
+    /// only the newest pending request per (kind, sub) runs; older ones drop here
+    pending: HashMap<(ReqKind, Option<String>), proto::Req>,
+    /// (kind, sub) → (request id, that reader's interrupt handle) while it runs
+    inflight: HashMap<(ReqKind, Option<String>), (ReqId, fp_store::InterruptHandle)>,
     writer_queue: VecDeque<WriterJob>,
     writer_running: bool,
 }
 
+type Key = (ReqKind, Option<String>);
+
 impl State {
     fn pop_next(&mut self) -> Option<proto::Req> {
-        let (&kind, _) = self.pending.iter().min_by_key(|(_, req)| req.id)?;
-        self.pending.remove(&kind)
+        let key = self
+            .pending
+            .iter()
+            .min_by_key(|(_, req)| req.id)
+            .map(|(key, _)| key.clone())?;
+        self.pending.remove(&key)
     }
 }
 
@@ -110,10 +116,12 @@ impl Worker {
         })
     }
 
-    /// Queues a read. Supersedes any pending request of the same kind.
+    /// Queues a read. Supersedes any pending request of the same (kind, sub), so
+    /// parallel facets/blocks never cancel each other.
     pub fn submit(
         &self,
         kind: ReqKind,
+        sub: Option<String>,
         generation: Generation,
         run: impl FnOnce(&fp_store::Store) -> Result<Payload, QueryError> + Send + 'static,
     ) -> ReqId {
@@ -121,11 +129,12 @@ impl Worker {
         state.next_id += 1;
         let id = state.next_id;
         state.pending.insert(
-            kind,
+            (kind, sub.clone()),
             proto::Req {
                 id,
                 generation,
                 kind,
+                sub,
                 run: Box::new(run),
             },
         );
@@ -164,12 +173,14 @@ impl Worker {
         id
     }
 
-    /// Interrupts the running query of this kind, if any. The interrupted query
+    /// Interrupts the running queries of this kind, if any. The interrupted query
     /// produces no response; a pending one is simply superseded later.
     pub fn cancel(&self, kind: ReqKind) {
         let state = lock(&self.shared.state);
-        if let Some((_, handle)) = state.inflight.get(&kind) {
-            handle.interrupt();
+        for ((inflight_kind, _), (_, handle)) in state.inflight.iter() {
+            if *inflight_kind == kind {
+                handle.interrupt();
+            }
         }
     }
 
@@ -235,10 +246,11 @@ fn spawn_reader(
             let id = req.id;
             let generation = req.generation;
             let kind = req.kind;
+            let key = (kind, req.sub.clone());
             let interrupt = store.interrupt_handle();
             {
                 let mut state = lock(&shared.state);
-                state.inflight.insert(kind, (id, interrupt));
+                state.inflight.insert(key.clone(), (id, interrupt));
             }
             // a panicking query must not take the reader down with it
             let result =
@@ -255,7 +267,7 @@ fn spawn_reader(
                     });
             {
                 let mut state = lock(&shared.state);
-                state.inflight.remove(&kind);
+                state.inflight.remove(&key);
             }
             // Interrupted: superseded while running; the newer request answers instead.
             if matches!(result, Err(QueryError::Interrupted)) {

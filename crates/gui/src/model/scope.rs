@@ -70,7 +70,8 @@ fn sh_quote(s: &str) -> String {
 
 fn push_list(args: &mut Vec<String>, flag: &str, values: &[String]) {
     if !values.is_empty() {
-        args.push(format!("{flag} {}", sh_quote(&values.join(","))));
+        args.push(flag.to_string());
+        args.push(sh_quote(&values.join(",")));
     }
 }
 
@@ -113,6 +114,46 @@ impl Scope {
 
     pub fn set_text(&mut self, text: Option<String>) {
         self.edit(|f| f.match_text = text.filter(|t| !t.is_empty()));
+    }
+
+    pub fn set_kinds(&mut self, values: Vec<String>) {
+        self.edit(|f| f.kinds = values);
+    }
+
+    pub fn set_kinds_not(&mut self, values: Vec<String>) {
+        self.edit(|f| f.kinds_not = values);
+    }
+
+    pub fn set_hosts(&mut self, values: Vec<String>) {
+        self.edit(|f| f.hosts = values);
+    }
+
+    pub fn set_hosts_not(&mut self, values: Vec<String>) {
+        self.edit(|f| f.hosts_not = values);
+    }
+
+    pub fn set_sources(&mut self, values: Vec<String>) {
+        self.edit(|f| f.sources = values);
+    }
+
+    pub fn set_sources_not(&mut self, values: Vec<String>) {
+        self.edit(|f| f.sources_not = values);
+    }
+
+    pub fn set_confidence(&mut self, values: Vec<fp_core::Confidence>) {
+        self.edit(|f| f.confidence = values);
+    }
+
+    pub fn set_run(&mut self, run: Option<u64>) {
+        self.edit(|f| f.run_id = run);
+    }
+
+    pub fn set_timing(&mut self, timing: EventTiming) {
+        self.edit(|f| f.timing = timing);
+    }
+
+    pub fn set_ioc_only(&mut self, on: bool) {
+        self.edit(|f| f.ioc_only = on);
     }
 
     pub fn show_untimed(&mut self) {
@@ -243,34 +284,45 @@ impl Scope {
 
     /// The equivalent `footprint list` invocation; every scope part maps to a CLI flag.
     pub fn to_cli(&self) -> String {
+        format!("footprint {}", self.cli_args().join(" "))
+    }
+
+    /// The argument vector behind [`to_cli`](Self::to_cli), one flag/value pair per
+    /// entry, in the CLI's flag order — kept separate so tests can pin the parity.
+    pub fn cli_args(&self) -> Vec<String> {
         let f = self.filter();
         let mut args: Vec<String> = vec!["list".to_string()];
         if let Some(t) = f.since {
-            args.push(format!("--since {}", sh_quote(&fmt_us(floor_second(t)))));
+            args.push("--since".to_string());
+            args.push(sh_quote(&fmt_us(floor_second(t))));
         }
         if let Some(t) = f.until {
-            args.push(format!("--until {}", sh_quote(&fmt_us(ceil_second(t)))));
+            args.push("--until".to_string());
+            args.push(sh_quote(&fmt_us(ceil_second(t))));
         }
         push_list(&mut args, "--kind", &f.kinds);
         push_list(&mut args, "--source", &f.sources);
         push_list(&mut args, "--host", &f.hosts);
         if let Some(text) = &f.match_text {
-            args.push(format!("--match {}", sh_quote(text)));
+            args.push("--match".to_string());
+            args.push(sh_quote(text));
         }
         push_list(&mut args, "--exclude-kind", &f.kinds_not);
         push_list(&mut args, "--exclude-host", &f.hosts_not);
         push_list(&mut args, "--exclude-source", &f.sources_not);
         if let Some(run) = f.run_id {
-            args.push(format!("--run {run}"));
+            args.push("--run".to_string());
+            args.push(run.to_string());
         }
         if !f.confidence.is_empty() {
+            args.push("--confidence".to_string());
             let list = f
                 .confidence
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            args.push(format!("--confidence {}", sh_quote(&list)));
+            args.push(sh_quote(&list));
         }
         match f.timing {
             EventTiming::Timed => args.push("--timed".to_string()),
@@ -280,7 +332,7 @@ impl Scope {
         if f.ioc_only {
             args.push("--ioc-only".to_string());
         }
-        format!("footprint {}", args.join(" "))
+        args
     }
 
     /// Cache key for request/row-block caching; paging fields never reach it.
@@ -433,6 +485,64 @@ mod tests {
         assert_eq!(
             fp_query::time::parse_in(until_str, Some(Tz::Local)).expect("until parses"),
             ceil_second(until)
+        );
+    }
+
+    #[test]
+    fn cli_args_pin_flag_parity_with_the_list_command() {
+        let s = scope(|f| {
+            f.since = Some(1_700_000_000_000_000);
+            f.until = Some(1_700_000_100_000_000);
+            f.kinds = vec!["web.*".into(), "dl.*".into()];
+            f.sources = vec!["brave/Default".into()];
+            f.hosts = vec!["zoom.us".into()];
+            f.match_text = Some("zoom".into());
+            f.kinds_not = vec!["file.*".into()];
+            f.hosts_not = vec!["google.com".into()];
+            f.sources_not = vec!["journald".into()];
+            f.run_id = Some(3);
+            f.confidence = vec![fp_core::Confidence::Direct, fp_core::Confidence::Derived];
+            f.timing = EventTiming::Timed;
+            f.ioc_only = true;
+        });
+        let args = s.cli_args();
+        assert_eq!(args[0], "list");
+        // flag order and names pinned against the CLI's scope flags; time values
+        // are local-zone formatted, so only their position is checked here
+        let flags: Vec<&str> = args.iter().filter_map(|a| a.strip_prefix("--")).collect();
+        assert_eq!(
+            flags,
+            [
+                "since",
+                "until",
+                "kind",
+                "source",
+                "host",
+                "match",
+                "exclude-kind",
+                "exclude-host",
+                "exclude-source",
+                "run",
+                "confidence",
+                "timed",
+                "ioc-only"
+            ]
+        );
+        assert_eq!(
+            args[args.iter().position(|a| a == "--kind").unwrap() + 1],
+            "'web.*,dl.*'"
+        );
+        assert_eq!(
+            args[args.iter().position(|a| a == "--match").unwrap() + 1],
+            "zoom"
+        );
+        assert_eq!(
+            args[args.iter().position(|a| a == "--confidence").unwrap() + 1],
+            "'direct,derived'"
+        );
+        assert_eq!(
+            args[args.iter().position(|a| a == "--run").unwrap() + 1],
+            "3"
         );
     }
 

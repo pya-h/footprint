@@ -201,7 +201,7 @@ impl Shell {
             return;
         };
 
-        let id = worker.submit(ReqKind::Count, generation, move |store| {
+        let id = worker.submit(ReqKind::Count, None, generation, move |store| {
             let in_case = store.event_count()?;
             let in_scope = store.count_events(&fp_store::EventFilter::from(&filter))?;
             let untimed_filter = fp_query::TimelineFilter {
@@ -215,7 +215,7 @@ impl Shell {
         });
         self.outstanding.insert(id);
 
-        let id = worker.submit(ReqKind::Bounds, generation, |store| {
+        let id = worker.submit(ReqKind::Bounds, None, generation, |store| {
             Ok(Box::new(store.time_bounds()?))
         });
         self.outstanding.insert(id);

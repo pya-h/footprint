@@ -172,7 +172,7 @@ pub fn histogram(
 
 pub const MAX_FACET_ROWS: usize = 500;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Facet {
     Kind,
     Source,

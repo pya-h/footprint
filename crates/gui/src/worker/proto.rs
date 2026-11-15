@@ -72,6 +72,9 @@ pub struct Req {
     pub id: ReqId,
     pub generation: Generation,
     pub kind: ReqKind,
+    /// Parallel requests of one kind (one per facet, per strip tier, per table
+    /// block) are kept apart by this key; the queue supersedes per (kind, sub).
+    pub sub: Option<String>,
     pub run: ReadJob,
 }
 
