@@ -33,6 +33,9 @@ pub enum ReqKind {
     IocWrite,
     /// collect; runs on the writer thread.
     Collect,
+    /// case-watch sample (`i64` data_version); produced by the watcher thread,
+    /// not by a reader.
+    Watch,
 }
 
 /// Why a query failed. Interruption is not a failure: it means a newer request of

@@ -17,6 +17,7 @@ fp-render = { path = "../render" } # sanitize and export
 fp-correlate = { path = "../correlate" } # trace tree types
 serde = { version = "1", features = ["derive"] } # gui.json settings
 serde_json = "1" # gui.json settings
+libc = "0.2" # root refusal (geteuid), same as fp-query uses
 anyhow = "1"
 
 [dev-dependencies]

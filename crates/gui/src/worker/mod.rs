@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 struct State {
     next_id: ReqId,
@@ -41,8 +42,12 @@ pub struct Worker {
     resp_rx: std::sync::mpsc::Receiver<Resp>,
     on_response: Arc<dyn Fn() + Send + Sync>,
     readers: Vec<JoinHandle<()>>,
+    watcher: JoinHandle<()>,
     writer: Mutex<Option<JoinHandle<()>>>,
 }
+
+/// How often the watcher samples `PRAGMA data_version`.
+pub const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 
 fn lock<T>(state: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     state
@@ -87,6 +92,12 @@ impl Worker {
                 on_response.clone(),
             ));
         }
+        let watcher = spawn_watcher(
+            case.clone(),
+            shared.clone(),
+            resp_tx.clone(),
+            on_response.clone(),
+        );
         Ok(Self {
             case,
             shared,
@@ -94,6 +105,7 @@ impl Worker {
             resp_rx,
             on_response,
             readers,
+            watcher,
             writer: Mutex::new(None),
         })
     }
@@ -177,6 +189,7 @@ impl Worker {
         for reader in self.readers {
             let _ = reader.join();
         }
+        let _ = self.watcher.join();
         let writer = lock(&self.writer).take();
         if let Some(writer) = writer {
             let _ = writer.join();
@@ -191,8 +204,20 @@ fn spawn_reader(
     on_response: Arc<dyn Fn() + Send + Sync>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let Ok(store) = fp_store::Store::open(&case) else {
-            return;
+        // the case may not exist yet (GUI empty state; the writer can create it later):
+        // keep trying instead of dying, so a case that appears later is served
+        let store = loop {
+            match fp_store::Store::open(&case) {
+                Ok(store) => break store,
+                Err(_) => {
+                    let state = lock(&shared.state);
+                    if state.quit {
+                        return;
+                    }
+                    drop(state);
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
         };
         loop {
             let req = {
@@ -242,6 +267,54 @@ fn spawn_reader(
                 kind,
                 result,
             });
+            on_response();
+        }
+    })
+}
+
+fn spawn_watcher(
+    case: PathBuf,
+    shared: Arc<Shared>,
+    resp_tx: std::sync::mpsc::Sender<Resp>,
+    on_response: Arc<dyn Fn() + Send + Sync>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        // watch responses are not submitted requests; start their ids away from the
+        // submit counter so they can never collide on the shared response channel
+        let mut next_id = u64::MAX / 2;
+        let mut store: Option<fp_store::Store> = None;
+        let mut last: Option<i64> = None;
+        let mut last_poll = Instant::now() - WATCH_INTERVAL;
+        loop {
+            if lock(&shared.state).quit {
+                return;
+            }
+            if last_poll.elapsed() < WATCH_INTERVAL {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            last_poll = Instant::now();
+            if store.is_none() {
+                store = fp_store::Store::open(&case).ok();
+                last = None;
+            }
+            let Some(store) = &store else {
+                continue;
+            };
+            let Ok(version) = store.data_version() else {
+                continue;
+            };
+            if last == Some(version) {
+                continue;
+            }
+            last = Some(version);
+            let _ = resp_tx.send(Resp {
+                id: next_id,
+                generation: 0,
+                kind: ReqKind::Watch,
+                result: Ok(Box::new(version)),
+            });
+            next_id += 1;
             on_response();
         }
     })

@@ -115,6 +115,14 @@ impl Scope {
         self.edit(|f| f.match_text = text.filter(|t| !t.is_empty()));
     }
 
+    pub fn show_untimed(&mut self) {
+        self.edit(|f| {
+            f.since = None;
+            f.until = None;
+            f.timing = EventTiming::Untimed;
+        });
+    }
+
     pub fn remove(&mut self, which: ChipRemove) {
         self.edit(|f| match which {
             ChipRemove::SinceUntil => {

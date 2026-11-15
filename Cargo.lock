@@ -1729,6 +1729,7 @@ dependencies = [
  "fp-query",
  "fp-render",
  "fp-store",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

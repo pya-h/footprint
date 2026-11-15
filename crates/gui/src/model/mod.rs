@@ -26,6 +26,9 @@ pub enum ScopeAction {
         since: Option<i64>,
         until: Option<i64>,
     },
+    /// the "[show]" answer to "untimed events hidden by the time window": drop the
+    /// window and look at the untimed events (their only order is file order)
+    ShowUntimed,
     Clear,
 }
 
@@ -44,12 +47,53 @@ pub enum Action {
     },
     Bounds {
         generation: Generation,
-        result: Result<(i64, i64), String>,
+        result: Result<Option<(i64, i64)>, String>,
     },
     Untimed {
         generation: Generation,
         result: Result<u64, String>,
     },
+    /// a watcher sample of the case's `data_version`
+    Observed {
+        version: i64,
+    },
+    /// the user acknowledged the "case changed" banner: the current version becomes baseline
+    RefreshCase,
+}
+
+/// Consecutive `data_version` samples of the case file, from which the shell derives
+/// the busy and changed banners. The GUI's own writer never raises its own
+/// connection's counter, so only external writes are observed.
+#[derive(Debug, Default)]
+pub struct WatchState {
+    baseline: Option<i64>,
+    previous: Option<i64>,
+    current: Option<i64>,
+}
+
+impl WatchState {
+    pub fn observe(&mut self, version: i64) {
+        self.previous = self.current;
+        self.current = Some(version);
+        if self.baseline.is_none() {
+            self.baseline = Some(version);
+        }
+    }
+
+    /// two consecutive samples differ: someone is writing right now
+    pub fn case_writing(&self) -> bool {
+        matches!((self.previous, self.current), (Some(p), Some(c)) if p != c)
+    }
+
+    /// the case settled on a version newer than the one the user last acknowledged
+    pub fn case_changed(&self) -> bool {
+        matches!((self.baseline, self.current), (Some(b), Some(c)) if b != c)
+            && !self.case_writing()
+    }
+
+    pub fn refresh(&mut self) {
+        self.baseline = self.current;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -59,10 +103,12 @@ pub struct Model {
     /// bumped on every scope change; worker responses carry it and stale ones drop
     pub generation: Generation,
     pub counts: Slot<Counts>,
-    pub bounds: Slot<(i64, i64)>,
+    /// the case's timed timespan; `None` while the case has no timed events
+    pub bounds: Slot<Option<(i64, i64)>>,
     /// untimed events matching the scope with its time window dropped; feeds the
     /// "untimed hidden by the time window" notice so they are never silently dropped
     pub untimed: Slot<u64>,
+    pub watch: WatchState,
 }
 
 impl Model {
@@ -92,6 +138,10 @@ impl Model {
                     }
                     ScopeAction::SetWindow { since, until } => {
                         self.scope.set_window(since, until);
+                        true
+                    }
+                    ScopeAction::ShowUntimed => {
+                        self.scope.show_untimed();
                         true
                     }
                     ScopeAction::Clear => self.scope.clear(),
@@ -127,6 +177,8 @@ impl Model {
             Action::Untimed { generation, result } => {
                 self.untimed.absorb(generation, self.generation, result)
             }
+            Action::Observed { version } => self.watch.observe(version),
+            Action::RefreshCase => self.watch.refresh(),
         }
     }
 

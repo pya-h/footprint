@@ -396,6 +396,15 @@ impl Store {
         self.conn.get_interrupt_handle()
     }
 
+    /// Per-connection change counter: bumps when *another* connection commits a
+    /// write after this connection's last read. The GUI watcher polls it to spot
+    /// external collects; a read-only connection still sees the bumps.
+    pub fn data_version(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
     /// Visits scoped timed events in an inclusive UTC microsecond range, without paging.
     /// If an error occurs, the visitor may already have seen some rows.
     pub fn visit_timed_events(
@@ -1774,6 +1783,23 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn data_version_tracks_other_connections_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("case.db");
+        let watcher = Store::open_or_create(&path).unwrap();
+        let before = watcher.data_version().unwrap();
+
+        let mut writer = Store::open_or_create(&path).unwrap();
+        let (run_id, source_id) = run(&mut writer);
+        ingest(&mut writer, run_id, &sample(run_id, source_id));
+
+        assert!(
+            watcher.data_version().unwrap() > before,
+            "another connection's commit must bump the watcher"
+        );
     }
 
     #[test]

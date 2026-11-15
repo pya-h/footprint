@@ -1,10 +1,14 @@
+#![cfg(test)]
+//! Worker pool tests; the module is gated in `mod.rs`, and the file-level gate
+//! keeps the CI no-unwrap scan from treating test code as product code.
+
 use super::{ReqKind, Worker};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 fn wait_for(mut cond: impl FnMut() -> bool) {
-    for _ in 0..500 {
+    for _ in 0..3000 {
         if cond() {
             return;
         }
@@ -16,7 +20,12 @@ fn wait_for(mut cond: impl FnMut() -> bool) {
 fn tiny_case() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("case.db");
-    let mut store = fp_store::Store::open_or_create(&db).unwrap();
+    seed_case(&db);
+    (dir, db)
+}
+
+fn seed_case(db: &std::path::Path) {
+    let mut store = fp_store::Store::open_or_create(db).unwrap();
     let run = store
         .insert_run(&fp_store::NewRun {
             host: "h",
@@ -66,7 +75,6 @@ fn tiny_case() -> (tempfile::TempDir, std::path::PathBuf) {
             },
         )
         .unwrap();
-    (dir, db)
 }
 
 #[test]
@@ -286,4 +294,94 @@ fn spawning_on_a_corrupt_case_errors() {
     std::fs::write(&bad, b"not a sqlite file").unwrap();
     let result = Worker::spawn(&bad, 1, || {});
     assert!(result.is_err());
+}
+
+#[test]
+fn the_watcher_reports_the_first_sample_and_external_writes() {
+    let (_dir, db) = tiny_case();
+    let worker = Worker::spawn(&db, 1, || {}).unwrap();
+
+    let mut samples: Vec<i64> = Vec::new();
+    wait_for(|| {
+        for resp in worker.poll() {
+            if resp.kind == ReqKind::Watch
+                && let Some(v) = resp
+                    .result
+                    .as_ref()
+                    .ok()
+                    .and_then(|p| p.as_ref().downcast_ref::<i64>().copied())
+            {
+                samples.push(v);
+            }
+        }
+        !samples.is_empty()
+    });
+
+    // a commit from another connection (what `footprint collect` does) shows up
+    let mut writer = fp_store::Store::open_or_create(&db).unwrap();
+    writer
+        .insert_run(&fp_store::NewRun {
+            host: "h",
+            user: "u",
+            uid: 1,
+            euid: 1,
+            version: "0",
+            tz: "UTC",
+            args: "collect",
+        })
+        .unwrap();
+    drop(writer);
+
+    wait_for(|| {
+        for resp in worker.poll() {
+            if resp.kind == ReqKind::Watch
+                && let Some(v) = resp
+                    .result
+                    .as_ref()
+                    .ok()
+                    .and_then(|p| p.as_ref().downcast_ref::<i64>().copied())
+            {
+                samples.push(v);
+            }
+        }
+        samples.len() >= 2
+    });
+    assert!(
+        samples.windows(2).any(|w| w[1] > w[0]),
+        "an external commit must raise the reported version: {samples:?}"
+    );
+    worker.shutdown();
+}
+
+#[test]
+fn a_case_appearing_after_spawn_is_opened_and_watched() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("later.db");
+    let worker = Worker::spawn(&db, 1, || {}).unwrap();
+    // let the reader and watcher hit the missing file a few times first
+    std::thread::sleep(Duration::from_millis(700));
+    seed_case(&db);
+
+    let id = worker.submit(ReqKind::Count, 1, |store| {
+        Ok(Box::new(store.event_count()?))
+    });
+    let mut count = None;
+    let mut watched = false;
+    wait_for(|| {
+        for resp in worker.poll() {
+            match resp.kind {
+                ReqKind::Count if resp.id == id => {
+                    count = resp
+                        .result
+                        .as_ref()
+                        .ok()
+                        .and_then(|p| p.as_ref().downcast_ref::<u64>().copied());
+                }
+                ReqKind::Watch => watched = true,
+                _ => {}
+            }
+        }
+        count == Some(1) && watched
+    });
+    worker.shutdown();
 }

@@ -178,3 +178,50 @@ fn failed_queries_show_as_errors_without_touching_the_generation() {
         fp_gui::model::LoadStatus::Error("database is locked".to_string())
     );
 }
+
+#[test]
+fn watch_samples_drive_busy_and_changed_banners() {
+    let mut model = Model::new();
+    model.apply(Action::Observed { version: 10 });
+    assert!(!model.watch.case_writing());
+    assert!(!model.watch.case_changed());
+
+    // a collect is writing: consecutive samples differ
+    model.apply(Action::Observed { version: 11 });
+    assert!(model.watch.case_writing());
+    assert!(!model.watch.case_changed());
+
+    // the run finished: settled on a newer version than the baseline
+    model.apply(Action::Observed { version: 11 });
+    assert!(!model.watch.case_writing());
+    assert!(model.watch.case_changed());
+
+    // the user acknowledged: no banner until the next external write
+    model.apply(Action::RefreshCase);
+    assert!(!model.watch.case_changed());
+    // one new sample reads as "writing"; it settles into "changed" on the next
+    model.apply(Action::Observed { version: 12 });
+    assert!(model.watch.case_writing());
+    assert!(!model.watch.case_changed());
+    model.apply(Action::Observed { version: 12 });
+    assert!(!model.watch.case_writing());
+    assert!(model.watch.case_changed());
+}
+
+#[test]
+fn show_untimed_drops_the_window_and_keeps_one_history_entry() {
+    let mut model = Model::new();
+    model.apply(Action::Scope(ScopeAction::SetWindow {
+        since: Some(1_700_000_000_000_000),
+        until: Some(1_700_000_100_000_000),
+    }));
+    let before = model.generation;
+    model.apply(Action::Scope(ScopeAction::ShowUntimed));
+    let filter = model.scope.filter();
+    assert_eq!(filter.since, None);
+    assert_eq!(filter.until, None);
+    assert_eq!(filter.timing, fp_store::EventTiming::Untimed);
+    assert_eq!(model.generation, before + 1);
+    model.apply(Action::UndoScope);
+    assert!(model.scope.filter().since.is_some());
+}

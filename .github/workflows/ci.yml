@@ -25,7 +25,33 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: no unwrap outside tests
         run: |
-          found=$(find crates -path '*/src/*.rs' -exec awk '/#\[cfg\(test\)\]/{exit} /\.unwrap\(\)/{print FILENAME":"FNR": "$0}' {} \;)
+          found=$(find crates -path '*/src/*.rs' -exec awk '/^#!?\[cfg\(test\)\]/{exit} /\.unwrap\(\)/{print FILENAME":"FNR": "$0}' {} \;)
           if [ -n "$found" ]; then echo "$found"; exit 1; fi
       - name: test
         run: cargo test --all-targets
+
+  gui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: check (gui)
+        run: cargo check --all-targets --features gui
+      - name: clippy (gui)
+        run: cargo clippy --all-targets --features gui -- -D warnings
+      - name: no unwrap outside tests
+        run: |
+          found=$(find crates -path '*/src/*.rs' -exec awk '/^#!?\[cfg\(test\)\]/{exit} /\.unwrap\(\)/{print FILENAME":"FNR": "$0}' {} \;)
+          if [ -n "$found" ]; then echo "$found"; exit 1; fi
+      - name: test (gui)
+        run: cargo test --all-targets --features gui
+      - name: no network crates in the gui tree
+        run: |
+          crates=$(cargo tree -p fp-gui --prefix none | awk '{print $1}' | sort -u)
+          found=$(echo "$crates" | grep -E '^(reqwest|hyper|ureq|curl|openssl|rustls|native-tls|webbrowser|open)$' || true)
+          if [ -n "$found" ]; then echo "denylisted crates in the gui tree:"; echo "$found"; exit 1; fi
