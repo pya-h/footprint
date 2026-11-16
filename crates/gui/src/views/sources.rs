@@ -10,6 +10,10 @@ use crate::theme::Theme;
 use crate::vm::SourcesDataVm;
 use crate::widgets::ViewCtx;
 use crate::widgets::chip::thousands;
+use crate::widgets::kit;
+
+const CARD_TARGET_WIDTH: f32 = 360.0;
+const MAX_COVERAGE_COLUMNS: usize = 6;
 
 pub fn show_sources(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Action>) {
     ui.label(egui::RichText::new("Coverage").strong());
@@ -44,39 +48,44 @@ pub fn show_sources(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Acti
 }
 
 fn render_coverage_cards(ui: &mut egui::Ui, theme: &Theme, data: &SourcesDataVm) {
-    ui.horizontal_wrapped(|ui| {
-        for card in &data.coverage {
-            egui::Frame::group(ui.style())
-                .fill(theme.bg1)
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.set_width(220.0);
-                    ui.label(egui::RichText::new(card.category).strong().small());
-                    ui.horizontal(|ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        paint_status_disc(ui.painter(), rect.center(), 5.0, card.status, theme);
-                        let label = match card.status {
-                            CoverageStatus::Covered => "covered",
-                            CoverageStatus::Partial => "partial",
-                            CoverageStatus::Gap => "gap",
-                        };
-                        ui.label(
-                            egui::RichText::new(label)
-                                .small()
-                                .color(status_color(card.status, theme)),
-                        );
-                    });
-                    for line in &card.answering {
-                        ui.label(egui::RichText::new(line.as_str()).small());
-                    }
-                    for line in &card.notes {
-                        ui.label(egui::RichText::new(line.as_str()).small().weak());
-                    }
-                });
-        }
+    // as many equal columns as fit at a readable width, so cards reflow when the window resizes
+    let columns = (ui.available_width() / CARD_TARGET_WIDTH)
+        .round()
+        .clamp(1.0, MAX_COVERAGE_COLUMNS as f32) as usize;
+    for row in data.coverage.chunks(columns) {
+        ui.columns(columns, |cols| {
+            for (col, card) in cols.iter_mut().zip(row) {
+                kit::card(col, theme, |ui| render_coverage_card(ui, theme, card));
+            }
+        });
+        ui.add_space(6.0);
+    }
+}
+
+fn render_coverage_card(ui: &mut egui::Ui, theme: &Theme, card: &crate::vm::CoverageCardVm) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(card.category).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let label = match card.status {
+                CoverageStatus::Covered => "covered",
+                CoverageStatus::Partial => "partial",
+                CoverageStatus::Gap => "gap",
+            };
+            ui.label(
+                egui::RichText::new(label)
+                    .small()
+                    .color(status_color(card.status, theme)),
+            );
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            paint_status_disc(ui.painter(), rect.center(), 5.0, card.status, theme);
+        });
     });
+    for line in &card.answering {
+        ui.label(egui::RichText::new(line.as_str()).small());
+    }
+    for line in &card.notes {
+        ui.label(egui::RichText::new(line.as_str()).small().weak());
+    }
 }
 
 fn render_health_matrix(
@@ -170,7 +179,7 @@ fn render_runs_table(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Act
             for idx in (0..runs.len()).rev() {
                 let run = &runs[idx];
                 let prev_id = idx.checked_sub(1).map(|p| runs[p].id);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.monospace(format!("run {:<3}", run.id));
                     ui.monospace(fp_query::format_time(
                         run.started_utc,
@@ -194,7 +203,10 @@ fn render_runs_table(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Act
                         );
                     }
                     if let Some(args) = &run.args {
-                        ui.label(egui::RichText::new(args.as_str()).small().weak());
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(args.as_str()).small().weak())
+                                .truncate(),
+                        );
                     }
                     if let Some(prev) = prev_id
                         && ui

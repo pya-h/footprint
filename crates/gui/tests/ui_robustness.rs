@@ -309,8 +309,19 @@ fn narrow_viewport_uses_drawers_at_1100x700() {
     harness.step();
     harness.step();
 
-    // Below 1280 px, open sidebars render as dismissible drawers instead of squeezing the timeline.
-    harness.get_by_label("close facets");
+    assert_eq!(harness.query_all_by_label("close facets").count(), 0);
+    assert_eq!(harness.query_all_by_label("close inspector").count(), 0);
+
+    harness.get_by_label("facets").click();
+    harness.step();
+    harness.step();
+    assert_eq!(harness.query_all_by_label("close facets").count(), 1);
+    assert_eq!(harness.query_all_by_label("close inspector").count(), 0);
+
+    harness.get_by_label("inspector").click();
+    harness.step();
+    harness.step();
+    assert_eq!(harness.query_all_by_label("close facets").count(), 0);
     harness.get_by_label("close inspector").click();
     harness.step();
     harness.step();

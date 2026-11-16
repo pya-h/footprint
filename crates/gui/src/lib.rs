@@ -36,7 +36,7 @@ pub fn run(case: &Path, tz_override: Option<fp_query::Tz>) -> anyhow::Result<()>
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(&title)
-            .with_inner_size([1100.0, 700.0])
+            .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1100.0, 700.0]),
         ..Default::default()
     };

@@ -64,7 +64,7 @@ footprint show 1832
 | `ioc add\|import\|check\|list`, `export --format jsonl\|csv\|html --out FILE [--redact] [list filters]` | indicators of compromise and reports |
 | `explain <finding>` | known false positives of scanner findings, with a read-only command that proves them |
 | `tui` | interactive terminal UI: timeline with live filters, detail, trace tree, state/diff, IOC hits, sources/coverage, collect with per-source progress (`NO_COLOR` respected) |
-| `gui` *(build with `--features gui`)* | optional desktop GUI over the shared read model: 10 views (Dashboard, Timeline with faceted filtering/minimap strip/table & inspector, Lanes, Hosts, Trace, State, Diff, IOC, Sources/coverage, Collect), scope chips with undo/redo + Copy-as-CLI, command palette (`Ctrl+K`), export dialog, help overlay (`F1`/`?`), responsive narrow-viewport drawers, and 3 WCAG AA themes (Dark, Light, High Contrast) |
+| `gui` *(build with `--features gui`)* | optional desktop GUI over the shared read model: 10 views (Dashboard, Timeline with faceted filtering/minimap strip/table & inspector, Lanes, Hosts, Trace, State, Diff, IOC, Sources/coverage, Collect), scope chips with undo/redo + Copy-as-CLI, session-only story Board and Saved Views, command palette (`Ctrl+K`), export dialog, help overlay (`F1`/`?`), responsive narrow-viewport drawers, 3 WCAG AA themes (Dark, Light, High Contrast), and a reduced-motion preference |
 
 Times accept `2026-10-16T20:40`, `20:40` (today), `-24h`, `-30d`, `yesterday`, `@1792172917`.
 Every read command takes `--tz local|UTC|+03:30` to render times in another zone.

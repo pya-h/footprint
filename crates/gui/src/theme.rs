@@ -23,6 +23,7 @@ pub enum ThemeName {
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub name: ThemeName,
+    pub reduced_motion: bool,
     pub bg0: Color32,
     pub bg1: Color32,
     pub bg2: Color32,
@@ -50,6 +51,7 @@ impl Theme {
     pub fn dark() -> Self {
         Self {
             name: ThemeName::Dark,
+            reduced_motion: false,
             bg0: rgb(0x0F1419),
             bg1: rgb(0x151B23),
             bg2: rgb(0x1C242E),
@@ -62,7 +64,7 @@ impl Theme {
             danger: rgb(0xF85149),
             ioc: rgb(0xFF5C5C),
             categories: [
-                rgb(0x3C71DD), // Web
+                rgb(0x4779E3), // Web
                 rgb(0x3CDDCF), // Downloads
                 rgb(0xE68C33), // Packages
                 rgb(0x8C3EDA), // Access
@@ -81,6 +83,7 @@ impl Theme {
     pub fn light() -> Self {
         Self {
             name: ThemeName::Light,
+            reduced_motion: false,
             bg0: rgb(0xF6F8FA),
             bg1: rgb(0xEEF1F4),
             bg2: rgb(0xE4E9EE),
@@ -98,7 +101,7 @@ impl Theme {
                 rgb(0x7F4710),
                 rgb(0x471778),
                 rgb(0x206F3A),
-                rgb(0x5D7C92),
+                rgb(0x3A6693),
                 rgb(0x791550),
                 rgb(0x7B7214),
                 rgb(0x3F4750),
@@ -112,6 +115,7 @@ impl Theme {
     pub fn high_contrast() -> Self {
         Self {
             name: ThemeName::HighContrast,
+            reduced_motion: false,
             bg0: rgb(0x000000),
             bg1: rgb(0x0A0A0A),
             bg2: rgb(0x141414),
@@ -144,6 +148,11 @@ impl Theme {
         [Self::dark(), Self::light(), Self::high_contrast()]
     }
 
+    pub fn with_reduced_motion(mut self, reduced_motion: bool) -> Self {
+        self.reduced_motion = reduced_motion;
+        self
+    }
+
     /// A category's swatch; neighbors stay distinguishable (asserted as ΔE in tests).
     pub fn category_color(&self, category: Category) -> Color32 {
         self.categories[category as usize]
@@ -164,15 +173,25 @@ impl Theme {
         }));
         let base = self.base_font_size;
         ctx.all_styles_mut(|style| {
-            for text_style in [TextStyle::Body, TextStyle::Button, TextStyle::Heading] {
+            for (text_style, size) in [
+                (TextStyle::Body, base),
+                (TextStyle::Button, base),
+                (TextStyle::Heading, base + 5.0),
+                // egui's default small text is 9 pt, too faint for evidence tables
+                (TextStyle::Small, base - 1.5),
+            ] {
                 style
                     .text_styles
-                    .insert(text_style, FontId::proportional(base));
+                    .insert(text_style, FontId::proportional(size));
             }
             style
                 .text_styles
                 .insert(TextStyle::Monospace, FontId::monospace(base - 0.5));
-            style.spacing.item_spacing = Vec2::new(8.0, 4.0);
+            style.spacing.item_spacing = Vec2::new(8.0, 5.0);
+            style.spacing.button_padding = Vec2::new(9.0, 3.5);
+            style.spacing.interact_size.y = 24.0;
+            style.spacing.menu_margin = eframe::egui::Margin::same(8);
+            style.animation_time = if self.reduced_motion { 0.0 } else { 0.14 };
         });
         ctx.set_visuals_of(
             match self.name {
@@ -187,16 +206,19 @@ impl Theme {
     /// contrast invariants hold everywhere, not just in our own widgets).
     fn visuals(&self) -> eframe::egui::Visuals {
         use eframe::egui::style::{WidgetVisuals, Widgets};
-        use eframe::egui::{CornerRadius, Stroke};
+        use eframe::egui::{CornerRadius, Shadow, Stroke};
 
         let widget = |bg: eframe::egui::Color32, fg: eframe::egui::Color32| WidgetVisuals {
             bg_fill: bg,
             weak_bg_fill: bg,
             bg_stroke: Stroke::new(1.0, self.border),
             fg_stroke: Stroke::new(1.0, fg),
-            corner_radius: CornerRadius::same(4),
+            corner_radius: CornerRadius::same(6),
             expansion: 0.0,
         };
+        // hover tints toward the accent so every button and row answers the pointer
+        let hover_bg = self.bg2.lerp_to_gamma(self.accent, 0.14);
+        let hover_border = self.border.lerp_to_gamma(self.accent, 0.55);
         let mut visuals = match self.name {
             ThemeName::Light => eframe::egui::Visuals::light(),
             ThemeName::Dark | ThemeName::HighContrast => eframe::egui::Visuals::dark(),
@@ -209,13 +231,25 @@ impl Theme {
         visuals.widgets = Widgets {
             noninteractive: widget(self.bg1, self.text),
             inactive: widget(self.bg2, self.text),
-            hovered: widget(self.bg2, self.text),
+            hovered: WidgetVisuals {
+                bg_stroke: Stroke::new(1.0, hover_border),
+                ..widget(hover_bg, self.text)
+            },
             active: WidgetVisuals {
                 bg_stroke: Stroke::new(2.0, self.accent),
-                ..widget(self.bg2, self.text)
+                ..widget(hover_bg, self.text)
             },
             open: widget(self.bg2, self.text),
         };
+        visuals.window_corner_radius = CornerRadius::same(10);
+        visuals.menu_corner_radius = CornerRadius::same(8);
+        visuals.window_shadow = Shadow {
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
+            color: Color32::from_black_alpha(90),
+        };
+        visuals.popup_shadow = visuals.window_shadow;
         visuals.selection.bg_fill = self.accent;
         // egui paints selected buttons and table rows using selection.stroke as text color
         visuals.selection.stroke = Stroke::new(1.0, self.bg0);
@@ -311,6 +345,26 @@ mod tests {
                 }
             }
             let visuals = theme.visuals();
+            let action_ratio = contrast(theme.bg0, theme.accent);
+            assert!(
+                action_ratio >= MIN_CONTRAST,
+                "{:?} primary-button text on accent: {action_ratio:.2} < {MIN_CONTRAST}",
+                theme.name
+            );
+            for (index, color) in theme.categories.iter().copied().enumerate() {
+                let swatch_ratio = contrast(theme.bg0, color).max(contrast(theme.text, color));
+                assert!(
+                    swatch_ratio >= MIN_CONTRAST,
+                    "{:?} category swatch {index} has no AA text color: {swatch_ratio:.2}",
+                    theme.name
+                );
+            }
+            let hover_ratio = contrast(theme.text, visuals.widgets.hovered.bg_fill);
+            assert!(
+                hover_ratio >= MIN_CONTRAST,
+                "{:?} text on hovered widgets: {hover_ratio:.2} < {MIN_CONTRAST}",
+                theme.name
+            );
             let strong_fg = visuals.strong_text_color();
             for (bg_name, bg) in bgs {
                 let ratio = contrast(strong_fg, bg);
@@ -355,6 +409,16 @@ mod tests {
         letters.sort_unstable();
         letters.dedup();
         assert_eq!(letters.len(), len, "category letters must be unique");
+    }
+
+    #[test]
+    fn reduced_motion_disables_egui_style_animations() {
+        let ctx = eframe::egui::Context::default();
+        Theme::dark().with_reduced_motion(true).apply(&ctx);
+        assert_eq!(ctx.style_of(eframe::egui::Theme::Dark).animation_time, 0.0);
+
+        Theme::dark().apply(&ctx);
+        assert_eq!(ctx.style_of(eframe::egui::Theme::Dark).animation_time, 0.14);
     }
 
     #[test]

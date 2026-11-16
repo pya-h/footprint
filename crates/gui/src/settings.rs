@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,7 @@ pub struct Settings {
     pub version: u32,
     pub theme: ThemeName,
     pub density: Density,
+    pub reduced_motion: bool,
     /// 0.8–1.6; clamped on load
     pub ui_scale: f32,
     /// `local`, `UTC` or a `±HH:MM` offset, parsed by `fp_query::parse_tz` at use
@@ -59,6 +60,7 @@ impl Default for Settings {
             version: SETTINGS_VERSION,
             theme: ThemeName::Dark,
             density: Density::Compact,
+            reduced_motion: false,
             ui_scale: 1.0,
             tz: "local".to_string(),
             panels: Panels::default(),
@@ -154,14 +156,15 @@ impl Settings {
             fs::create_dir_all(dir)?;
         }
         let bytes = serde_json::to_vec_pretty(self)?;
-        // mode on creation only; a pre-existing file keeps its permissions
-        fs::OpenOptions::new()
+        let mut file = fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .mode(0o600)
-            .open(path)?
-            .write_all(&bytes)?;
+            .open(path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.set_len(0)?;
+        file.write_all(&bytes)?;
         Ok(())
     }
 
@@ -175,8 +178,6 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
 
     #[test]
@@ -185,6 +186,7 @@ mod tests {
         let path = dir.path().join("conf").join("gui.json");
         let settings = Settings {
             ui_scale: 1.3,
+            reduced_motion: true,
             last_view: Some("timeline".into()),
             ..Settings::default()
         };
@@ -227,5 +229,18 @@ mod tests {
         fs::write(&path, br#"{"version": 1, "ui_scale": 9.0}"#).expect("write");
         let (settings, _) = Settings::load_from(&path);
         assert_eq!(settings.ui_scale, UI_SCALE_MAX);
+    }
+
+    #[test]
+    fn save_restores_private_permissions_on_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gui.json");
+        fs::write(&path, b"old settings").expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        Settings::default().save_to(&path).expect("save");
+
+        let mode = path.metadata().expect("meta").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "settings must stay private after overwrite");
     }
 }

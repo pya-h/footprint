@@ -12,6 +12,7 @@ use crate::vm::{TraceHeadVm, TraceRowVm, TraceVm};
 use crate::widgets::ViewCtx;
 use crate::widgets::badge::{ConfidenceGlyph, confidence_disc};
 use crate::widgets::chip::thousands;
+use crate::widgets::kit;
 
 const GUTTER_W: f32 = 22.0;
 const REDIRECT_REL: &str = "redirected_from";
@@ -39,13 +40,19 @@ pub fn show_trace(
                 ui.colored_label(ctx.theme.danger, format!("trace failed: {err}"));
             }
             _ if ctx.model.pending_trace.is_none() => {
-                ui.add_space(12.0);
-                ui.label(
-                    egui::RichText::new(
-                        "type an artifact path, URL, or event id above to see its provenance chain",
-                    )
-                    .weak(),
+                kit::empty_state(
+                    ui,
+                    ctx.theme,
+                    "trace where something came from",
+                    "type an artifact path, URL, or event id above to see its provenance chain",
                 );
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("or select an event in the Timeline and press t")
+                            .small()
+                            .color(ctx.theme.text_dim),
+                    );
+                });
             }
             _ => {
                 ui.add_space(12.0);

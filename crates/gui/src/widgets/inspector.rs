@@ -52,13 +52,26 @@ pub fn show_inspector(
 
     match model.inspected() {
         Selection::None => {
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "select an event to inspect details, links, and provenance",
-                    )
-                    .weak(),
-                );
+            super::kit::empty_state(
+                ui,
+                theme,
+                "nothing selected",
+                "select an event to inspect details, links, and provenance",
+            );
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                for hint in [
+                    "t  trace the selected event",
+                    "c  copy its subject",
+                    "b  open the board",
+                ] {
+                    ui.label(
+                        egui::RichText::new(hint)
+                            .small()
+                            .monospace()
+                            .color(theme.text_dim),
+                    );
+                }
             });
         }
         Selection::Event(id) | Selection::TraceNode(id) => {

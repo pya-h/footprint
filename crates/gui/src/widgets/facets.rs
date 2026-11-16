@@ -7,7 +7,7 @@ use fp_query::overview::Facet;
 use fp_store::{EventTiming, FacetPage};
 
 use crate::model::{Action, Model, ScopeAction};
-use crate::theme::Theme;
+use crate::theme::{Theme, contrast};
 use crate::vm::SafeText;
 use crate::widgets::chip::thousands;
 
@@ -110,6 +110,15 @@ pub fn show_facets(
                     }));
                 },
             );
+            if state.source_open {
+                ui.label(
+                    egui::RichText::new(
+                        "Counts are per identity; an app filter also includes its profiles.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
 
             show_collapsing_facet(
                 ui,
@@ -202,7 +211,11 @@ fn show_categories(
                 egui::Align2::CENTER_CENTER,
                 Theme::category_letter(cat),
                 egui::FontId::monospace(10.0),
-                theme.bg0,
+                if contrast(theme.bg0, color) >= contrast(theme.text, color) {
+                    theme.bg0
+                } else {
+                    theme.text
+                },
             );
 
             let label_text = if excluded {
@@ -234,11 +247,15 @@ fn show_categories(
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("!=")
-                    .on_hover_text("exclude category (Alt+click)")
-                    .clicked()
-                {
+                let exclude_other = cat == Category::Other;
+                let exclude = ui
+                    .add_enabled(!exclude_other, egui::Button::new("!=").small())
+                    .on_hover_text(if exclude_other {
+                        "Other kinds cannot be excluded as a group"
+                    } else {
+                        "exclude category (Alt+click)"
+                    });
+                if exclude.clicked() {
                     let (kinds, kinds_not) = apply_category_click(filter, cat, false, true);
                     actions.push(Action::Scope(ScopeAction::SetKindFilter {
                         kinds,
@@ -682,6 +699,9 @@ pub fn apply_category_click(
     exclude: bool,
 ) -> (Vec<String>, Vec<String>) {
     if cat == Category::Other {
+        if exclude {
+            return (filter.kinds.clone(), filter.kinds_not.clone());
+        }
         let already = category_included(filter, Category::Other);
         if already {
             return (Vec::new(), Vec::new());
@@ -771,6 +791,20 @@ mod tests {
         let (inc2, exc2) = apply_category_click(&web_only, Category::Downloads, true, false);
         assert_eq!(inc2, vec!["web.*", "dl.*"]);
         assert!(exc2.is_empty());
+    }
+
+    #[test]
+    fn other_category_cannot_be_excluded_as_a_group() {
+        let filter = fp_query::TimelineFilter {
+            kinds: vec!["web.*".into()],
+            kinds_not: vec!["web.download".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            apply_category_click(&filter, Category::Other, false, true),
+            (filter.kinds.clone(), filter.kinds_not.clone())
+        );
     }
 
     #[test]

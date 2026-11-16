@@ -4,13 +4,14 @@
 use std::collections::BTreeMap;
 
 use eframe::egui;
-use egui_extras::{Column, TableBuilder};
+use egui_extras::{Column, Size, StripBuilder, TableBuilder};
 
 use crate::model::{Action, LoadStatus, Selection};
 use crate::theme::Theme;
 use crate::vm::{SafeJson, StateRowVm, state_flag_help};
 use crate::widgets::ViewCtx;
 use crate::widgets::badge::{StatusGlyph, status_mark};
+use crate::widgets::kit;
 
 #[derive(Default)]
 pub struct StateViewState {
@@ -49,7 +50,12 @@ pub fn show_state(
     };
 
     if rows.is_empty() {
-        ui.label(egui::RichText::new("no state records for this run and filter").weak());
+        kit::empty_state(
+            ui,
+            ctx.theme,
+            "no state records for this run and filter",
+            "clear the filter or pick another run; collect captures permissions, extensions and startup items",
+        );
         return;
     }
 
@@ -58,13 +64,24 @@ pub fn show_state(
         .filter(|r| !state.flagged_only || !r.flags.is_empty())
         .collect();
 
-    ui.horizontal(|ui| {
-        render_kind_tree(ui, ctx.theme, &visible, state);
-        ui.separator();
-        ui.vertical(|ui| {
-            render_rows_table(ui, ctx, &visible, state, actions);
+    // a strip gives both panes the full remaining height, which `horizontal` would not
+    let tree_width = (ui.available_width() * 0.22).clamp(150.0, 230.0);
+    StripBuilder::new(ui)
+        .size(Size::exact(tree_width))
+        .size(Size::remainder().at_least(220.0))
+        .horizontal(|mut strip| {
+            strip.cell(|ui| render_kind_tree(ui, ctx.theme, &visible, state));
+            strip.cell(|ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: 10,
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| {
+                        render_rows_table(ui, ctx, &visible, state, actions)
+                    });
+            });
         });
-    });
 }
 
 fn render_toolbar(
@@ -154,7 +171,6 @@ fn render_kind_tree(
         }
     }
     ui.vertical(|ui| {
-        ui.set_width(190.0);
         ui.label(
             egui::RichText::new("KINDS")
                 .small()
@@ -207,7 +223,12 @@ fn render_rows_table(
         })
         .collect();
     if rows.is_empty() {
-        ui.label(egui::RichText::new("no records in this kind").weak());
+        kit::empty_state(
+            ui,
+            theme,
+            "no records in this kind",
+            "pick another kind, or switch the flagged-only filter off",
+        );
         return;
     }
 
@@ -273,7 +294,18 @@ fn render_rows_table(
                     row_ui.set_selected(selected);
 
                     row_ui.col(|ui| {
-                        ui.label(egui::RichText::new(row.key.as_str()).monospace());
+                        let font = egui::TextStyle::Monospace.resolve(ui.style());
+                        let shown = kit::middle_ellipsis(
+                            ui,
+                            row.key.as_str(),
+                            &font,
+                            ui.available_width() - 8.0,
+                        );
+                        let truncated = shown != row.key.as_str();
+                        let label = ui.label(egui::RichText::new(shown).monospace());
+                        if truncated {
+                            label.on_hover_text(row.key.as_str());
+                        }
                     });
                     if show_decision {
                         row_ui.col(|ui| {

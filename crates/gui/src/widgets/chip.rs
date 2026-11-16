@@ -172,8 +172,7 @@ fn render_saved_views_controls(
     } else {
         format!("views ({})", saved_views.len())
     };
-    let menu_btn = ui
-        .selectable_label(saved_ui.menu_open, saved_label)
+    let menu_btn = super::kit::toggle(ui, saved_ui.menu_open, saved_label)
         .on_hover_text("apply or manage session saved views");
     if menu_btn.clicked() {
         saved_ui.menu_open = !saved_ui.menu_open;
@@ -237,8 +236,7 @@ fn render_saved_views_controls(
             });
     }
 
-    let save_btn = ui
-        .selectable_label(saved_ui.save_open, "save view")
+    let save_btn = super::kit::toggle(ui, saved_ui.save_open, "save view")
         .on_hover_text("name and save the current view + scope for this session");
     if save_btn.clicked() {
         saved_ui.save_open = !saved_ui.save_open;

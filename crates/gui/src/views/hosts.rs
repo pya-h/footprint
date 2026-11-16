@@ -11,6 +11,7 @@ use crate::theme::Theme;
 use crate::vm::HostSummaryVm;
 use crate::widgets::ViewCtx;
 use crate::widgets::chip::thousands;
+use crate::widgets::kit;
 
 pub const HOSTS_CAP: usize = 500;
 
@@ -49,10 +50,22 @@ pub fn show_hosts(
     };
 
     if rows.is_empty() {
-        ui.label(
-            egui::RichText::new("No subject hosts match the current scope and search filter.")
-                .color(ctx.theme.text_dim),
+        kit::empty_state(
+            ui,
+            ctx.theme,
+            "no hosts in this view",
+            "clear the host search or scope to widen the results",
         );
+        ui.horizontal(|ui| {
+            if !state.search.is_empty() && ui.button("clear host search").clicked() {
+                state.search.clear();
+                state.submitted_search.clear();
+                actions.push(Action::RequestHostsQuery);
+            }
+            if !model.scope.is_empty() && ui.button("clear scope").clicked() {
+                actions.push(Action::Scope(ScopeAction::Clear));
+            }
+        });
         return;
     }
 

@@ -38,6 +38,7 @@ use crate::widgets::chip::{
 use crate::widgets::event_table::TableState;
 use crate::widgets::facets::{FacetsState, show_facets};
 use crate::widgets::inspector::show_inspector;
+use crate::widgets::kit;
 use crate::widgets::strip::StripState;
 use crate::worker::cache::BLOCK_SIZE;
 use crate::worker::{BlockCache, Generation, QueryError, ReqKind, Worker};
@@ -50,6 +51,9 @@ pub struct Shell {
     settings: Settings,
     settings_warning: Option<String>,
     model: Model,
+    last_view: View,
+    view_transition: u64,
+    narrow_drawer: Option<NarrowDrawer>,
     worker: Option<Worker>,
     startup_error: Option<String>,
     search: String,
@@ -94,12 +98,13 @@ pub struct Shell {
     focus_search_next: bool,
 }
 
-fn apply_theme(name: ThemeName, ui_scale: f32, ctx: &egui::Context) {
+fn apply_theme(name: ThemeName, ui_scale: f32, reduced_motion: bool, ctx: &egui::Context) {
     match name {
         ThemeName::Dark => Theme::dark(),
         ThemeName::Light => Theme::light(),
         ThemeName::HighContrast => Theme::high_contrast(),
     }
+    .with_reduced_motion(reduced_motion)
     .apply(ctx);
     ctx.set_zoom_factor(ui_scale.clamp(0.8, 1.6));
 }
@@ -187,7 +192,12 @@ impl Shell {
         settings_warning: Option<String>,
         ctx: &egui::Context,
     ) -> Self {
-        apply_theme(settings.theme, settings.ui_scale, ctx);
+        apply_theme(
+            settings.theme,
+            settings.ui_scale,
+            settings.reduced_motion,
+            ctx,
+        );
         let worker = Worker::spawn(&case, 3, {
             let ctx = ctx.clone();
             move || ctx.request_repaint()
@@ -201,6 +211,7 @@ impl Shell {
         {
             model.nav.navigate(view, Selection::None);
         }
+        let last_view = model.view();
         Self {
             ctx: ctx.clone(),
             case,
@@ -209,6 +220,9 @@ impl Shell {
             settings,
             settings_warning,
             model,
+            last_view,
+            view_transition: 0,
+            narrow_drawer: None,
             worker: worker.ok(),
             startup_error,
             search: String::new(),
@@ -272,8 +286,14 @@ impl Shell {
         if let Action::SetTheme(name) = &action {
             if let Some(theme) = parse_theme(name) {
                 self.theme = theme;
+                self.settings.theme = theme;
                 let ctx = self.ctx.clone();
-                apply_theme(self.theme, self.settings.ui_scale, &ctx);
+                apply_theme(
+                    self.theme,
+                    self.settings.ui_scale,
+                    self.settings.reduced_motion,
+                    &ctx,
+                );
             }
             return;
         }
@@ -374,6 +394,14 @@ impl Shell {
         });
     }
 
+    fn toggle_narrow_drawer(&mut self, drawer: NarrowDrawer) {
+        self.narrow_drawer = if self.narrow_drawer == Some(drawer) {
+            None
+        } else {
+            Some(drawer)
+        };
+    }
+
     fn drain_collect(&mut self) {
         let Some(run) = self.collect_state.run.as_mut() else {
             return;
@@ -465,6 +493,7 @@ impl Shell {
             ThemeName::Light => Theme::light(),
             ThemeName::HighContrast => Theme::high_contrast(),
         }
+        .with_reduced_motion(self.settings.reduced_motion)
     }
 
     fn drain_worker(&mut self) {
@@ -1351,6 +1380,8 @@ impl Shell {
                 self.saved_views_ui.close();
             } else if self.chip_editor.is_open() {
                 self.chip_editor.close();
+            } else if self.narrow_drawer.is_some() {
+                self.narrow_drawer = None;
             } else if self.model.selection() != Selection::None {
                 self.apply(Action::Select(Selection::None));
             }
@@ -1387,10 +1418,19 @@ impl Shell {
             self.focus_search_next = true;
         }
         if ui.input(|i| i.key_pressed(egui::Key::F) && !i.modifiers.any()) {
-            self.settings.panels.facets_collapsed = !self.settings.panels.facets_collapsed;
+            if ui.ctx().content_rect().width() < 1280.0 {
+                self.toggle_narrow_drawer(NarrowDrawer::Facets);
+            } else {
+                self.settings.panels.facets_collapsed = !self.settings.panels.facets_collapsed;
+            }
         }
         if ui.input(|i| i.key_pressed(egui::Key::I) && !i.modifiers.any()) {
-            self.settings.panels.inspector_collapsed = !self.settings.panels.inspector_collapsed;
+            if ui.ctx().content_rect().width() < 1280.0 {
+                self.toggle_narrow_drawer(NarrowDrawer::Inspector);
+            } else {
+                self.settings.panels.inspector_collapsed =
+                    !self.settings.panels.inspector_collapsed;
+            }
         }
         if ui.input(|i| i.key_pressed(egui::Key::B) && !i.modifiers.any()) {
             self.board_state.toggle(&self.case);
@@ -1412,7 +1452,11 @@ impl Shell {
         if ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.any())
             && self.model.inspected() != Selection::None
         {
-            self.settings.panels.inspector_collapsed = false;
+            if ui.ctx().content_rect().width() < 1280.0 {
+                self.narrow_drawer = Some(NarrowDrawer::Inspector);
+            } else {
+                self.settings.panels.inspector_collapsed = false;
+            }
         }
         if ui.input(|i| {
             i.key_pressed(egui::Key::Questionmark)
@@ -1436,7 +1480,12 @@ impl Shell {
         }
         if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Num0)) {
             self.settings.ui_scale = 1.0;
-            apply_theme(self.theme, self.settings.ui_scale, ui.ctx());
+            apply_theme(
+                self.theme,
+                self.settings.ui_scale,
+                self.settings.reduced_motion,
+                ui.ctx(),
+            );
         }
         for (i, key) in [
             egui::Key::Num1,
@@ -1517,12 +1566,19 @@ impl Shell {
 
     fn zoom_by(&mut self, ui: &egui::Ui, delta: f32) {
         self.settings.ui_scale = (self.settings.ui_scale + delta).clamp(0.8, 1.6);
-        apply_theme(self.theme, self.settings.ui_scale, ui.ctx());
+        apply_theme(
+            self.theme,
+            self.settings.ui_scale,
+            self.settings.reduced_motion,
+            ui.ctx(),
+        );
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let theme = self.active_theme();
+        let narrow = ui.ctx().content_rect().width() < 1280.0;
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("footprint").strong());
+            brand_mark(ui, &theme);
             let name = self
                 .case
                 .file_name()
@@ -1591,8 +1647,7 @@ impl Shell {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button("Collect")
+                if kit::primary_button(ui, &theme, "Collect")
                     .on_hover_text("open the collect view (0)")
                     .clicked()
                 {
@@ -1614,7 +1669,23 @@ impl Shell {
                         ThemeName::HighContrast => ThemeName::Dark,
                     };
                     self.settings.theme = self.theme;
-                    apply_theme(self.theme, self.settings.ui_scale, ui.ctx());
+                    apply_theme(
+                        self.theme,
+                        self.settings.ui_scale,
+                        self.settings.reduced_motion,
+                        ui.ctx(),
+                    );
+                }
+                if ui
+                    .checkbox(&mut self.settings.reduced_motion, "reduce motion")
+                    .changed()
+                {
+                    apply_theme(
+                        self.theme,
+                        self.settings.ui_scale,
+                        self.settings.reduced_motion,
+                        ui.ctx(),
+                    );
                 }
                 let tz_resp = egui::ComboBox::from_id_salt("tz_combo")
                     .selected_text(self.tz_label())
@@ -1634,40 +1705,57 @@ impl Shell {
                 tz_resp.response.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Time zone")
                 });
+                ui.separator();
                 let board_label = if self.model.board.is_empty() {
                     "board".to_string()
                 } else {
                     format!("board ({})", self.model.board.len())
                 };
-                if ui
-                    .selectable_label(self.board_state.open, board_label)
+                if kit::toggle(ui, self.board_state.open, board_label)
                     .on_hover_text("open the session story board (b)")
                     .clicked()
                 {
                     self.board_state.toggle(&self.case);
                 }
                 if ui
-                    .small_button("export")
+                    .button("export")
                     .on_hover_text("write the events in the current scope to a file")
                     .clicked()
                 {
                     self.export_dialog.open_default(&self.case);
                 }
-                if ui
-                    .selectable_label(!self.settings.panels.inspector_collapsed, "inspector")
+                let inspector_open = if narrow {
+                    self.narrow_drawer == Some(NarrowDrawer::Inspector)
+                } else {
+                    !self.settings.panels.inspector_collapsed
+                };
+                if kit::toggle(ui, inspector_open, "inspector")
                     .on_hover_text("toggle inspector (i)")
                     .clicked()
                 {
-                    self.settings.panels.inspector_collapsed =
-                        !self.settings.panels.inspector_collapsed;
+                    if narrow {
+                        self.toggle_narrow_drawer(NarrowDrawer::Inspector);
+                    } else {
+                        self.settings.panels.inspector_collapsed =
+                            !self.settings.panels.inspector_collapsed;
+                    }
                 }
+                let facets_open = if narrow {
+                    self.narrow_drawer == Some(NarrowDrawer::Facets)
+                } else {
+                    !self.settings.panels.facets_collapsed
+                };
                 if self.model.view() == View::Timeline
-                    && ui
-                        .selectable_label(!self.settings.panels.facets_collapsed, "facets")
+                    && kit::toggle(ui, facets_open, "facets")
                         .on_hover_text("toggle facets (f)")
                         .clicked()
                 {
-                    self.settings.panels.facets_collapsed = !self.settings.panels.facets_collapsed;
+                    if narrow {
+                        self.toggle_narrow_drawer(NarrowDrawer::Facets);
+                    } else {
+                        self.settings.panels.facets_collapsed =
+                            !self.settings.panels.facets_collapsed;
+                    }
                 }
             });
         });
@@ -1750,12 +1838,11 @@ impl Shell {
     }
 
     fn rail(&mut self, ui: &mut egui::Ui) {
+        let theme = self.active_theme();
+        ui.add_space(6.0);
         for (i, view) in View::ALL.iter().enumerate() {
             let selected = self.model.view() == *view;
-            if ui
-                .selectable_label(selected, format!("{}  {}", i + 1, view.label()))
-                .clicked()
-            {
+            if kit::nav_item(ui, &theme, &(i + 1).to_string(), view.label(), selected).clicked() {
                 self.apply(Action::Go(*view));
             }
         }
@@ -1805,13 +1892,20 @@ impl Shell {
                 }
             }
 
+            let theme = self.active_theme();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.outstanding.is_empty() {
                     ui.label(egui::RichText::new("worker idle").weak());
+                    status_dot(ui, theme.ok, false);
                 } else {
-                    ui.spinner();
                     ui.label("worker busy");
+                    status_dot(ui, theme.warn, !theme.reduced_motion);
                 }
+                ui.label(
+                    egui::RichText::new("F1 help · Ctrl+K palette")
+                        .small()
+                        .weak(),
+                );
             });
         });
     }
@@ -1994,23 +2088,49 @@ impl Shell {
         }
         self.ensure_requests();
         self.shortcuts(ui);
+        let theme = self.active_theme();
 
-        egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
-        egui::Panel::top("scope_bar").show(ui, |ui| self.scope_bar(ui));
+        egui::Panel::top("top_bar")
+            .frame(bar_frame(ui, &theme, 6))
+            .show(ui, |ui| self.top_bar(ui));
+        egui::Panel::top("scope_bar")
+            .frame(bar_frame(ui, &theme, 4))
+            .show(ui, |ui| self.scope_bar(ui));
         if self.has_banners() {
             egui::Panel::top("banners").show(ui, |ui| self.banners(ui));
         }
-        egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
+        egui::Panel::bottom("status_bar")
+            .frame(bar_frame(ui, &theme, 3))
+            .show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("rail")
             .resizable(false)
             .default_size(112.0)
+            .frame(egui::Frame::side_top_panel(ui.style()).fill(theme.bg1))
             .show(ui, |ui| self.rail(ui));
 
-        let show_facets_panel = self.model.view() == View::Timeline
-            && !self.settings.panels.facets_collapsed
-            && !self.case_missing;
-        let show_inspector_panel = !self.settings.panels.inspector_collapsed && !self.case_missing;
+        let current_view = self.model.view();
+        if current_view != self.last_view {
+            self.last_view = current_view;
+            self.view_transition = self.view_transition.wrapping_add(1);
+            self.narrow_drawer = None;
+        }
         let narrow = ui.ctx().content_rect().width() < 1280.0;
+        if !narrow {
+            self.narrow_drawer = None;
+        }
+        let show_facets_panel = !self.case_missing
+            && self.model.view() == View::Timeline
+            && (if narrow {
+                self.narrow_drawer == Some(NarrowDrawer::Facets)
+            } else {
+                !self.settings.panels.facets_collapsed
+            });
+        let show_inspector_panel = !self.case_missing
+            && (if narrow {
+                self.narrow_drawer == Some(NarrowDrawer::Inspector)
+            } else {
+                !self.settings.panels.inspector_collapsed
+            });
 
         if !narrow && show_facets_panel {
             let theme = self.active_theme();
@@ -2051,6 +2171,25 @@ impl Shell {
         }
 
         let central_resp = egui::CentralPanel::default().show(ui, |ui| self.main(ui));
+        if !theme.reduced_motion {
+            let progress = ui.ctx().animate_value_with_time(
+                egui::Id::NULL.with(("view_fade", self.view_transition)),
+                1.0,
+                0.16,
+            );
+            if progress < 1.0 {
+                ui.ctx()
+                    .layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::NULL.with("view_fade_overlay"),
+                    ))
+                    .rect_filled(
+                        central_resp.response.rect,
+                        0.0,
+                        theme.bg0.gamma_multiply(1.0 - progress),
+                    );
+            }
+        }
         if narrow && (show_facets_panel || show_inspector_panel) {
             let theme = self.active_theme();
             let area_rect = central_resp.response.rect;
@@ -2067,6 +2206,7 @@ impl Shell {
                         pos: area_rect.min,
                         width: drawer_w,
                         height: area_rect.height(),
+                        from_right: false,
                     },
                     &mut close,
                     |ui| {
@@ -2080,7 +2220,7 @@ impl Shell {
                     },
                 );
                 if close {
-                    self.settings.panels.facets_collapsed = true;
+                    self.narrow_drawer = None;
                 }
                 self.apply_all(actions);
             }
@@ -2101,6 +2241,7 @@ impl Shell {
                         pos: anchor,
                         width: drawer_w,
                         height: area_rect.height(),
+                        from_right: true,
                     },
                     &mut close,
                     |ui| {
@@ -2108,7 +2249,7 @@ impl Shell {
                     },
                 );
                 if close {
-                    self.settings.panels.inspector_collapsed = true;
+                    self.narrow_drawer = None;
                 }
                 self.apply_all(actions);
             }
@@ -2161,6 +2302,46 @@ struct DrawerSpec<'a> {
     pos: egui::Pos2,
     width: f32,
     height: f32,
+    from_right: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NarrowDrawer {
+    Facets,
+    Inspector,
+}
+
+fn bar_frame(ui: &egui::Ui, theme: &Theme, vertical_margin: i8) -> egui::Frame {
+    egui::Frame::side_top_panel(ui.style())
+        .fill(theme.bg1)
+        .inner_margin(egui::Margin::symmetric(10, vertical_margin))
+}
+
+fn brand_mark(ui: &mut egui::Ui, theme: &Theme) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.circle_filled(rect.center() + egui::vec2(-3.5, 3.5), 3.6, theme.accent);
+    painter.circle_filled(rect.center() + egui::vec2(3.5, -3.5), 3.6, theme.accent);
+    ui.label(
+        egui::RichText::new("footprint")
+            .strong()
+            .color(theme.text)
+            .size(14.5),
+    );
+}
+
+fn status_dot(ui: &mut egui::Ui, color: egui::Color32, pulse: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    let alpha = if pulse {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(80));
+        let t = ui.input(|i| i.time) as f32;
+        0.55 + 0.45 * (t * 5.0).sin().abs()
+    } else {
+        1.0
+    };
+    ui.painter()
+        .circle_filled(rect.center(), 3.5, color.gamma_multiply(alpha));
 }
 
 fn show_side_drawer(
@@ -2170,9 +2351,16 @@ fn show_side_drawer(
     close: &mut bool,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
+    let progress = if theme.reduced_motion {
+        1.0
+    } else {
+        ctx.animate_bool_with_time(egui::Id::NULL.with((spec.id, "slide")), true, 0.18)
+    };
+    let offset = spec.width * (1.0 - progress);
+    let pos = spec.pos + egui::vec2(if spec.from_right { offset } else { -offset }, 0.0);
     egui::Area::new(egui::Id::NULL.with(spec.id))
         .order(egui::Order::Middle)
-        .fixed_pos(spec.pos)
+        .fixed_pos(pos)
         .show(ctx, |ui| {
             egui::Frame::window(ui.style())
                 .fill(theme.bg1)

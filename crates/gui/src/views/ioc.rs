@@ -3,12 +3,13 @@
 //! writer thread.
 
 use eframe::egui;
+use egui_extras::{Size, StripBuilder};
 
 use crate::model::{Action, LoadStatus, Selection, View};
 use crate::theme::Theme;
 use crate::vm::{IocHitVm, IocSummaryVm};
-use crate::widgets::ViewCtx;
 use crate::widgets::chip::thousands;
+use crate::widgets::{ViewCtx, kit};
 
 #[derive(Default)]
 pub struct IocViewState {
@@ -45,7 +46,16 @@ pub fn show_iocs(
                 Err(err) => ui.colored_label(ctx.theme.danger, format!("IOC error: {err}")),
             };
             if ui.small_button("dismiss").clicked() {
-                actions.push(Action::DismissIocStatus);
+                kit::empty_state(
+                    ui,
+                    ctx.theme,
+                    if state.selected_ioc.is_some() {
+                        "no hits for this IOC"
+                    } else {
+                        "no IOC hits in this case"
+                    },
+                    "collect more evidence or add different indicators",
+                );
             }
         });
     }
@@ -79,11 +89,22 @@ pub fn show_iocs(
         state.selected_ioc = None;
     }
     let selected_id = state.selected_ioc;
-    ui.horizontal(|ui| {
-        render_ioc_list(ui, ctx.theme, iocs, selected_id, state, actions);
-        ui.separator();
-        render_hits(ui, ctx, state, actions);
-    });
+    // a strip gives each pane the full remaining height; a scroll area inside `horizontal` is one row tall
+    let list_width = (ui.available_width() * 0.4).clamp(260.0, 420.0);
+    StripBuilder::new(ui)
+        .size(Size::exact(list_width))
+        .size(Size::remainder().at_least(160.0))
+        .horizontal(|mut strip| {
+            strip.cell(|ui| render_ioc_list(ui, ctx.theme, iocs, selected_id, state, actions));
+            strip.cell(|ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: 12,
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| render_hits(ui, ctx, state, actions));
+            });
+        });
 
     if let Some(dialog) = state.dialog.as_mut() {
         let mut keep = true;
@@ -133,7 +154,6 @@ fn render_ioc_list(
     actions: &mut Vec<Action>,
 ) {
     ui.vertical(|ui| {
-        ui.set_width(340.0);
         if iocs.is_empty() {
             ui.label(egui::RichText::new("no indicators yet — add or import some").weak());
             return;
@@ -199,7 +219,6 @@ fn render_hits(
 ) {
     let model = ctx.model;
     ui.vertical(|ui| {
-        ui.set_min_width(420.0);
         ui.horizontal(|ui| {
             let title = if state.selected_ioc.is_some() {
                 "HITS"

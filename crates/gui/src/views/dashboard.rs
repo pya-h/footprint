@@ -12,6 +12,7 @@ use crate::vm::{DashboardSummaryVm, HostSummaryVm};
 use crate::widgets::ViewCtx;
 use crate::widgets::chip::thousands;
 use crate::widgets::facets::apply_category_click;
+use crate::widgets::kit;
 use crate::widgets::strip::{BandData, paint_histogram_band, x_to_ts};
 
 const HERO_HIST_HEIGHT: f32 = 88.0;
@@ -41,7 +42,7 @@ pub fn show_dashboard(
             ui.add_space(10.0);
 
             let avail = ui.available_width();
-            if avail >= 720.0 {
+            if avail >= 1000.0 {
                 ui.columns(2, |cols| {
                     render_activity_card(&mut cols[0], ctx, state, actions);
                     cols[0].add_space(8.0);
@@ -175,6 +176,7 @@ fn render_kpis(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Action>) 
         KpiSpec {
             title: "EVENTS",
             value: total_text,
+            animated_value: counts.map(|c| c.in_scope as f32),
             sub: total_sub,
             accent: theme.text,
             action: KpiClick::Timeline,
@@ -182,6 +184,7 @@ fn render_kpis(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Action>) 
         KpiSpec {
             title: "UNTIMED",
             value: untimed_text,
+            animated_value: untimed_count.map(|count| count as f32),
             sub: "order_only".into(),
             accent: if untimed_count.unwrap_or(0) > 0 {
                 theme.warn
@@ -193,6 +196,7 @@ fn render_kpis(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Action>) 
         KpiSpec {
             title: "IOC HITS",
             value: ioc_text,
+            animated_value: ioc_count.map(|count| count as f32),
             sub: "correlated events".into(),
             accent: if ioc_count.unwrap_or(0) > 0 {
                 theme.ioc
@@ -204,6 +208,7 @@ fn render_kpis(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Action>) 
         KpiSpec {
             title: "FLAGGED STATE",
             value: flagged_text,
+            animated_value: summary.map(|s| s.flagged_state_count as f32),
             sub: flagged_sub,
             accent: if summary.is_some_and(|s| s.flagged_state_count > 0) {
                 theme.warn
@@ -215,6 +220,7 @@ fn render_kpis(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Action>) 
         KpiSpec {
             title: "SOURCE ISSUES",
             value: issue_text,
+            animated_value: summary.map(|_| issue_count as f32),
             sub: "partial / unreadable".into(),
             accent: if issue_count > 0 {
                 theme.warn
@@ -226,6 +232,11 @@ fn render_kpis(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Action>) 
         KpiSpec {
             title: "COVERAGE",
             value: cov_text,
+            animated_value: summary.map(|s| {
+                ((s.coverage_covered as u128) * 100)
+                    .checked_div(s.coverage_total as u128)
+                    .map_or(100.0, |percent| percent as f32)
+            }),
             sub: cov_sub,
             accent: theme.ok,
             action: KpiClick::Sources,
@@ -257,17 +268,16 @@ enum KpiClick {
 struct KpiSpec {
     title: &'static str,
     value: String,
+    animated_value: Option<f32>,
     sub: String,
     accent: egui::Color32,
     action: KpiClick,
 }
 
 fn render_kpi_card(ui: &mut egui::Ui, theme: &Theme, card: &KpiSpec) -> bool {
-    let frame = egui::Frame::group(ui.style())
-        .fill(theme.bg1)
-        .stroke(egui::Stroke::new(1.0, theme.border))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(10, 8));
+    let id = ui.scope_id().with(("kpi", card.title));
+    let frame = kit::card_frame(theme, kit::hover_amount(ui, id, theme))
+        .inner_margin(egui::Margin::symmetric(12, 9));
     let outer = frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.label(
@@ -275,9 +285,25 @@ fn render_kpi_card(ui: &mut egui::Ui, theme: &Theme, card: &KpiSpec) -> bool {
                 .small()
                 .color(theme.text_dim),
         );
+        let value = card
+            .animated_value
+            .map(|target| {
+                let value = if theme.reduced_motion {
+                    target
+                } else {
+                    ui.ctx()
+                        .animate_value_with_time(id.with("value"), target, 0.32)
+                };
+                if card.title == "COVERAGE" {
+                    format!("{value:.0}%")
+                } else {
+                    thousands(value.round() as u64)
+                }
+            })
+            .unwrap_or_else(|| card.value.clone());
         ui.label(
-            egui::RichText::new(&card.value)
-                .size(20.0)
+            egui::RichText::new(value)
+                .size(22.0)
                 .strong()
                 .color(card.accent),
         );
@@ -289,7 +315,9 @@ fn render_kpi_card(ui: &mut egui::Ui, theme: &Theme, card: &KpiSpec) -> bool {
     let resp = outer
         .response
         .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text("click to open filtered view");
+    kit::remember_hover(ui, id, resp.hovered());
     resp.clicked()
 }
 
@@ -460,8 +488,18 @@ fn render_categories_card(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Ve
                 ui.painter().rect_filled(bar_rect, 2.0, theme.bg0);
                 if count > 0 {
                     let frac = (count as f32 / max_count as f32).clamp(0.04, 1.0);
+                    let target_width = (bar_rect.width() * frac).max(3.0);
+                    let width = if theme.reduced_motion {
+                        target_width
+                    } else {
+                        ui.ctx().animate_value_with_time(
+                            ui.scope_id().with(("category-bar", idx)),
+                            target_width,
+                            0.28,
+                        )
+                    };
                     let mut filled = bar_rect;
-                    filled.set_width((bar_rect.width() * frac).max(3.0));
+                    filled.set_width(width);
                     ui.painter().rect_filled(filled, 2.0, color);
                 }
                 if bar_resp.clicked() {
@@ -783,15 +821,7 @@ fn active_window_bounds(model: &crate::model::Model) -> Option<(i64, i64)> {
 }
 
 fn card_frame(ui: &mut egui::Ui, theme: &Theme, body: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::group(ui.style())
-        .fill(theme.bg1)
-        .stroke(egui::Stroke::new(1.0, theme.border))
-        .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            body(ui);
-        });
+    kit::card(ui, theme, body);
 }
 
 fn format_bytes(n: u64) -> String {

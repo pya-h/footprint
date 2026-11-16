@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use eframe::egui;
+use egui_extras::{Size, StripBuilder};
 use fp_query::DiffChange;
 
 use crate::model::{Action, LoadStatus};
@@ -12,6 +13,7 @@ use crate::theme::Theme;
 use crate::vm::DiffEntryVm;
 use crate::widgets::ViewCtx;
 use crate::widgets::json_tree::show_json_diff;
+use crate::widgets::kit;
 
 pub struct DiffViewState {
     pub last_pair: Option<(u64, u64)>,
@@ -57,7 +59,12 @@ pub fn show_diff(
     ui.add_space(4.0);
 
     if ctx.model.runs.value().is_some_and(|r| r.len() < 2) {
-        ui.label(egui::RichText::new("collect at least two runs to compare them").weak());
+        kit::empty_state(
+            ui,
+            ctx.theme,
+            "only one run so far",
+            "collect again later; the diff compares the captured state of two runs",
+        );
         return;
     }
 
@@ -88,20 +95,39 @@ pub fn show_diff(
         })
         .collect();
     if entries.is_empty() {
-        ui.label(
-            egui::RichText::new("the two runs hold identical state — nothing to compare").weak(),
+        kit::empty_state(
+            ui,
+            ctx.theme,
+            "nothing changed",
+            "the two runs hold identical state",
         );
         return;
     }
 
-    ui.horizontal_top(|ui| {
-        render_entry_list(ui, ctx.theme, &filtered, state);
-        if let Some((_, entry)) = state
-            .selected
-            .and_then(|idx| filtered.iter().find(|(i, _)| *i == idx).copied())
-        {
-            ui.separator();
-            render_comparison(ui, ctx.theme, entry);
+    let selected_entry = state
+        .selected
+        .and_then(|idx| filtered.iter().find(|(i, _)| *i == idx).copied())
+        .map(|(_, entry)| entry);
+    let list_width = if selected_entry.is_some() {
+        (ui.available_width() * 0.45).clamp(300.0, 560.0)
+    } else {
+        ui.available_width()
+    };
+    let mut builder = StripBuilder::new(ui).size(Size::exact(list_width));
+    if selected_entry.is_some() {
+        builder = builder.size(Size::remainder().at_least(240.0));
+    }
+    builder.horizontal(|mut strip| {
+        strip.cell(|ui| render_entry_list(ui, ctx.theme, &filtered, state));
+        if let Some(entry) = selected_entry {
+            strip.cell(|ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: 10,
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| render_comparison(ui, ctx.theme, entry));
+            });
         }
     });
 }
@@ -136,9 +162,30 @@ fn render_toolbar(
         if model.diff.value().is_some() {
             let entries = model.diff.value().map(Vec::as_slice).unwrap_or(&[]);
             let (added, removed, changed) = counts(entries);
-            chip(ui, "+ added", added, &mut state.show_added);
-            chip(ui, "- removed", removed, &mut state.show_removed);
-            chip(ui, "~ changed", changed, &mut state.show_changed);
+            chip(
+                ui,
+                ctx.theme,
+                "+ added",
+                added,
+                ctx.theme.ok,
+                &mut state.show_added,
+            );
+            chip(
+                ui,
+                ctx.theme,
+                "- removed",
+                removed,
+                ctx.theme.danger,
+                &mut state.show_removed,
+            );
+            chip(
+                ui,
+                ctx.theme,
+                "~ changed",
+                changed,
+                ctx.theme.warn,
+                &mut state.show_changed,
+            );
         }
     });
 }
@@ -184,10 +231,22 @@ fn run_picker(
     changed
 }
 
-fn chip(ui: &mut egui::Ui, label: &str, count: usize, on: &mut bool) {
+fn chip(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    count: usize,
+    color: egui::Color32,
+    on: &mut bool,
+) {
     let text = format!("{label} ({count})");
+    let (fill, ink) = if *on {
+        (color, theme.bg0)
+    } else {
+        (theme.bg2, color)
+    };
     if ui
-        .selectable_label(*on, egui::RichText::new(text).small())
+        .add(egui::Button::new(egui::RichText::new(text).small().strong().color(ink)).fill(fill))
         .on_hover_text("click to show/hide this change kind")
         .clicked()
     {
@@ -221,8 +280,6 @@ fn render_entry_list(
             .push((*idx, entry));
     }
     ui.vertical(|ui| {
-        let width = (ui.available_width() * 0.45).clamp(300.0, 560.0);
-        ui.set_width(width);
         egui::ScrollArea::both()
             .id_salt("diff_entries_scroll")
             .auto_shrink([false, false])
@@ -290,7 +347,6 @@ fn summarize_group(kind: &str, items: &[(usize, &DiffEntryVm)]) -> String {
 
 fn render_comparison(ui: &mut egui::Ui, theme: &Theme, entry: &DiffEntryVm) {
     ui.vertical(|ui| {
-        ui.set_min_width(360.0);
         ui.label(
             egui::RichText::new(format!("{}  {}", entry.kind.as_str(), entry.key.as_str()))
                 .monospace()
