@@ -21,7 +21,8 @@ pub fn show_help(ctx: &egui::Context, theme: &Theme, open: &mut bool) {
                 .id_salt("help_body")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new("Keyboard").strong());
+                    ui.label(egui::RichText::new("Keyboard").strong().color(theme.accent));
+                    ui.separator();
                     for (keys, what) in [
                         ("1…0", "open a view (rail order)"),
                         ("j / k / Up / Down", "move timeline row focus"),
@@ -45,12 +46,21 @@ pub fn show_help(ctx: &egui::Context, theme: &Theme, open: &mut bool) {
                         ("F1 or ?", "this help"),
                     ] {
                         ui.horizontal(|ui| {
-                            ui.monospace(format!("{keys:<26}"));
-                            ui.label(what);
+                            ui.label(
+                                egui::RichText::new(format!("{keys:<26}"))
+                                    .monospace()
+                                    .color(theme.accent),
+                            );
+                            ui.label(egui::RichText::new(what).color(theme.text_dim));
                         });
                     }
                     ui.add_space(10.0);
-                    ui.label(egui::RichText::new("Confidence discs").strong());
+                    ui.label(
+                        egui::RichText::new("Confidence discs")
+                            .strong()
+                            .color(theme.accent),
+                    );
+                    ui.separator();
                     for (shape, what) in [
                         ("filled disc", "direct — read straight from the record"),
                         ("half disc", "derived — computed from a related record"),
@@ -75,7 +85,12 @@ pub fn show_help(ctx: &egui::Context, theme: &Theme, open: &mut bool) {
                         });
                     }
                     ui.add_space(10.0);
-                    ui.label(egui::RichText::new("Status marks").strong());
+                    ui.label(
+                        egui::RichText::new("Status marks")
+                            .strong()
+                            .color(theme.accent),
+                    );
+                    ui.separator();
                     for (glyph, what) in [
                         ("check", "ok — matches the package record"),
                         ("cross", "mismatch — differs from the package record"),
@@ -111,7 +126,8 @@ pub fn show_help(ctx: &egui::Context, theme: &Theme, open: &mut bool) {
                         });
                     }
                     ui.add_space(10.0);
-                    ui.label(egui::RichText::new("Colours").strong());
+                    ui.label(egui::RichText::new("Colours").strong().color(theme.accent));
+                    ui.separator();
                     for (name, color, what) in [
                         (
                             "accent",

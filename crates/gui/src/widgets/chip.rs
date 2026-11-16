@@ -4,6 +4,8 @@ use eframe::egui;
 use fp_query::Tz;
 
 use crate::model::{Action, ChipRemove, SavedViews, Scope, ScopeAction};
+use crate::theme::Theme;
+use crate::widgets::kit;
 
 #[derive(Default)]
 pub struct SavedViewsUiState {
@@ -31,6 +33,7 @@ pub struct ScopeBarCtx<'a> {
     pub saved_views: &'a SavedViews,
     pub counts: Option<(u64, u64)>,
     pub tz: Tz,
+    pub theme: &'a Theme,
 }
 
 #[derive(Default)]
@@ -71,7 +74,9 @@ pub fn show_scope_bar(
         }
         for (idx, chip) in chips.iter().enumerate() {
             let is_editing = editor.editing == Some(idx);
-            let frame = egui::Frame::group(ui.style()).corner_radius(egui::CornerRadius::same(6));
+            let chip_id = ui.scope_id().with(("scope_chip", idx));
+            let frame = kit::card_frame(ctx.theme, kit::hover_amount(ui, chip_id, ctx.theme))
+                .inner_margin(egui::Margin::symmetric(8, 4));
             let resp = frame
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -99,6 +104,7 @@ pub fn show_scope_bar(
                     });
                 })
                 .response;
+            kit::remember_hover(ui, chip_id, resp.hovered());
 
             if is_editing {
                 let area_id = ui.scope_id().with(("chip_edit", idx));
@@ -117,15 +123,14 @@ pub fn show_scope_bar(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let scope_empty = scope.is_empty();
             if ui
-                .add_enabled(!scope_empty, egui::Button::new("clear"))
+                .add_enabled(!scope_empty, egui::Button::new("clear").selected(false))
                 .on_hover_text("clear the scope (Ctrl+Shift+Backspace)")
                 .clicked()
             {
                 editor.close();
                 actions.push(Action::Scope(ScopeAction::Clear));
             }
-            if ui
-                .button("copy CLI")
+            if kit::primary_button(ui, ctx.theme, "copy CLI")
                 .on_hover_text("copy the scope as a footprint command (Ctrl+Shift+C)")
                 .clicked()
             {

@@ -7,6 +7,7 @@ use eframe::egui;
 
 use crate::model::{Action, BoardExportFormat, Model, target_label, view_for_selection};
 use crate::theme::Theme;
+use crate::widgets::kit;
 
 #[derive(Default)]
 pub struct BoardWindowState {
@@ -122,9 +123,10 @@ pub fn show_board_window(
                     .show(ui, |ui| {
                         let count = items.len();
                         for (idx, item) in items.iter().enumerate() {
-                            egui::Frame::group(ui.style())
-                                .fill(theme.bg2)
-                                .corner_radius(egui::CornerRadius::same(6))
+                            let item_id = ui.scope_id().with(("board_item", item.id));
+                            let item_frame =
+                                kit::card_frame(theme, kit::hover_amount(ui, item_id, theme));
+                            let item_response = item_frame
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         let when = item.when.as_deref().unwrap_or("untimed");
@@ -229,6 +231,7 @@ pub fn show_board_window(
                                         });
                                     }
                                 });
+                            kit::remember_hover(ui, item_id, item_response.response.hovered());
                             ui.add_space(4.0);
                         }
                     });
@@ -262,7 +265,7 @@ pub fn show_board_window(
                     ui.ctx().copy_text(md);
                     state.status = Some(Ok("copied Markdown to clipboard".to_string()));
                 }
-                if ui.button("Export Board").clicked() {
+                if kit::primary_button(ui, theme, "Export Board").clicked() {
                     let path = PathBuf::from(state.path.trim());
                     match model.board.write_export(&case_name, state.format, &path) {
                         Ok(count) => {

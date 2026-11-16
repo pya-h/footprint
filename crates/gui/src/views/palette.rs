@@ -5,6 +5,7 @@ use eframe::egui;
 
 use crate::model::{Action, SavedView, ScopeAction, Selection, View};
 use crate::theme::Theme;
+use crate::widgets::kit;
 
 #[derive(Default)]
 pub struct PaletteState {
@@ -66,7 +67,7 @@ pub fn toggle(palette: &mut PaletteState) {
 
 pub fn show_palette(
     ctx: &egui::Context,
-    _theme: &Theme,
+    theme: &Theme,
     palette: &mut PaletteState,
     hosts: &[String],
     saved_views: &[SavedView],
@@ -82,6 +83,7 @@ pub fn show_palette(
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -80.0))
+        .default_width(520.0)
         .open(&mut open)
         .show(ctx, |ui| {
             let response = ui.add(
@@ -107,6 +109,15 @@ pub fn show_palette(
             palette.selected = palette.selected.min(matches.len().saturating_sub(1));
 
             ui.add_space(4.0);
+            kit::section_label(
+                ui,
+                theme,
+                if id_jump.is_some() {
+                    "EVENT"
+                } else {
+                    "COMMANDS"
+                },
+            );
             egui::ScrollArea::vertical()
                 .id_salt("palette_results")
                 .auto_shrink([false, false])
@@ -129,20 +140,50 @@ pub fn show_palette(
                     }
                     for (idx, command) in matches.iter().enumerate() {
                         let selected = idx == palette.selected;
-                        let resp = ui
-                            .selectable_label(
-                                selected,
-                                egui::RichText::new(&command.title).monospace(),
-                            )
-                            .on_hover_text(&command.hint);
-                        if resp.clicked() {
-                            palette.selected = idx;
-                            actions_out.extend(command.run.actions());
-                            close = true;
-                        }
+                        let frame = egui::Frame::new()
+                            .fill(if selected { theme.bg2 } else { theme.bg1 })
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                if selected { theme.accent } else { theme.border },
+                            ))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::symmetric(8, 4));
+                        frame.show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let title_width = (ui.available_width() * 0.58).max(160.0);
+                                let resp = ui
+                                    .add_sized(
+                                        [title_width, 26.0],
+                                        egui::Button::new(
+                                            egui::RichText::new(&command.title).monospace(),
+                                        )
+                                        .selected(selected)
+                                        .frame(false),
+                                    )
+                                    .on_hover_text(&command.hint);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&command.hint)
+                                            .small()
+                                            .color(theme.text_dim),
+                                    )
+                                    .truncate(),
+                                );
+                                if resp.clicked() {
+                                    palette.selected = idx;
+                                    actions_out.extend(command.run.actions());
+                                    close = true;
+                                }
+                            });
+                        });
                     }
                     if matches.is_empty() {
-                        ui.label(egui::RichText::new("no matches").weak());
+                        kit::empty_state(
+                            ui,
+                            theme,
+                            "no matches",
+                            "try a view, host, action or #event id",
+                        );
                     }
                 });
 

@@ -1771,6 +1771,7 @@ impl Shell {
 
     fn scope_bar(&mut self, ui: &mut egui::Ui) {
         let counts = self.model.counts.value().map(|c| (c.in_scope, c.in_case));
+        let theme = self.active_theme();
         let mut actions = Vec::new();
         show_scope_bar(
             ui,
@@ -1779,6 +1780,7 @@ impl Shell {
                 saved_views: &self.model.saved_views,
                 counts,
                 tz: self.tz,
+                theme: &theme,
             },
             &mut self.chip_editor,
             &mut self.saved_views_ui,

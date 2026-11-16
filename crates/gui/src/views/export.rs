@@ -9,6 +9,7 @@ use eframe::egui;
 
 use crate::model::Action;
 use crate::theme::Theme;
+use crate::widgets::kit;
 
 #[derive(Default)]
 pub struct ExportDialog {
@@ -126,7 +127,9 @@ pub fn show_export_dialog(
             }
             ui.horizontal(|ui| {
                 let busy = dialog.running.is_some();
-                if ui.add_enabled(!busy, egui::Button::new("Export")).clicked() {
+                let export_button =
+                    ui.add_enabled_ui(!busy, |ui| kit::primary_button(ui, theme, "Export"));
+                if export_button.inner.clicked() {
                     actions.push(Action::ExportScope {
                         path: PathBuf::from(dialog.path.trim()),
                         format: dialog.format.clone(),
