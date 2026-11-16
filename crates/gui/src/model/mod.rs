@@ -62,9 +62,24 @@ pub enum ScopeAction {
 /// A mutating IOC operation queued for the worker's writer thread.
 #[derive(Debug)]
 pub enum IocWriteRequest {
-    Add { ioc_type: String, value: String },
-    Import { content: String },
-    Remove { id: u64 },
+    Add {
+        ioc_type: String,
+        value: String,
+        note: Option<String>,
+    },
+    Import {
+        content: String,
+    },
+    Remove {
+        id: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmptyRecoveryHint {
+    pub remove: crate::model::scope::ChipRemove,
+    pub label: String,
+    pub restored_count: u64,
 }
 
 #[derive(Debug)]
@@ -162,6 +177,11 @@ pub enum Action {
     AddIoc {
         ioc_type: String,
         value: String,
+        note: Option<String>,
+    },
+    EmptyRecovery {
+        generation: Generation,
+        hints: Vec<EmptyRecoveryHint>,
     },
     /// import one IOC per line (type value [note], csv, or bare auto-detected values)
     ImportIocs(String),
@@ -294,6 +314,8 @@ pub struct Model {
     /// bumped on each seek request
     pub seek_gen: Generation,
     pub counts: Slot<Counts>,
+    /// when `counts.in_scope == 0`, how many events each single removable chip would restore
+    pub empty_recovery: Slot<Vec<EmptyRecoveryHint>>,
     /// the case's timed timespan; `None` while the case has no timed events
     pub bounds: Slot<Option<(i64, i64)>>,
     /// untimed events matching the scope with its time window dropped; feeds the
@@ -492,6 +514,10 @@ impl Model {
             Action::Counts { generation, result } => {
                 self.counts.absorb(generation, self.generation, result)
             }
+            Action::EmptyRecovery { generation, hints } => {
+                self.empty_recovery
+                    .absorb(generation, self.generation, Ok(hints));
+            }
             Action::Bounds { generation, result } => {
                 self.bounds.absorb(generation, self.generation, result)
             }
@@ -659,8 +685,16 @@ impl Model {
                     self.lanes_gen += 1;
                 }
             }
-            Action::AddIoc { ioc_type, value } => {
-                self.pending_ioc_write = Some(IocWriteRequest::Add { ioc_type, value });
+            Action::AddIoc {
+                ioc_type,
+                value,
+                note,
+            } => {
+                self.pending_ioc_write = Some(IocWriteRequest::Add {
+                    ioc_type,
+                    value,
+                    note,
+                });
             }
             Action::ImportIocs(content) => {
                 self.pending_ioc_write = Some(IocWriteRequest::Import { content });

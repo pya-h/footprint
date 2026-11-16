@@ -149,6 +149,7 @@ fn read_only_0400_case_reads_cleanly_and_reports_write_errors() {
     harness.state_mut().apply(Action::AddIoc {
         ioc_type: "domain".to_string(),
         value: "example.com".to_string(),
+        note: None,
     });
     pump_until(&mut harness, |s| s.model().ioc_status.is_some());
     assert!(

@@ -58,15 +58,21 @@ pub fn interrupted() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{arm, cancel, interrupted};
+    use std::sync::Mutex;
+
+    // `SIGNALED`/`CANCELLED` are process-global atomics; serialize tests that mutate them.
+    static LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn flag_starts_clear_and_arms() {
+        let _guard_lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = arm();
         assert!(!interrupted());
     }
 
     #[test]
     fn cancel_stops_and_rearm_clears() {
+        let _guard_lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         cancel();
         assert!(interrupted());
         let _guard = arm();

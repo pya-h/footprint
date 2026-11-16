@@ -15,7 +15,7 @@ pub use theme::Theme;
 use std::path::Path;
 
 /// Opens the case in a window. Blocks until the window closes.
-pub fn run(case: &Path, tz: fp_query::Tz) -> anyhow::Result<()> {
+pub fn run(case: &Path, tz_override: Option<fp_query::Tz>) -> anyhow::Result<()> {
     if unsafe { libc::geteuid() } == 0 {
         anyhow::bail!(
             "refusing to run the GUI as root: run `sudo footprint collect` in a terminal \
@@ -30,6 +30,8 @@ pub fn run(case: &Path, tz: fp_query::Tz) -> anyhow::Result<()> {
     }
 
     let (settings, settings_warning) = settings::Settings::load();
+    let tz = tz_override
+        .unwrap_or_else(|| fp_query::parse_tz(&settings.tz).unwrap_or(fp_query::Tz::Local));
     let title = format!("footprint — {}", case.display());
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

@@ -205,3 +205,78 @@ fn sources_view_shows_coverage_health_and_run_actions() {
     assert!(harness.state().model().scope.to_cli().contains("--run 1"));
     assert_eq!(harness.state().model().view(), View::Timeline);
 }
+
+#[test]
+fn ioc_add_preserves_note_and_state_hit_click_selects_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("case.db");
+    build_ioc_case(&db);
+    let state_rowid: i64 = {
+        let store = Store::open_or_create(&db).expect("open db");
+        store
+            .conn()
+            .execute(
+                "INSERT INTO state (run_id, kind, key, value_json)
+                 VALUES (1, 'persist.cron', '/etc/cron.d/backdoor', '{\"origin\":\"https://us09-web-zoom.com\"}')",
+                [],
+            )
+            .expect("insert state");
+        let sid = store.conn().last_insert_rowid();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO links (src_type, src_id, rel, dst_type, dst_id, confidence, why)
+                 VALUES ('state', ?1, 'ioc_match', 'ioc', 1, 'direct', 'state-hit')",
+                rusqlite::params![sid],
+            )
+            .expect("insert state ioc link");
+        sid
+    };
+
+    let shell = new_shell(&db, View::Ioc);
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1280.0, 900.0))
+        .with_step_dt(1.0 / 60.0)
+        .build_ui_state(
+            |ui, state| {
+                state.show_ui(ui);
+            },
+            shell,
+        );
+
+    pump_until(&mut harness, |s| s.model().iocs.value().is_some());
+    harness.state_mut().apply(Action::AddIoc {
+        ioc_type: "domain".into(),
+        value: "evil.example".into(),
+        note: Some("audit persistence check".into()),
+    });
+    pump_until(&mut harness, |s| {
+        s.model()
+            .iocs
+            .value()
+            .is_some_and(|rows| rows.iter().any(|r| r.value.as_str() == "evil.example"))
+    });
+    harness
+        .get_by_label_contains("domain  evil.example")
+        .click();
+    harness.step();
+    harness.step();
+    harness.get_by_label_contains("audit persistence check");
+
+    harness
+        .get_by_label_contains("domain  us09-web-zoom.com")
+        .click();
+    pump_until(&mut harness, |s| {
+        s.model()
+            .ioc_hits
+            .value()
+            .is_some_and(|rows| rows.iter().any(|h| h.target_type.as_str() == "state"))
+    });
+    harness.step();
+    harness.get_by_label_contains("persist.cron · ").click();
+    harness.step();
+    assert_eq!(
+        harness.state().model().selection(),
+        Selection::State(state_rowid)
+    );
+}

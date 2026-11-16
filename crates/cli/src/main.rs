@@ -14,9 +14,9 @@ struct Cli {
     /// case file
     #[arg(short, long, global = true, default_value = "footprint.db")]
     case: PathBuf,
-    /// render times in this zone (`local`, `UTC`, `+03:30`)
-    #[arg(long, global = true, default_value = "local")]
-    tz: String,
+    /// render times in this zone (`local`, `UTC`, `+03:30`); defaults to `local` (or `gui.json` for `gui`)
+    #[arg(long, global = true)]
+    tz: Option<String>,
     #[command(subcommand)]
     cmd: Command,
 }
@@ -323,7 +323,8 @@ fn clean(text: &str) -> String {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let tz = fp_query::parse_tz(&cli.tz)?;
+    let tz_override = cli.tz.as_deref().map(fp_query::parse_tz).transpose()?;
+    let tz = tz_override.unwrap_or(fp_query::Tz::Local);
     match cli.cmd {
         Command::Collect(args) => collect(&cli.case, args),
         Command::Sources {
@@ -341,17 +342,17 @@ fn main() -> Result<()> {
         Command::Export(args) => export(&cli.case, args, tz),
         Command::Explain { finding } => explain(&finding),
         Command::Tui => fp_tui::run(&cli.case, tz),
-        Command::Gui => gui(&cli.case, tz),
+        Command::Gui => gui(&cli.case, tz_override),
     }
 }
 
 #[cfg(feature = "gui")]
-fn gui(case: &Path, tz: fp_query::Tz) -> Result<()> {
-    fp_gui::run(case, tz)
+fn gui(case: &Path, tz_override: Option<fp_query::Tz>) -> Result<()> {
+    fp_gui::run(case, tz_override)
 }
 
 #[cfg(not(feature = "gui"))]
-fn gui(_case: &Path, _tz: fp_query::Tz) -> Result<()> {
+fn gui(_case: &Path, _tz_override: Option<fp_query::Tz>) -> Result<()> {
     eprintln!("this build has no GUI; rebuild with `--features gui`; or use `footprint tui`");
     std::process::exit(2);
 }
@@ -914,13 +915,14 @@ fn ioc(case: &Path, args: IocArgs, tz: fp_query::Tz) -> Result<()> {
                 for ioc in iocs {
                     let added =
                         fp_query::format_time(ioc.added_utc, "second", tz, "%Y-%m-%d %H:%M:%S");
+                    let note_text = ioc.note.as_deref().map(clean).unwrap_or_else(|| "-".into());
                     println!(
                         "{:<6} {:<8} {:<36} {:<20} {}",
                         ioc.id,
-                        ioc.ioc_type,
-                        ioc.value,
+                        clean(&ioc.ioc_type),
+                        clean(&ioc.value),
                         added,
-                        ioc.note.unwrap_or_else(|| "-".into())
+                        note_text
                     );
                 }
             }

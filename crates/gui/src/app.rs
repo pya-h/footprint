@@ -320,8 +320,12 @@ impl Shell {
         let generation = self.model.generation;
         let id = worker.submit_writer(ReqKind::IocWrite, generation, move |store| {
             let message = match &request {
-                crate::model::IocWriteRequest::Add { ioc_type, value } => {
-                    fp_query::iocs::add_ioc(store, ioc_type, value, None)
+                crate::model::IocWriteRequest::Add {
+                    ioc_type,
+                    value,
+                    note,
+                } => {
+                    fp_query::iocs::add_ioc(store, ioc_type, value, note.as_deref())
                         .map_err(|e| QueryError::Message(e.to_string()))?;
                     format!("Added IOC {ioc_type}:{value}")
                 }
@@ -471,7 +475,7 @@ impl Shell {
                 ReqKind::Count => {
                     let result = match resp.result {
                         Ok(payload) => payload
-                            .downcast::<(Counts, u64)>()
+                            .downcast::<(Counts, u64, Vec<crate::model::EmptyRecoveryHint>)>()
                             .map(|boxed| *boxed)
                             .map_err(|_| "internal: counts payload mismatch".to_string()),
                         Err(QueryError::Message(m)) => Err(m),
@@ -479,7 +483,7 @@ impl Shell {
                     };
                     let generation = resp.generation;
                     match result {
-                        Ok((counts, untimed)) => {
+                        Ok((counts, untimed, recovery)) => {
                             self.apply(Action::Counts {
                                 generation,
                                 result: Ok(counts),
@@ -487,6 +491,10 @@ impl Shell {
                             self.apply(Action::Untimed {
                                 generation,
                                 result: Ok(untimed),
+                            });
+                            self.apply(Action::EmptyRecovery {
+                                generation,
+                                hints: recovery,
                             });
                         }
                         Err(message) => {
@@ -979,7 +987,8 @@ impl Shell {
         let Some(worker) = &self.worker else {
             return;
         };
-        let filter = self.model.scope.filter();
+        let scope_snapshot = self.model.scope.clone();
+        let filter = scope_snapshot.filter();
         let count_filter = filter.clone();
         let id = worker.submit(ReqKind::Count, None, generation, move |store| {
             let in_case = store.event_count()?;
@@ -991,7 +1000,22 @@ impl Shell {
                 ..count_filter.clone()
             };
             let untimed = store.count_events(&fp_store::EventFilter::from(&untimed_filter))?;
-            Ok(Box::new((Counts { in_scope, in_case }, untimed)))
+            let mut recovery = Vec::new();
+            if in_scope == 0 && !scope_snapshot.is_empty() {
+                for chip in scope_snapshot.chips() {
+                    let mut relaxed = scope_snapshot.clone();
+                    relaxed.remove(chip.remove.clone());
+                    let n = store.count_events(&fp_store::EventFilter::from(&relaxed.filter()))?;
+                    if n > 0 {
+                        recovery.push(crate::model::EmptyRecoveryHint {
+                            remove: chip.remove,
+                            label: chip.label,
+                            restored_count: n,
+                        });
+                    }
+                }
+            }
+            Ok(Box::new((Counts { in_scope, in_case }, untimed, recovery)))
         });
         self.outstanding.insert(id);
 
@@ -1200,10 +1224,33 @@ impl Shell {
             return;
         }
         self.submitted_detail = Some(sel_gen);
-        let Selection::Event(id) = self.model.inspected() else {
+        let Some(worker) = &self.worker else {
             return;
         };
-        let Some(worker) = &self.worker else {
+        if let Selection::State(_) = self.model.inspected()
+            && self.model.states.value().is_none()
+        {
+            let run = self.state_state.run;
+            let search = self.state_state.submitted_search.clone();
+            let states_gen = self.model.states_gen;
+            let key = (states_gen, run, search.clone());
+            if self.submitted_states.as_ref() != Some(&key) {
+                self.submitted_states = Some(key);
+                let id = worker.submit(ReqKind::State, None, states_gen, move |store| {
+                    let run_id = match run {
+                        Some(id) => id,
+                        None => store.last_run_id()?.unwrap_or(0),
+                    };
+                    let match_text = (!search.is_empty()).then_some(search.as_str());
+                    let rows = fp_query::state_records(store, Some(run_id), None, match_text)?;
+                    let vms: Vec<StateRowVm> = rows.iter().map(StateRowVm::from_view).collect();
+                    Ok(Box::new(vms))
+                });
+                self.outstanding.insert(id);
+            }
+            return;
+        }
+        let Selection::Event(id) = self.model.inspected() else {
             return;
         };
         let req_id = worker.submit(
@@ -1333,6 +1380,9 @@ impl Shell {
         {
             self.apply(Action::Scope(ScopeAction::Clear));
         }
+        if ui.input(|i| i.key_pressed(egui::Key::E) && i.modifiers.ctrl && !i.modifiers.shift) {
+            self.export_dialog.open_default(&self.case);
+        }
         if ui.input(|i| i.key_pressed(egui::Key::Slash) && !i.modifiers.any()) {
             self.focus_search_next = true;
         }
@@ -1344,6 +1394,25 @@ impl Shell {
         }
         if ui.input(|i| i.key_pressed(egui::Key::B) && !i.modifiers.any()) {
             self.board_state.toggle(&self.case);
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::T) && !i.modifiers.any()) {
+            match self.model.inspected() {
+                Selection::Event(id) => {
+                    self.apply(Action::Go(View::Trace));
+                    self.apply(Action::RequestTrace(id.to_string()));
+                }
+                _ => self.apply(Action::Go(View::Trace)),
+            }
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::C) && !i.modifiers.any())
+            && let Some(text) = self.selected_copy_text()
+        {
+            ui.ctx().copy_text(text);
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.any())
+            && self.model.inspected() != Selection::None
+        {
+            self.settings.panels.inspector_collapsed = false;
         }
         if ui.input(|i| {
             i.key_pressed(egui::Key::Questionmark)
@@ -1390,6 +1459,59 @@ impl Shell {
             {
                 self.apply(Action::Go(view));
             }
+        }
+    }
+
+    fn selected_copy_text(&self) -> Option<String> {
+        match self.model.inspected() {
+            Selection::Event(id) => {
+                let d = self.model.detail.value()?.as_ref()?;
+                if d.id != id {
+                    return None;
+                }
+                d.subject
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .or(d.summary.as_ref())
+                    .map(|s| s.as_str().to_string())
+            }
+            Selection::State(rowid) => self
+                .model
+                .states
+                .value()?
+                .iter()
+                .find(|s| s.rowid == rowid)
+                .map(|s| s.key.as_str().to_string()),
+            Selection::Ioc(id) => self
+                .model
+                .iocs
+                .value()?
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| i.value.as_str().to_string()),
+            Selection::Source(id) => self
+                .model
+                .sources
+                .value()?
+                .health_rows
+                .iter()
+                .find(|s| s.source_id == id)
+                .map(|s| s.label.as_str().to_string()),
+            Selection::TraceNode(id) => self
+                .model
+                .trace
+                .value()
+                .and_then(|t| match &t.head {
+                    crate::vm::TraceHeadVm::Artifact { id: hid, path, .. } if *hid == id => {
+                        Some(path.as_str().to_string())
+                    }
+                    crate::vm::TraceHeadVm::Event {
+                        id: hid, subject, ..
+                    } if *hid == id => Some(subject.as_str().to_string()),
+                    _ => None,
+                })
+                .or_else(|| self.model.pending_trace.clone()),
+            Selection::None => None,
         }
     }
 
@@ -2072,10 +2194,25 @@ fn show_side_drawer(
 /// Resolves an IOC hit target to (kind, label) for display; unresolved targets
 /// fall back to the target type and an empty label.
 fn resolve_hit_target(store: &fp_store::Store, hit: &fp_store::IocHitLink) -> (String, String) {
-    if hit.target_type == "event"
-        && let Ok(Some(ev)) = store.get_event(hit.target_id)
-    {
-        return (ev.kind, ev.subject.unwrap_or_default());
+    match hit.target_type.as_str() {
+        "event" => {
+            if let Ok(Some(ev)) = store.get_event(hit.target_id) {
+                return (ev.kind, ev.subject.unwrap_or_default());
+            }
+        }
+        "state" => {
+            if let Ok(rowid) = i64::try_from(hit.target_id)
+                && let Ok(Some(st)) = store.get_state(rowid)
+            {
+                return (st.kind, st.key);
+            }
+        }
+        "artifact" => {
+            if let Ok(Some(art)) = store.get_artifact(hit.target_id) {
+                return ("artifact".to_string(), art.path);
+            }
+        }
+        _ => {}
     }
     (hit.target_type.clone(), String::new())
 }

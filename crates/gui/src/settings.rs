@@ -60,7 +60,7 @@ impl Default for Settings {
             theme: ThemeName::Dark,
             density: Density::Compact,
             ui_scale: 1.0,
-            tz: "UTC".to_string(),
+            tz: "local".to_string(),
             panels: Panels::default(),
             table: Table::default(),
             last_view: None,

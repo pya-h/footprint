@@ -462,3 +462,73 @@ fn keyboard_navigation_and_panel_toggles_work_without_mouse() {
     harness.step();
     assert!(harness.state().model().scope.is_empty());
 }
+
+#[test]
+fn empty_scope_recovery_and_shortcuts_c_t_ctrl_e() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("case.db");
+    build_fake_zoom_case(&db);
+
+    let shell = new_shell(&db);
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1280.0, 820.0))
+        .with_step_dt(1.0 / 60.0)
+        .build_ui_state(
+            |ui, state| {
+                state.show_ui(ui);
+            },
+            shell,
+        );
+
+    pump_until(&mut harness, |s| s.model().counts.value().is_some());
+    harness.step();
+
+    // Combine an empty-matching text query with a host chip to verify recovery hints appear.
+    harness
+        .state_mut()
+        .apply(Action::Scope(ScopeAction::SetHostFilter {
+            hosts: vec!["us09-web-zoom.com".into()],
+            hosts_not: vec![],
+        }));
+    harness
+        .state_mut()
+        .apply(Action::Scope(ScopeAction::SetText(Some(
+            "definitely_missing_xyz".into(),
+        ))));
+    pump_until(&mut harness, |s| {
+        s.model().counts.generation() == s.model().generation
+            && s.model()
+                .empty_recovery
+                .value()
+                .is_some_and(|v| !v.is_empty())
+    });
+    harness.step();
+    harness.get_by_label("No events match this scope");
+    harness.get_by_label_contains("+1 events").click();
+    pump_until(&mut harness, |s| {
+        s.model().counts.generation() == s.model().generation
+            && s.model().counts.value().is_some_and(|c| c.in_scope == 1)
+    });
+
+    // Clear scope, select event 1, verify `c` doesn't crash, `t` opens Trace, and `Ctrl+E` opens Export.
+    harness.state_mut().apply(Action::Scope(ScopeAction::Clear));
+    harness
+        .state_mut()
+        .apply(Action::Select(Selection::Event(1)));
+    pump_until(&mut harness, |s| {
+        s.model()
+            .detail
+            .value()
+            .and_then(|d| d.as_ref())
+            .is_some_and(|d| d.id == 1)
+    });
+    harness.key_press(egui::Key::C);
+    harness.step();
+    harness.key_press(egui::Key::T);
+    harness.step();
+    assert_eq!(harness.state().model().view(), fp_gui::model::View::Trace);
+
+    harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::E);
+    harness.step();
+    harness.get_by_label("Export scope");
+}

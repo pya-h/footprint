@@ -24,7 +24,12 @@ pub fn show_help(ctx: &egui::Context, theme: &Theme, open: &mut bool) {
                     ui.label(egui::RichText::new("Keyboard").strong());
                     for (keys, what) in [
                         ("1…0", "open a view (rail order)"),
+                        ("j / k / Up / Down", "move timeline row focus"),
+                        ("PgUp / PgDn / Home / End", "page or jump in the timeline"),
+                        ("Enter", "open the inspector on the current selection"),
+                        ("t / c", "trace selected event / copy selected value"),
                         ("Ctrl+K", "command palette"),
+                        ("Ctrl+E", "export current scope"),
                         ("Ctrl+Z / Ctrl+Y", "undo / redo the scope"),
                         ("Ctrl+Shift+C", "copy the scope as a footprint command"),
                         ("Ctrl+Shift+Backspace", "clear the scope"),

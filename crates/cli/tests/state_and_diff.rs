@@ -67,23 +67,33 @@ fn collect(case: &Case, sources: &str) -> String {
     )
 }
 
+/// Creates a file and clamps `mtime` back to `btime` so tmpfs ~100us write latency does not emit a second `file.modified` event.
+fn write_stable(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+    if let Ok(created) = fs::metadata(path).and_then(|m| m.created())
+        && let Ok(f) = File::options().write(true).open(path)
+    {
+        let _ = f.set_modified(created);
+    }
+}
+
 #[test]
 fn filesystem_statx_and_group_by() {
     let case = setup();
 
     let dl_dir = case.home.join("Downloads");
     fs::create_dir_all(&dl_dir).unwrap();
-    fs::write(dl_dir.join("pkg1.deb"), "data1").unwrap();
-    fs::write(dl_dir.join("pkg2.deb"), "data2").unwrap();
+    write_stable(&dl_dir.join("pkg1.deb"), "data1");
+    write_stable(&dl_dir.join("pkg2.deb"), "data2");
 
     let doc_dir = case.home.join("Documents");
     fs::create_dir_all(&doc_dir).unwrap();
-    fs::write(doc_dir.join("file.txt"), "text").unwrap();
+    write_stable(&doc_dir.join("file.txt"), "text");
 
     // Noise dir should be ignored
     let cache_dir = case.home.join(".cache/foo");
     fs::create_dir_all(&cache_dir).unwrap();
-    fs::write(cache_dir.join("cached.bin"), "noise").unwrap();
+    write_stable(&cache_dir.join("cached.bin"), "noise");
 
     collect(&case, "fs.statx");
 

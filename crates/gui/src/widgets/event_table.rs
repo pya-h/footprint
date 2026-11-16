@@ -32,6 +32,8 @@ pub struct TableState {
     pub needed_blocks: Vec<usize>,
     pub multi_selected: BTreeSet<u64>,
     pub focused_row: Option<usize>,
+    pub scroll_to_focused: bool,
+    pub select_after_load: Option<usize>,
     pub burst_folding: bool,
     pub expanded_bursts: HashSet<u64>,
 }
@@ -65,9 +67,7 @@ pub fn show_timeline_table(
     };
     let total_rows = usize::try_from(counts.in_scope).unwrap_or(usize::MAX);
     if total_rows == 0 {
-        ui.centered_and_justified(|ui| {
-            ui.label(egui::RichText::new("no events match the current scope").weak());
-        });
+        show_empty_scope(ui, model, theme, actions);
         return;
     }
 
@@ -80,11 +80,18 @@ pub fn show_timeline_table(
 
     let scope_hash = model.scope.hash();
     let reverse = model.reverse;
+    if let Some(pending_idx) = state.select_after_load
+        && let Some(row) = cache.row(scope_hash, reverse, pending_idx)
+    {
+        state.select_after_load = None;
+        actions.push(Action::Select(Selection::Event(row.id)));
+    }
     let quiet_threshold = quiet_gap_threshold(model);
     let cols = sanitized_columns(&settings.table.columns);
     let click_mods = ui.input(|i| i.modifiers);
 
     let mut visited_blocks = HashSet::new();
+    let mut resized_widths: Vec<(String, f32)> = Vec::new();
     ui.scope(|ui| {
         ui.style_mut().interaction.selectable_labels = false;
         let mut builder = TableBuilder::new(ui)
@@ -99,7 +106,12 @@ pub fn show_timeline_table(
                 Some(egui::Align::Center),
             );
             state.focused_row = Some(target_row.min(total_rows.saturating_sub(1)));
+            state.scroll_to_focused = false;
             actions.push(Action::ClearScrollTarget);
+        } else if std::mem::take(&mut state.scroll_to_focused)
+            && let Some(row_idx) = state.focused_row
+        {
+            builder = builder.scroll_to_row(row_idx.min(total_rows.saturating_sub(1)), None);
         }
 
         for col in &cols {
@@ -124,6 +136,14 @@ pub fn show_timeline_table(
             .header(row_h, |mut header| {
                 for col in &cols {
                     header.col(|ui| {
+                        let actual_w = ui.max_rect().width();
+                        if col != "summary"
+                            && actual_w >= 20.0
+                            && (actual_w - default_col_width(col, &settings.table.widths)).abs()
+                                > 1.5
+                        {
+                            resized_widths.push((col.clone(), actual_w));
+                        }
                         let title = col_header(col, tz);
                         ui.label(
                             egui::RichText::new(title)
@@ -222,12 +242,56 @@ pub fn show_timeline_table(
             });
     });
 
+    for (col, w) in resized_widths {
+        settings.table.widths.insert(col, w);
+    }
     for block in visited_blocks {
         if !cache.has_block((scope_hash, reverse, block)) {
             state.needed_blocks.push(block);
         }
     }
     state.needed_blocks.sort_unstable();
+}
+
+fn show_empty_scope(ui: &mut egui::Ui, model: &Model, theme: &Theme, actions: &mut Vec<Action>) {
+    ui.centered_and_justified(|ui| {
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("No events match this scope")
+                    .strong()
+                    .color(theme.text),
+            );
+            if let Some(hints) = model.empty_recovery.value()
+                && !hints.is_empty()
+            {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Remove a filter chip to bring events back:")
+                        .small()
+                        .color(theme.text_dim),
+                );
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    for hint in hints {
+                        let text = format!(
+                            "x {} (+{} events)",
+                            hint.label,
+                            thousands(hint.restored_count)
+                        );
+                        if ui.button(text).clicked() {
+                            actions.push(Action::Scope(ScopeAction::Remove(hint.remove.clone())));
+                        }
+                    }
+                });
+            }
+            if !model.scope.is_empty() {
+                ui.add_space(6.0);
+                if ui.small_button("Clear all filters").clicked() {
+                    actions.push(Action::Scope(ScopeAction::Clear));
+                }
+            }
+        });
+    });
 }
 
 fn show_toolbar(
@@ -499,11 +563,19 @@ fn handle_keyboard_nav(
     };
     let cur = state.focused_row.unwrap_or(0) as isize;
     let next = (cur + step).clamp(0, total_rows.saturating_sub(1) as isize) as usize;
-    if Some(next) != state.focused_row
-        && let Some(row) = cache.row(model.scope.hash(), model.reverse, next)
-    {
+    if Some(next) != state.focused_row {
         state.focused_row = Some(next);
-        actions.push(Action::Select(Selection::Event(row.id)));
+        state.scroll_to_focused = true;
+        let block = next / BLOCK_SIZE;
+        if let Some(row) = cache.row(model.scope.hash(), model.reverse, next) {
+            state.select_after_load = None;
+            actions.push(Action::Select(Selection::Event(row.id)));
+        } else {
+            state.select_after_load = Some(next);
+            if !cache.has_block((model.scope.hash(), model.reverse, block)) {
+                state.needed_blocks.push(block);
+            }
+        }
     }
 }
 

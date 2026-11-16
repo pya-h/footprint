@@ -345,6 +345,7 @@ fn attach_host_context_menu(
             actions.push(Action::AddIoc {
                 ioc_type,
                 value: host_key.to_string(),
+                note: None,
             });
             ui.close();
         }

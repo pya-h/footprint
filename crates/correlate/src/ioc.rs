@@ -98,8 +98,8 @@ pub fn check_iocs(store: &Store) -> Result<Vec<IocHit>> {
 }
 
 /// Rebuilt on every pass: an IOC deleted since the last one must not keep its links.
+/// Matching runs before mutating `links`, and replacement happens in one transaction.
 pub fn correlate_iocs(store: &mut Store) -> Result<usize> {
-    store.delete_links(IOC_MATCH)?;
     let hits = check_iocs(store)?;
     let mut links = Vec::new();
 
@@ -125,7 +125,7 @@ pub fn correlate_iocs(store: &mut Store) -> Result<usize> {
         });
     }
 
-    store.insert_links(&links).map_err(Into::into)
+    store.replace_links(IOC_MATCH, &links).map_err(Into::into)
 }
 
 pub fn match_event_iocs(

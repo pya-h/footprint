@@ -292,6 +292,25 @@ impl Store {
 
     pub fn insert_links(&mut self, links: &[Link]) -> Result<usize, StoreError> {
         let tx = self.conn.transaction()?;
+        let count = Self::insert_links_tx(&tx, links)?;
+        tx.commit()?;
+        Ok(count)
+    }
+
+    /// Atomically replaces every link of `rel` with `links` inside a single transaction,
+    /// avoiding a window where interrupted passes leave links empty.
+    pub fn replace_links(&mut self, rel: &str, links: &[Link]) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM links WHERE rel = ?1", [rel])?;
+        let count = Self::insert_links_tx(&tx, links)?;
+        tx.commit()?;
+        Ok(count)
+    }
+
+    fn insert_links_tx(
+        tx: &rusqlite::Transaction<'_>,
+        links: &[Link],
+    ) -> Result<usize, StoreError> {
         let mut count = 0;
         {
             let mut stmt = tx.prepare_cached(
@@ -310,7 +329,6 @@ impl Store {
                 ])?;
             }
         }
-        tx.commit()?;
         Ok(count)
     }
 
@@ -1100,6 +1118,14 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    pub fn get_state(&self, rowid: i64) -> Result<Option<StateRow>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, run_id, kind, key, value_json, locator
+             FROM state WHERE rowid = ?1",
+        )?;
+        Ok(stmt.query_row([rowid], StateRow::from_row).optional()?)
+    }
+
     /// Adding an existing `(type, value)` again returns its id: imports stay idempotent
     /// and a double import can't double the hits.
     pub fn insert_ioc(
@@ -1136,9 +1162,13 @@ impl Store {
     }
 
     pub fn delete_ioc(&mut self, id: u64) -> Result<bool, StoreError> {
-        let n = self
-            .conn
-            .execute("DELETE FROM iocs WHERE id = ?1", params![id])?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM links WHERE rel = 'ioc_match' AND dst_type = 'ioc' AND dst_id = ?1",
+            params![id],
+        )?;
+        let n = tx.execute("DELETE FROM iocs WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -3053,6 +3083,91 @@ mod tests {
 
         let not_found = store.delete_ioc(999).unwrap();
         assert!(!not_found);
+    }
+
+    #[test]
+    fn delete_ioc_drops_its_links_and_replace_links_swaps_atomically() {
+        let (_dir, mut store) = open_case();
+        let (run_id, source_id) = run(&mut store);
+        let ev1 = event(
+            run_id,
+            source_id,
+            100,
+            EventKind::WebVisit,
+            "https://us09-web-zoom.com/j/1",
+            Some("us09-web-zoom.com"),
+            "k1",
+        );
+        let ev2 = event(
+            run_id,
+            source_id,
+            200,
+            EventKind::WebVisit,
+            "https://evil.example/2",
+            Some("evil.example"),
+            "k2",
+        );
+        let events = [ev1, ev2];
+        store
+            .ingest(
+                run_id,
+                &Batch {
+                    source_identity: "test",
+                    events: &events,
+                    states: &[],
+                    artifacts: &[],
+                },
+            )
+            .unwrap();
+        let ev_ids: Vec<u64> = store
+            .list_events(&EventFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        let ioc1 = store
+            .insert_ioc("domain", "us09-web-zoom.com", None)
+            .unwrap();
+        let ioc2 = store.insert_ioc("domain", "evil.example", None).unwrap();
+        let links = vec![
+            Link {
+                src_type: fp_core::LinkType::Event,
+                src_id: ev_ids[0],
+                rel: "ioc_match".into(),
+                dst_type: fp_core::LinkType::Ioc,
+                dst_id: ioc1,
+                confidence: Confidence::Direct,
+                why: Some("match1".into()),
+            },
+            Link {
+                src_type: fp_core::LinkType::Event,
+                src_id: ev_ids[1],
+                rel: "ioc_match".into(),
+                dst_type: fp_core::LinkType::Ioc,
+                dst_id: ioc2,
+                confidence: Confidence::Direct,
+                why: Some("match2".into()),
+            },
+        ];
+        store.replace_links("ioc_match", &links).unwrap();
+        let hit_counts = store.ioc_hit_counts().unwrap();
+        assert_eq!(hit_counts, vec![(ioc1, 1), (ioc2, 1)]);
+
+        assert!(store.delete_ioc(ioc1).unwrap());
+        let counts_after_delete = store.ioc_hit_counts().unwrap();
+        assert_eq!(counts_after_delete, vec![(ioc2, 1)]);
+
+        store.replace_links("ioc_match", &links[1..2]).unwrap();
+        let link_rows: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE rel = 'ioc_match'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(link_rows, 1);
     }
 
     #[test]

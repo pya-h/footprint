@@ -252,23 +252,33 @@ fn render_hit_row(
         shorten(hit.target_label.as_str(), 60),
         hit.ioc_value.as_str()
     );
+    let default_hint = match hit.target_type.as_str() {
+        "event" => "click to inspect the matched event",
+        "state" => "click to inspect the matched state record",
+        "artifact" => "click to trace this matched artifact",
+        _ => "matched IOC hit",
+    };
     let resp = ui
         .selectable_label(
             false,
             egui::RichText::new(label).monospace().color(theme.text),
         )
-        .on_hover_text(
-            hit.why
-                .as_ref()
-                .map(|w| w.as_str())
-                .unwrap_or("click to inspect the matched event"),
-        );
-    if resp.clicked() && hit.target_type.as_str() == "event" {
-        actions.push(Action::Select(Selection::Event(hit.target_id)));
+        .on_hover_text(hit.why.as_ref().map(|w| w.as_str()).unwrap_or(default_hint));
+    let selection = match hit.target_type.as_str() {
+        "event" => Some(Selection::Event(hit.target_id)),
+        "state" => i64::try_from(hit.target_id).ok().map(Selection::State),
+        _ => None,
+    };
+    if resp.clicked() {
+        if let Some(sel) = &selection {
+            actions.push(Action::Select(sel.clone()));
+        } else if hit.target_type.as_str() == "artifact" && !hit.target_label.as_str().is_empty() {
+            actions.push(Action::Go(View::Trace));
+            actions.push(Action::RequestTrace(hit.target_label.as_str().to_string()));
+        }
     }
-    if hit.target_type.as_str() == "event" {
+    if let Some(target) = selection {
         resp.context_menu(|ui| {
-            let target = Selection::Event(hit.target_id);
             let on_board = model.board.contains(&target);
             let board_label = if on_board {
                 "Remove from Board"
@@ -340,9 +350,11 @@ fn render_dialog(
                             .weak(),
                     );
                     if ui.button("add").clicked() && !value.trim().is_empty() {
+                        let note_trimmed = note.trim();
                         actions.push(Action::AddIoc {
                             ioc_type: detected.to_string(),
                             value: value.trim().to_string(),
+                            note: (!note_trimmed.is_empty()).then(|| note_trimmed.to_string()),
                         });
                         close = true;
                     }

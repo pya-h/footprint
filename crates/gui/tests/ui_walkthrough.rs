@@ -236,6 +236,7 @@ fn fake_zoom_end_to_end_walkthrough() {
     harness.state_mut().apply(Action::AddIoc {
         ioc_type: "domain".to_string(),
         value: "us09-web-zoom.com".to_string(),
+        note: None,
     });
     pump_until(&mut harness, |s| {
         s.model().iocs.value().is_some_and(|rows| {
