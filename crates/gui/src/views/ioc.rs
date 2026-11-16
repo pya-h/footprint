@@ -232,13 +232,19 @@ fn render_hits(
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for hit in hits {
-                    render_hit_row(ui, ctx.theme, hit, actions);
+                    render_hit_row(ui, ctx.theme, model, hit, actions);
                 }
             });
     });
 }
 
-fn render_hit_row(ui: &mut egui::Ui, theme: &Theme, hit: &IocHitVm, actions: &mut Vec<Action>) {
+fn render_hit_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    model: &crate::model::Model,
+    hit: &IocHitVm,
+    actions: &mut Vec<Action>,
+) {
     let label = format!(
         "{} · {} · {}   (matched: {})",
         hit.target_kind.as_str(),
@@ -259,6 +265,31 @@ fn render_hit_row(ui: &mut egui::Ui, theme: &Theme, hit: &IocHitVm, actions: &mu
         );
     if resp.clicked() && hit.target_type.as_str() == "event" {
         actions.push(Action::Select(Selection::Event(hit.target_id)));
+    }
+    if hit.target_type.as_str() == "event" {
+        resp.context_menu(|ui| {
+            let target = Selection::Event(hit.target_id);
+            let on_board = model.board.contains(&target);
+            let board_label = if on_board {
+                "Remove from Board"
+            } else {
+                "Add to Board"
+            };
+            if ui.button(board_label).clicked() {
+                if on_board {
+                    actions.push(Action::UnpinBoardTarget(target));
+                } else {
+                    actions.push(Action::PinToBoard(crate::model::BoardDraft {
+                        target,
+                        kind: hit.target_kind.as_str().to_string(),
+                        when: None,
+                        summary: hit.target_label.as_str().to_string(),
+                        detail: format!("matched IOC: {}", hit.ioc_value.as_str()),
+                    }));
+                }
+                ui.close();
+            }
+        });
     }
 }
 

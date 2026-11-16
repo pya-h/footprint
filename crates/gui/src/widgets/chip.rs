@@ -3,7 +3,35 @@
 use eframe::egui;
 use fp_query::Tz;
 
-use crate::model::{Action, ChipRemove, Scope, ScopeAction};
+use crate::model::{Action, ChipRemove, SavedViews, Scope, ScopeAction};
+
+#[derive(Default)]
+pub struct SavedViewsUiState {
+    pub save_open: bool,
+    pub menu_open: bool,
+    pub draft_name: String,
+    pub editing_id: Option<u64>,
+    pub rename_text: String,
+}
+
+impl SavedViewsUiState {
+    pub fn close(&mut self) {
+        self.save_open = false;
+        self.menu_open = false;
+        self.editing_id = None;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.save_open || self.menu_open
+    }
+}
+
+pub struct ScopeBarCtx<'a> {
+    pub scope: &'a Scope,
+    pub saved_views: &'a SavedViews,
+    pub counts: Option<(u64, u64)>,
+    pub tz: Tz,
+}
 
 #[derive(Default)]
 pub struct ChipEditorState {
@@ -30,12 +58,12 @@ impl ChipEditorState {
 
 pub fn show_scope_bar(
     ui: &mut egui::Ui,
-    scope: &Scope,
-    counts: Option<(u64, u64)>,
-    tz: Tz,
+    ctx: ScopeBarCtx<'_>,
     editor: &mut ChipEditorState,
+    saved_ui: &mut SavedViewsUiState,
     actions: &mut Vec<Action>,
 ) {
+    let scope = ctx.scope;
     let chips = scope.chips();
     ui.horizontal_wrapped(|ui| {
         if chips.is_empty() {
@@ -58,7 +86,8 @@ pub fn show_scope_bar(
                             if is_editing {
                                 editor.close();
                             } else {
-                                seed_editor(editor, idx, &chip.remove, scope, tz);
+                                saved_ui.close();
+                                seed_editor(editor, idx, &chip.remove, scope, ctx.tz);
                             }
                         }
                         if ui.small_button("×").on_hover_text("remove").clicked() {
@@ -79,7 +108,7 @@ pub fn show_scope_bar(
                     .fixed_pos(pos)
                     .show(ui.ctx(), |ui| {
                         egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            render_editor(ui, &chip.remove, scope, tz, editor, actions);
+                            render_editor(ui, &chip.remove, scope, ctx.tz, editor, actions);
                         });
                     });
             }
@@ -102,6 +131,7 @@ pub fn show_scope_bar(
             {
                 ui.ctx().copy_text(scope.to_cli());
             }
+            render_saved_views_controls(ui, ctx.saved_views, editor, saved_ui, actions);
             if ui
                 .add_enabled(scope.can_redo(), egui::Button::new("redo"))
                 .on_hover_text("Ctrl+Y")
@@ -118,7 +148,7 @@ pub fn show_scope_bar(
                 editor.close();
                 actions.push(Action::UndoScope);
             }
-            match counts {
+            match ctx.counts {
                 Some((in_scope, in_case)) => {
                     ui.label(format!("{} / {}", thousands(in_scope), thousands(in_case)));
                 }
@@ -128,6 +158,126 @@ pub fn show_scope_bar(
             }
         });
     });
+}
+
+fn render_saved_views_controls(
+    ui: &mut egui::Ui,
+    saved_views: &SavedViews,
+    editor: &mut ChipEditorState,
+    saved_ui: &mut SavedViewsUiState,
+    actions: &mut Vec<Action>,
+) {
+    let saved_label = if saved_views.is_empty() {
+        "views".to_string()
+    } else {
+        format!("views ({})", saved_views.len())
+    };
+    let menu_btn = ui
+        .selectable_label(saved_ui.menu_open, saved_label)
+        .on_hover_text("apply or manage session saved views");
+    if menu_btn.clicked() {
+        saved_ui.menu_open = !saved_ui.menu_open;
+        saved_ui.save_open = false;
+        saved_ui.editing_id = None;
+        editor.close();
+    }
+    if saved_ui.menu_open {
+        let pos = menu_btn.rect.left_bottom() + egui::vec2(-160.0, 4.0);
+        egui::Area::new(ui.scope_id().with("saved_views_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(250.0);
+                    ui.label(egui::RichText::new("Saved views (session only)").strong());
+                    if saved_views.is_empty() {
+                        ui.label(egui::RichText::new("none saved yet").small().weak());
+                    }
+                    for sv in saved_views.list() {
+                        if saved_ui.editing_id == Some(sv.id) {
+                            ui.horizontal(|ui| {
+                                let ed = ui.add(
+                                    egui::TextEdit::singleline(&mut saved_ui.rename_text)
+                                        .desired_width(140.0),
+                                );
+                                let submit = ui.button("OK").clicked()
+                                    || (ed.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                if submit {
+                                    actions.push(Action::RenameSavedView {
+                                        id: sv.id,
+                                        name: saved_ui.rename_text.clone(),
+                                    });
+                                    saved_ui.editing_id = None;
+                                }
+                                if ui.small_button("cancel").clicked() {
+                                    saved_ui.editing_id = None;
+                                }
+                            });
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(format!("{} ({})", sv.name, sv.view.label()))
+                                .clicked()
+                            {
+                                actions.push(Action::ApplySavedView(sv.id));
+                                saved_ui.menu_open = false;
+                            }
+                            if ui.small_button("rename").clicked() {
+                                saved_ui.editing_id = Some(sv.id);
+                                saved_ui.rename_text = sv.name.clone();
+                            }
+                            if ui.small_button("x").on_hover_text("remove view").clicked() {
+                                actions.push(Action::RemoveSavedView(sv.id));
+                            }
+                        });
+                    }
+                });
+            });
+    }
+
+    let save_btn = ui
+        .selectable_label(saved_ui.save_open, "save view")
+        .on_hover_text("name and save the current view + scope for this session");
+    if save_btn.clicked() {
+        saved_ui.save_open = !saved_ui.save_open;
+        saved_ui.menu_open = false;
+        editor.close();
+        if saved_ui.save_open && saved_ui.draft_name.is_empty() {
+            saved_ui.draft_name = format!("View {}", saved_views.len() + 1);
+        }
+    }
+    if saved_ui.save_open {
+        let pos = save_btn.rect.left_bottom() + egui::vec2(-140.0, 4.0);
+        egui::Area::new(ui.scope_id().with("save_view_popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Save current view + scope").strong());
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut saved_ui.draft_name)
+                            .desired_width(180.0)
+                            .hint_text("view name…"),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() || enter {
+                            let name = saved_ui.draft_name.trim().to_string();
+                            if !name.is_empty() {
+                                actions.push(Action::SaveView(name));
+                                saved_ui.draft_name.clear();
+                                saved_ui.save_open = false;
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            saved_ui.save_open = false;
+                        }
+                    });
+                });
+            });
+    }
 }
 
 fn seed_editor(

@@ -3,7 +3,7 @@
 
 use eframe::egui;
 
-use crate::model::{Action, ScopeAction, Selection, View};
+use crate::model::{Action, SavedView, ScopeAction, Selection, View};
 use crate::theme::Theme;
 
 #[derive(Default)]
@@ -24,6 +24,7 @@ enum Cmd {
     Theme(&'static str),
     Actions(Vec<fn() -> Vec<Action>>),
     Host(String),
+    SavedView(u64),
 }
 
 impl Cmd {
@@ -36,6 +37,7 @@ impl Cmd {
                 Action::Scope(ScopeAction::SetHosts(vec![host.clone()])),
                 Action::Go(View::Timeline),
             ],
+            Cmd::SavedView(id) => vec![Action::ApplySavedView(*id)],
         }
     }
 }
@@ -52,6 +54,9 @@ fn undo_scope() -> Vec<Action> {
 fn open_export() -> Vec<Action> {
     vec![Action::OpenExport]
 }
+fn open_board() -> Vec<Action> {
+    vec![Action::OpenBoard]
+}
 
 pub fn toggle(palette: &mut PaletteState) {
     palette.open = !palette.open;
@@ -64,6 +69,8 @@ pub fn show_palette(
     _theme: &Theme,
     palette: &mut PaletteState,
     hosts: &[String],
+    saved_views: &[SavedView],
+    board_count: usize,
     actions_out: &mut Vec<Action>,
 ) {
     if !palette.open {
@@ -88,7 +95,7 @@ pub fn show_palette(
             }
 
             let id_jump = id_query_action(palette.query.trim());
-            let commands = build_commands(hosts);
+            let commands = build_commands(hosts, saved_views, board_count);
             let matches: Vec<&Command> = if id_jump.is_some() {
                 Vec::new()
             } else {
@@ -163,7 +170,7 @@ pub fn show_palette(
     }
 }
 
-fn build_commands(hosts: &[String]) -> Vec<Command> {
+fn build_commands(hosts: &[String], saved_views: &[SavedView], board_count: usize) -> Vec<Command> {
     let mut out = Vec::new();
     for view in View::ALL {
         out.push(Command {
@@ -177,6 +184,18 @@ fn build_commands(hosts: &[String]) -> Vec<Command> {
             title: format!("theme {theme}"),
             hint: "switch the colour theme".to_string(),
             run: Cmd::Theme(theme),
+        });
+    }
+    out.push(Command {
+        title: format!("open board ({board_count})"),
+        hint: "review, reorder, annotate and export pinned items".into(),
+        run: Cmd::Actions(vec![open_board]),
+    });
+    for sv in saved_views {
+        out.push(Command {
+            title: format!("view: {}", sv.name),
+            hint: format!("apply saved scope and open {}", sv.view.label()),
+            run: Cmd::SavedView(sv.id),
         });
     }
     out.push(Command {

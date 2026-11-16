@@ -31,6 +31,7 @@ pub fn show_help(ctx: &egui::Context, theme: &Theme, open: &mut bool) {
                         ("Ctrl++ / Ctrl+- / Ctrl+0", "zoom in / out / reset"),
                         ("/", "focus the search box"),
                         ("f / i", "toggle the facets / inspector panels"),
+                        ("b", "toggle the session story board"),
                         (
                             "Alt+Left / Alt+Right",
                             "back / forward in selection history",

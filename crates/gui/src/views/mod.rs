@@ -1,3 +1,4 @@
+pub mod board;
 pub mod collect;
 pub mod dashboard;
 pub mod diff;

@@ -6,7 +6,7 @@ use eframe::egui;
 use fp_core::Confidence;
 use fp_query::{LinkDirection, Tz};
 
-use crate::model::{Action, LoadStatus, Model, ScopeAction, Selection, View};
+use crate::model::{Action, BoardDraft, LoadStatus, Model, ScopeAction, Selection, View};
 use crate::theme::Theme;
 use crate::vm::DetailVm;
 use crate::widgets::badge::{ConfidenceGlyph, confidence_disc};
@@ -65,7 +65,7 @@ pub fn show_inspector(
             show_event_inspector(ui, id, model, theme, tz, actions);
         }
         Selection::State(id) => {
-            show_state_inspector(ui, id, model, theme);
+            show_state_inspector(ui, id, model, theme, actions);
         }
         Selection::Ioc(id) => {
             show_ioc_inspector(ui, id, model, theme, actions);
@@ -241,6 +241,31 @@ fn show_event_inspector(
                 if ui.button("Copy ID").clicked() {
                     ui.ctx().copy_text(detail.id.to_string());
                 }
+                show_board_pin_button(
+                    ui,
+                    model,
+                    &Selection::Event(detail.id),
+                    || BoardDraft {
+                        target: Selection::Event(detail.id),
+                        kind: detail.kind.as_str().to_string(),
+                        when: (!detail.untimed).then(|| {
+                            fp_query::format_time(detail.ts_utc, "second", tz, "%Y-%m-%d %H:%M:%S")
+                        }),
+                        summary: detail
+                            .subject
+                            .as_ref()
+                            .filter(|s| !s.is_empty())
+                            .or(detail.summary.as_ref())
+                            .map(|s| s.as_str().to_string())
+                            .unwrap_or_else(|| detail.kind.as_str().to_string()),
+                        detail: detail
+                            .subject_host
+                            .as_ref()
+                            .map(|h| h.as_str().to_string())
+                            .unwrap_or_else(|| detail.source.as_str().to_string()),
+                    },
+                    actions,
+                );
             });
         });
 }
@@ -291,6 +316,19 @@ fn show_ioc_inspector(
             actions.push(Action::Scope(crate::model::ScopeAction::SetIocOnly(true)));
             actions.push(Action::Go(crate::model::View::Timeline));
         }
+        show_board_pin_button(
+            ui,
+            model,
+            &Selection::Ioc(ioc.id),
+            || BoardDraft {
+                target: Selection::Ioc(ioc.id),
+                kind: format!("ioc: {}", ioc.ioc_type.as_str()),
+                when: None,
+                summary: ioc.value.as_str().to_string(),
+                detail: format!("{} linked hits", thousands(ioc.hits)),
+            },
+            actions,
+        );
     });
 }
 
@@ -336,7 +374,13 @@ fn show_source_inspector(ui: &mut egui::Ui, source_id: u64, model: &Model, theme
     }
 }
 
-fn show_state_inspector(ui: &mut egui::Ui, rowid: i64, model: &Model, theme: &Theme) {
+fn show_state_inspector(
+    ui: &mut egui::Ui,
+    rowid: i64,
+    model: &Model,
+    theme: &Theme,
+    actions: &mut Vec<Action>,
+) {
     let Some(row) = model
         .states
         .value()
@@ -374,6 +418,24 @@ fn show_state_inspector(ui: &mut egui::Ui, rowid: i64, model: &Model, theme: &Th
             ui.label(egui::RichText::new(line).small().weak());
         }
     }
+    ui.add_space(4.0);
+    show_board_pin_button(
+        ui,
+        model,
+        &Selection::State(row.rowid),
+        || BoardDraft {
+            target: Selection::State(row.rowid),
+            kind: format!("state: {}", row.kind.as_str()),
+            when: None,
+            summary: row.key.as_str().to_string(),
+            detail: row
+                .locator
+                .as_ref()
+                .map(|l| l.as_str().to_string())
+                .unwrap_or_default(),
+        },
+        actions,
+    );
     ui.separator();
     match &row.value {
         crate::vm::SafeJson::Null => {
@@ -382,6 +444,28 @@ fn show_state_inspector(ui: &mut egui::Ui, rowid: i64, model: &Model, theme: &Th
         }
         value => {
             show_json_tree(ui, "state_value", value, theme);
+        }
+    }
+}
+
+fn show_board_pin_button(
+    ui: &mut egui::Ui,
+    model: &Model,
+    target: &Selection,
+    draft: impl FnOnce() -> BoardDraft,
+    actions: &mut Vec<Action>,
+) {
+    let on_board = model.board.contains(target);
+    let label = if on_board { "On Board" } else { "Add to Board" };
+    if ui
+        .selectable_label(on_board, label)
+        .on_hover_text("pin or unpin this item on the session story board (b)")
+        .clicked()
+    {
+        if on_board {
+            actions.push(Action::UnpinBoardTarget(target.clone()));
+        } else {
+            actions.push(Action::PinToBoard(draft()));
         }
     }
 }

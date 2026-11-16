@@ -2,10 +2,15 @@
 //! [`Model::apply`] is the only mutator, which is what makes the GUI testable
 //! without a window.
 
+pub mod board;
 pub mod data;
 pub mod nav;
 pub mod scope;
 
+pub use board::{
+    Board, BoardDraft, BoardExportFormat, BoardItem, SavedView, SavedViews, target_label,
+    view_for_selection,
+};
 pub use data::{LoadStatus, Slot};
 pub use nav::{Nav, Selection, View};
 pub use scope::{Chip, ChipRemove, Scope};
@@ -176,6 +181,27 @@ pub enum Action {
     SetTheme(String),
     /// open the export dialog (handled by the shell)
     OpenExport,
+    /// open or focus the session story board (handled by the shell)
+    OpenBoard,
+    PinToBoard(BoardDraft),
+    UnpinBoardItem(u64),
+    UnpinBoardTarget(Selection),
+    MoveBoardItem {
+        index: usize,
+        delta: isize,
+    },
+    SetBoardNote {
+        id: u64,
+        note: String,
+    },
+    ClearBoard,
+    SaveView(String),
+    ApplySavedView(u64),
+    RenameSavedView {
+        id: u64,
+        name: String,
+    },
+    RemoveSavedView(u64),
     IocWriteDone(Result<String, String>),
     DismissIocStatus,
     SetGroupBy(Option<fp_query::overview::GroupBy>),
@@ -316,6 +342,8 @@ pub struct Model {
     pub diff_gen: Generation,
     /// the two runs the diff view compares; `None` until the view picks a default
     pub pending_diff: Option<(u64, u64)>,
+    pub board: Board,
+    pub saved_views: SavedViews,
 }
 
 impl Model {
@@ -651,9 +679,50 @@ impl Model {
             Action::DismissIocStatus => {
                 self.ioc_status = None;
             }
+            Action::PinToBoard(draft) => {
+                self.board.pin(draft);
+            }
+            Action::UnpinBoardItem(id) => {
+                self.board.remove(id);
+            }
+            Action::UnpinBoardTarget(target) => {
+                self.board.remove_target(&target);
+            }
+            Action::MoveBoardItem { index, delta } => {
+                self.board.move_item(index, delta);
+            }
+            Action::SetBoardNote { id, note } => {
+                self.board.set_note(id, note);
+            }
+            Action::ClearBoard => {
+                self.board.clear();
+            }
+            Action::SaveView(name) => {
+                let filter = self.scope.filter();
+                let view = self.view();
+                self.saved_views.save(name, view, filter);
+            }
+            Action::ApplySavedView(id) => {
+                if let Some(sv) = self.saved_views.get(id).cloned() {
+                    if self.scope.set_filter(sv.filter) {
+                        self.scope_changed();
+                    }
+                    let prev = self.inspected();
+                    self.nav.navigate(sv.view, Selection::None);
+                    if self.inspected() != prev {
+                        self.selection_gen += 1;
+                    }
+                }
+            }
+            Action::RenameSavedView { id, name } => {
+                self.saved_views.rename(id, name);
+            }
+            Action::RemoveSavedView(id) => {
+                self.saved_views.remove(id);
+            }
             // handled by the shell before they reach the model
             Action::StartCollect | Action::CancelCollect | Action::ExportScope { .. } => {}
-            Action::SetTheme(_) | Action::OpenExport => {}
+            Action::SetTheme(_) | Action::OpenExport | Action::OpenBoard => {}
         }
     }
 

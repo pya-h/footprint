@@ -216,7 +216,7 @@ pub fn show_timeline_table(
                         );
                     }
                     row_resp.context_menu(|ui| {
-                        show_row_context_menu(ui, &row, model, actions);
+                        show_row_context_menu(ui, &row, model, tz, actions);
                     });
                 });
             });
@@ -507,7 +507,13 @@ fn handle_keyboard_nav(
     }
 }
 
-fn show_row_context_menu(ui: &mut egui::Ui, row: &RowVm, model: &Model, actions: &mut Vec<Action>) {
+fn show_row_context_menu(
+    ui: &mut egui::Ui,
+    row: &RowVm,
+    model: &Model,
+    tz: Tz,
+    actions: &mut Vec<Action>,
+) {
     let host = row.subject_host.as_str();
     if ui
         .add_enabled(!host.is_empty(), egui::Button::new("Filter to this host"))
@@ -543,6 +549,36 @@ fn show_row_context_menu(ui: &mut egui::Ui, row: &RowVm, model: &Model, actions:
         ui.close();
     }
     ui.separator();
+    let target = Selection::Event(row.id);
+    let on_board = model.board.contains(&target);
+    let board_label = if on_board {
+        "Remove from Board"
+    } else {
+        "Add to Board"
+    };
+    if ui.button(board_label).clicked() {
+        if on_board {
+            actions.push(Action::UnpinBoardTarget(target));
+        } else {
+            actions.push(Action::PinToBoard(crate::model::BoardDraft {
+                target,
+                kind: row.kind.as_str().to_string(),
+                when: (!row.untimed)
+                    .then(|| fp_query::format_time(row.ts_utc, "second", tz, "%Y-%m-%d %H:%M:%S")),
+                summary: if row.subject.is_empty() {
+                    row.summary.as_str().to_string()
+                } else {
+                    row.subject.as_str().to_string()
+                },
+                detail: if row.subject_host.is_empty() {
+                    row.source.as_str().to_string()
+                } else {
+                    row.subject_host.as_str().to_string()
+                },
+            }));
+        }
+        ui.close();
+    }
     if ui.button("Trace").clicked() {
         actions.push(Action::Go(View::Trace));
         actions.push(Action::Select(Selection::Event(row.id)));

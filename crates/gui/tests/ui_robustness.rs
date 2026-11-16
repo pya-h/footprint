@@ -315,3 +315,121 @@ fn narrow_viewport_uses_drawers_at_1100x700() {
     harness.step();
     assert_eq!(harness.query_all_by_label("close inspector").count(), 0);
 }
+
+#[test]
+fn concurrent_collect_while_gui_reads_stays_consistent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let evidence = dir.path().join("evidence");
+    fp_fixtures::fake_zoom(&evidence).expect("fake_zoom");
+    let db = dir.path().join("case.db");
+    {
+        let mut store = Store::open_or_create(&db).expect("create initial case");
+        let run_id = store
+            .insert_run(&fp_store::NewRun {
+                host: "workstation",
+                user: "paya",
+                uid: 1000,
+                euid: 1000,
+                version: "0.1.0",
+                tz: "UTC",
+                args: "seed",
+            })
+            .expect("insert run");
+        store
+            .conn()
+            .execute(
+                "INSERT INTO sources (run_id, kind, app, profile, status) VALUES (?1, 'shell.history', 'bash', NULL, 'ok')",
+                rusqlite::params![run_id],
+            )
+            .expect("insert source");
+        store
+            .conn()
+            .execute(
+                "INSERT INTO events
+                    (run_id, source_id, ts_utc, ts_precision, kind, subject, confidence, dedup_key)
+                 VALUES (?1, 1, 1_760_647_493_000_000, 'exact', 'shell.command', 'echo seed', 'direct', 'seed-1')",
+                rusqlite::params![run_id],
+            )
+            .expect("insert event");
+    }
+
+    let worker = Worker::spawn(&db, 2, || {}).expect("spawn worker");
+
+    let collect_db = db.clone();
+    let collect_home = evidence.join("home/u");
+    let collect_root = evidence.join("root");
+    let collect_handle = std::thread::spawn(move || {
+        fp_query::run_collect(
+            &collect_db,
+            &fp_query::CollectParams {
+                since: Some(format!("@{}", fp_fixtures::local(0, 0, 0))),
+                until: Some(format!("@{}", fp_fixtures::local(23, 59, 59))),
+                assume_tz: Some(fp_fixtures::SCENARIO_TZ.into()),
+                homes: vec![collect_home],
+                root: collect_root,
+                ..Default::default()
+            },
+            None,
+        )
+    });
+
+    // Interleave active reads while run_collect ingests in parallel.
+    let mut generation = 1u64;
+    while !collect_handle.is_finished() {
+        worker.submit(ReqKind::Count, None, generation, |store| {
+            Ok(Box::new(store.count_events(&Default::default())?))
+        });
+        worker.submit(ReqKind::Page, None, generation, |store| {
+            Ok(Box::new(store.list_events(&fp_store::EventFilter {
+                limit: Some(50),
+                ..Default::default()
+            })?))
+        });
+        for resp in worker.poll() {
+            if let Err(err) = resp.result {
+                assert!(
+                    matches!(err, QueryError::Interrupted),
+                    "unexpected concurrent error: {err:?}"
+                );
+            }
+        }
+        generation += 1;
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let summary = collect_handle
+        .join()
+        .expect("collect thread joined")
+        .expect("run_collect succeeded");
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+
+    // Drain any in-flight work, then verify a clean post-collect read sees all events.
+    let _ = worker.poll();
+    let final_id = worker.submit(ReqKind::Count, None, generation + 1, |store| {
+        Ok(Box::new(store.count_events(&Default::default())?))
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut final_count = None;
+    while Instant::now() < deadline {
+        for resp in worker.poll() {
+            if resp.id == final_id {
+                let count = *resp
+                    .result
+                    .expect("final count ok")
+                    .downcast::<u64>()
+                    .expect("u64");
+                final_count = Some(count);
+                break;
+            }
+        }
+        if final_count.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let count = final_count.expect("final count response arrived");
+    assert!(
+        count > 1,
+        "expected collected events beyond initial seed, got {count}"
+    );
+}

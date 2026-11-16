@@ -12,6 +12,7 @@ use fp_query::overview::{Facet, HostSort, LaneMode, TimeWindow};
 use crate::model::{Action, Counts, LoadStatus, Model, ScopeAction, Selection, View};
 use crate::settings::Settings;
 use crate::theme::{Theme, ThemeName};
+use crate::views::board::{BoardWindowState, show_board_window};
 use crate::views::collect::{
     CollectRun, CollectViewState, InstanceRow, InstanceState, show_collect,
 };
@@ -31,7 +32,9 @@ use crate::vm::{
     LanesDataVm, RowVm, RunMarkerVm, SafeText, SourceHealthVm, SourceIssueVm, SourcesDataVm,
     StateRowVm, TraceVm, UntimedLaneVm,
 };
-use crate::widgets::chip::{ChipEditorState, show_scope_bar, thousands};
+use crate::widgets::chip::{
+    ChipEditorState, SavedViewsUiState, ScopeBarCtx, show_scope_bar, thousands,
+};
 use crate::widgets::event_table::TableState;
 use crate::widgets::facets::{FacetsState, show_facets};
 use crate::widgets::inspector::show_inspector;
@@ -84,6 +87,8 @@ pub struct Shell {
     ioc_state: IocViewState,
     collect_state: CollectViewState,
     export_dialog: ExportDialog,
+    board_state: BoardWindowState,
+    saved_views_ui: SavedViewsUiState,
     palette: PaletteState,
     help_open: bool,
     focus_search_next: bool,
@@ -236,6 +241,8 @@ impl Shell {
             ioc_state: IocViewState::default(),
             collect_state: CollectViewState::default(),
             export_dialog: ExportDialog::default(),
+            board_state: BoardWindowState::default(),
+            saved_views_ui: SavedViewsUiState::default(),
             palette: PaletteState::default(),
             help_open: false,
             submitted_states: None,
@@ -272,6 +279,10 @@ impl Shell {
         }
         if matches!(action, Action::OpenExport) {
             self.export_dialog.open_default(&self.case);
+            return;
+        }
+        if matches!(action, Action::OpenBoard) {
+            self.board_state.open_default(&self.case);
             return;
         }
         if let Action::ExportScope {
@@ -1285,8 +1296,12 @@ impl Shell {
             } else if self.export_dialog.open {
                 self.export_dialog.open = false;
                 self.export_dialog.running = None;
+            } else if self.board_state.open {
+                self.board_state.close();
             } else if self.ioc_state.dialog.is_some() {
                 self.ioc_state.dialog = None;
+            } else if self.saved_views_ui.is_open() {
+                self.saved_views_ui.close();
             } else if self.chip_editor.is_open() {
                 self.chip_editor.close();
             } else if self.model.selection() != Selection::None {
@@ -1326,6 +1341,9 @@ impl Shell {
         }
         if ui.input(|i| i.key_pressed(egui::Key::I) && !i.modifiers.any()) {
             self.settings.panels.inspector_collapsed = !self.settings.panels.inspector_collapsed;
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::B) && !i.modifiers.any()) {
+            self.board_state.toggle(&self.case);
         }
         if ui.input(|i| {
             i.key_pressed(egui::Key::Questionmark)
@@ -1494,6 +1512,18 @@ impl Shell {
                 tz_resp.response.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Time zone")
                 });
+                let board_label = if self.model.board.is_empty() {
+                    "board".to_string()
+                } else {
+                    format!("board ({})", self.model.board.len())
+                };
+                if ui
+                    .selectable_label(self.board_state.open, board_label)
+                    .on_hover_text("open the session story board (b)")
+                    .clicked()
+                {
+                    self.board_state.toggle(&self.case);
+                }
                 if ui
                     .small_button("export")
                     .on_hover_text("write the events in the current scope to a file")
@@ -1534,10 +1564,14 @@ impl Shell {
         let mut actions = Vec::new();
         show_scope_bar(
             ui,
-            &self.model.scope,
-            counts,
-            self.tz,
+            ScopeBarCtx {
+                scope: &self.model.scope,
+                saved_views: &self.model.saved_views,
+                counts,
+                tz: self.tz,
+            },
             &mut self.chip_editor,
+            &mut self.saved_views_ui,
             &mut actions,
         );
         self.apply_all(actions);
@@ -1975,7 +2009,23 @@ impl Shell {
                 .or_else(|| self.model.dashboard_hosts.value())
                 .map(|rows| rows.iter().map(|h| h.host.as_str().to_string()).collect())
                 .unwrap_or_default();
-            show_palette(ui.ctx(), &theme, &mut self.palette, &hosts, &mut actions);
+            show_board_window(
+                ui.ctx(),
+                &theme,
+                &self.case,
+                &self.model,
+                &mut self.board_state,
+                &mut actions,
+            );
+            show_palette(
+                ui.ctx(),
+                &theme,
+                &mut self.palette,
+                &hosts,
+                self.model.saved_views.list(),
+                self.model.board.len(),
+                &mut actions,
+            );
             show_help(ui.ctx(), &theme, &mut self.help_open);
             self.apply_all(actions);
         }

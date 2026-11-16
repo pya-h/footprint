@@ -177,6 +177,12 @@ impl Scope {
         self.edit(|f| f.ioc_only = on);
     }
 
+    pub fn set_filter(&mut self, next: TimelineFilter) -> bool {
+        let before = self.filter.clone();
+        self.edit(|f| *f = next);
+        self.filter != before
+    }
+
     pub fn show_untimed(&mut self) {
         self.edit(|f| {
             f.since = None;

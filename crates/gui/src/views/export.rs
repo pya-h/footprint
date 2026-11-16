@@ -35,7 +35,7 @@ impl ExportDialog {
     }
 }
 
-fn chrono_now_stamp() -> String {
+pub(crate) fn chrono_now_stamp() -> String {
     fp_query::format_time(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
