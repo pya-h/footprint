@@ -7,7 +7,7 @@ use eframe::egui;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use fp_gui::app::Shell;
-use fp_gui::model::{Action, View};
+use fp_gui::model::{Action, Selection, View};
 use fp_gui::settings::Settings;
 use fp_query::Tz;
 use fp_store::Store;
@@ -148,18 +148,21 @@ fn state_view_filters_kinds_and_explains_flags() {
     harness.step();
     harness.step();
     harness.get_by_label("web.site_permission  2").click();
-    harness.step();
+    // the kind change re-queries state rows; wait for the permissions set to arrive
+    pump_until(&mut harness, |s| {
+        s.model().states.value().is_some_and(|rows| {
+            rows.iter()
+                .any(|r| r.key.as_str().contains("media_stream_camera"))
+        })
+    });
     harness.get_by_label_contains("media_stream_camera").click();
-    // the accesskit tree lags the model by one frame: settle before asserting
+    pump_until(&mut harness, |s| {
+        matches!(s.model().selection(), Selection::State(_))
+    });
     harness.step();
     harness.step();
-    // the key now appears twice: once in the table, once as the inspector header
-    assert!(
-        harness
-            .get_all_by_label_contains("us09-web-zoom.com:443|media_stream_camera")
-            .count()
-            >= 2
-    );
+    // the table cell ellipsizes long keys, so the full key appears only in the inspector header
+    harness.get_by_label("brave/Default|https://us09-web-zoom.com:443|media_stream_camera");
     harness.get_by_label("decision:");
 
     // the unowned service explains itself in the inspector

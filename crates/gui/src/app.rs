@@ -10,7 +10,7 @@ use eframe::egui;
 use fp_query::overview::{Facet, HostSort, LaneMode, TimeWindow};
 
 use crate::model::{Action, Counts, LoadStatus, Model, ScopeAction, Selection, View};
-use crate::settings::Settings;
+use crate::settings::{Settings, UI_SCALE_MAX, UI_SCALE_MIN};
 use crate::theme::{Theme, ThemeName};
 use crate::views::board::{BoardWindowState, show_board_window};
 use crate::views::collect::{
@@ -43,6 +43,15 @@ use crate::widgets::strip::StripState;
 use crate::worker::cache::BLOCK_SIZE;
 use crate::worker::{BlockCache, Generation, QueryError, ReqKind, Worker};
 
+const VIEW_FADE_SECS: f32 = 0.18;
+/// a fade from full transparency reads as a flicker on fast view switches
+const VIEW_FADE_FLOOR: f32 = 0.3;
+const DRAWER_SLIDE_SECS: f32 = 0.2;
+/// Wide enough that the longest view name stays on one line beside its number.
+const RAIL_WIDTH: f32 = 128.0;
+const SEARCH_MIN_WIDTH: f32 = 140.0;
+const SEARCH_MAX_WIDTH: f32 = 320.0;
+
 pub struct Shell {
     ctx: egui::Context,
     case: PathBuf,
@@ -52,8 +61,11 @@ pub struct Shell {
     settings_warning: Option<String>,
     model: Model,
     last_view: View,
-    view_transition: u64,
+    view_entered_at: f64,
     narrow_drawer: Option<NarrowDrawer>,
+    top_right_width: f32,
+    shown_drawer: Option<NarrowDrawer>,
+    drawer_opened_at: f64,
     worker: Option<Worker>,
     startup_error: Option<String>,
     search: String,
@@ -221,8 +233,11 @@ impl Shell {
             settings_warning,
             model,
             last_view,
-            view_transition: 0,
+            view_entered_at: 0.0,
             narrow_drawer: None,
+            top_right_width: 0.0,
+            shown_drawer: None,
+            drawer_opened_at: 0.0,
             worker: worker.ok(),
             startup_error,
             search: String::new(),
@@ -287,13 +302,7 @@ impl Shell {
             if let Some(theme) = parse_theme(name) {
                 self.theme = theme;
                 self.settings.theme = theme;
-                let ctx = self.ctx.clone();
-                apply_theme(
-                    self.theme,
-                    self.settings.ui_scale,
-                    self.settings.reduced_motion,
-                    &ctx,
-                );
+                self.reapply_theme(&self.ctx);
             }
             return;
         }
@@ -1479,13 +1488,7 @@ impl Shell {
             self.zoom_by(ui, 0.1);
         }
         if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Num0)) {
-            self.settings.ui_scale = 1.0;
-            apply_theme(
-                self.theme,
-                self.settings.ui_scale,
-                self.settings.reduced_motion,
-                ui.ctx(),
-            );
+            self.set_ui_scale(ui, 1.0);
         }
         for (i, key) in [
             egui::Key::Num1,
@@ -1565,13 +1568,69 @@ impl Shell {
     }
 
     fn zoom_by(&mut self, ui: &egui::Ui, delta: f32) {
-        self.settings.ui_scale = (self.settings.ui_scale + delta).clamp(0.8, 1.6);
+        self.set_ui_scale(ui, self.settings.ui_scale + delta);
+    }
+
+    fn set_ui_scale(&mut self, ui: &egui::Ui, scale: f32) {
+        self.settings.ui_scale = scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+        self.reapply_theme(ui.ctx());
+    }
+
+    fn reapply_theme(&self, ctx: &egui::Context) {
         apply_theme(
             self.theme,
             self.settings.ui_scale,
             self.settings.reduced_motion,
-            ui.ctx(),
+            ctx,
         );
+    }
+
+    fn appearance_menu(&mut self, ui: &mut egui::Ui) {
+        kit::section_label(ui, &self.active_theme(), "theme");
+        for (name, label) in [
+            (ThemeName::Dark, "dark"),
+            (ThemeName::Light, "light"),
+            (ThemeName::HighContrast, "high contrast"),
+        ] {
+            if ui.selectable_label(self.theme == name, label).clicked() {
+                self.theme = name;
+                self.settings.theme = name;
+                self.reapply_theme(ui.ctx());
+            }
+        }
+        ui.separator();
+        if ui
+            .checkbox(&mut self.settings.reduced_motion, "reduce motion")
+            .changed()
+        {
+            self.reapply_theme(ui.ctx());
+        }
+        ui.separator();
+        kit::section_label(ui, &self.active_theme(), "interface scale");
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("-")
+                .on_hover_text("smaller (Ctrl -)")
+                .clicked()
+            {
+                self.zoom_by(ui, -0.1);
+            }
+            ui.label(format!("{:.0}%", self.settings.ui_scale * 100.0));
+            if ui
+                .small_button("+")
+                .on_hover_text("larger (Ctrl +)")
+                .clicked()
+            {
+                self.zoom_by(ui, 0.1);
+            }
+            if ui
+                .small_button("reset")
+                .on_hover_text("100% (Ctrl 0)")
+                .clicked()
+            {
+                self.set_ui_scale(ui, 1.0);
+            }
+        });
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -1626,11 +1685,9 @@ impl Shell {
             if let Some(r) = next_run {
                 self.apply(Action::Scope(ScopeAction::SetRun(r)));
             }
-            let search_w = if ui.ctx().content_rect().width() < 1280.0 {
-                200.0
-            } else {
-                280.0
-            };
+            // last frame's right-hand group, since the right-to-left layout is laid out after
+            let search_w = (ui.available_width() - self.top_right_width - 24.0)
+                .clamp(SEARCH_MIN_WIDTH, SEARCH_MAX_WIDTH);
             let response = ui.add_sized(
                 [search_w, 20.0],
                 egui::TextEdit::singleline(&mut self.search)
@@ -1646,47 +1703,16 @@ impl Shell {
                 response.surrender_focus();
             }
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let right = ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if kit::primary_button(ui, &theme, "Collect")
                     .on_hover_text("open the collect view (0)")
                     .clicked()
                 {
                     self.apply(Action::Go(View::Collect));
                 }
-                let theme_label = match self.theme {
-                    ThemeName::Dark => "theme: dark",
-                    ThemeName::Light => "theme: light",
-                    ThemeName::HighContrast => "theme: contrast",
-                };
-                if ui
-                    .button(theme_label)
-                    .on_hover_text("switch theme")
-                    .clicked()
-                {
-                    self.theme = match self.theme {
-                        ThemeName::Dark => ThemeName::Light,
-                        ThemeName::Light => ThemeName::HighContrast,
-                        ThemeName::HighContrast => ThemeName::Dark,
-                    };
-                    self.settings.theme = self.theme;
-                    apply_theme(
-                        self.theme,
-                        self.settings.ui_scale,
-                        self.settings.reduced_motion,
-                        ui.ctx(),
-                    );
-                }
-                if ui
-                    .checkbox(&mut self.settings.reduced_motion, "reduce motion")
-                    .changed()
-                {
-                    apply_theme(
-                        self.theme,
-                        self.settings.ui_scale,
-                        self.settings.reduced_motion,
-                        ui.ctx(),
-                    );
-                }
+                ui.menu_button("appearance", |ui| self.appearance_menu(ui))
+                    .response
+                    .on_hover_text("theme, motion and interface scale");
                 let tz_resp = egui::ComboBox::from_id_salt("tz_combo")
                     .selected_text(self.tz_label())
                     .width(74.0)
@@ -1757,7 +1783,9 @@ impl Shell {
                             !self.settings.panels.facets_collapsed;
                     }
                 }
+                ui.min_rect().width()
             });
+            self.top_right_width = right.inner;
         });
     }
 
@@ -2106,20 +2134,27 @@ impl Shell {
             .show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("rail")
             .resizable(false)
-            .default_size(112.0)
+            .default_size(RAIL_WIDTH)
+            .min_size(RAIL_WIDTH)
             .frame(egui::Frame::side_top_panel(ui.style()).fill(theme.bg1))
             .show(ui, |ui| self.rail(ui));
 
         let current_view = self.model.view();
         if current_view != self.last_view {
             self.last_view = current_view;
-            self.view_transition = self.view_transition.wrapping_add(1);
+            self.view_entered_at = ui.input(|i| i.time);
             self.narrow_drawer = None;
         }
         let narrow = ui.ctx().content_rect().width() < 1280.0;
         if !narrow {
             self.narrow_drawer = None;
         }
+        if self.narrow_drawer != self.shown_drawer {
+            self.shown_drawer = self.narrow_drawer;
+            self.drawer_opened_at = ui.input(|i| i.time);
+        }
+        let drawer_progress =
+            kit::entrance(ui.ctx(), self.drawer_opened_at, DRAWER_SLIDE_SECS, &theme);
         let show_facets_panel = !self.case_missing
             && self.model.view() == View::Timeline
             && (if narrow {
@@ -2172,26 +2207,11 @@ impl Shell {
             self.apply_all(resp.inner);
         }
 
-        let central_resp = egui::CentralPanel::default().show(ui, |ui| self.main(ui));
-        if !theme.reduced_motion {
-            let progress = ui.ctx().animate_value_with_time(
-                egui::Id::NULL.with(("view_fade", self.view_transition)),
-                1.0,
-                0.16,
-            );
-            if progress < 1.0 {
-                ui.ctx()
-                    .layer_painter(egui::LayerId::new(
-                        egui::Order::Foreground,
-                        egui::Id::NULL.with("view_fade_overlay"),
-                    ))
-                    .rect_filled(
-                        central_resp.response.rect,
-                        0.0,
-                        theme.bg0.gamma_multiply(1.0 - progress),
-                    );
-            }
-        }
+        let view_progress = kit::entrance(ui.ctx(), self.view_entered_at, VIEW_FADE_SECS, &theme);
+        let central_resp = egui::CentralPanel::default().show(ui, |ui| {
+            ui.multiply_opacity(VIEW_FADE_FLOOR + (1.0 - VIEW_FADE_FLOOR) * view_progress);
+            self.main(ui);
+        });
         if narrow && (show_facets_panel || show_inspector_panel) {
             let theme = self.active_theme();
             let area_rect = central_resp.response.rect;
@@ -2209,6 +2229,7 @@ impl Shell {
                         width: drawer_w,
                         height: area_rect.height(),
                         from_right: false,
+                        progress: drawer_progress,
                     },
                     &mut close,
                     |ui| {
@@ -2244,6 +2265,7 @@ impl Shell {
                         width: drawer_w,
                         height: area_rect.height(),
                         from_right: true,
+                        progress: drawer_progress,
                     },
                     &mut close,
                     |ui| {
@@ -2305,6 +2327,8 @@ struct DrawerSpec<'a> {
     width: f32,
     height: f32,
     from_right: bool,
+    /// eased 0→1 slide-in progress
+    progress: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2353,17 +2377,13 @@ fn show_side_drawer(
     close: &mut bool,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
-    let progress = if theme.reduced_motion {
-        1.0
-    } else {
-        ctx.animate_bool_with_time(egui::Id::NULL.with((spec.id, "slide")), true, 0.18)
-    };
-    let offset = spec.width * (1.0 - progress);
+    let offset = spec.width * (1.0 - spec.progress);
     let pos = spec.pos + egui::vec2(if spec.from_right { offset } else { -offset }, 0.0);
     egui::Area::new(egui::Id::NULL.with(spec.id))
         .order(egui::Order::Middle)
         .fixed_pos(pos)
         .show(ctx, |ui| {
+            ui.multiply_opacity(spec.progress);
             egui::Frame::window(ui.style())
                 .fill(theme.bg1)
                 .stroke(egui::Stroke::new(1.0, theme.border))

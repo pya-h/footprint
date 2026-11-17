@@ -11,6 +11,7 @@ use fp_query::{CollectEvent, CollectParams};
 use crate::model::{Action, View};
 use crate::widgets::ViewCtx;
 use crate::widgets::chip::thousands;
+use crate::widgets::kit;
 
 /// standard form families ↔ source-kind prefixes; opt-ins (`with_live`,
 /// `with_scanners`) live in their own toggles so `--sources all` excludes them
@@ -226,8 +227,7 @@ pub fn show_collect(
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui
-                    .button("Start")
+                if kit::primary_button(ui, ctx.theme, "Start")
                     .on_hover_text("start collecting into this case")
                     .clicked()
                 {

@@ -9,6 +9,10 @@ pub const MIN_CONTRAST: f64 = 4.5;
 /// CIE76 distance above which two category colors read as clearly different.
 pub const MIN_CATEGORY_DELTA_E: f64 = 20.0;
 
+/// a light surface needs a softer shadow to read as depth rather than a smudge
+const LIGHT_SHADOW_ALPHA: u8 = 38;
+const DARK_SHADOW_ALPHA: u8 = 90;
+
 pub const CATEGORY_LETTERS: [char; 9] = ['W', 'D', 'P', 'A', 'S', 'F', 'R', 'E', 'O'];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -247,7 +251,10 @@ impl Theme {
             offset: [0, 6],
             blur: 18,
             spread: 0,
-            color: Color32::from_black_alpha(90),
+            color: Color32::from_black_alpha(match self.name {
+                ThemeName::Light => LIGHT_SHADOW_ALPHA,
+                ThemeName::Dark | ThemeName::HighContrast => DARK_SHADOW_ALPHA,
+            }),
         };
         visuals.popup_shadow = visuals.window_shadow;
         visuals.selection.bg_fill = self.accent;
@@ -374,6 +381,13 @@ mod tests {
                     theme.name
                 );
             }
+            let hovered = &visuals.widgets.hovered;
+            let hover_ratio = contrast(hovered.fg_stroke.color, hovered.bg_fill);
+            assert!(
+                hover_ratio >= MIN_CONTRAST,
+                "{:?} hovered text on hover fill: {hover_ratio:.2} < {MIN_CONTRAST}",
+                theme.name
+            );
             let sel_ratio = contrast(visuals.selection.stroke.color, visuals.selection.bg_fill);
             assert!(
                 sel_ratio >= MIN_CONTRAST,

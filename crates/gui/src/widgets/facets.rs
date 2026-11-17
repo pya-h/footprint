@@ -11,6 +11,9 @@ use crate::theme::{Theme, contrast};
 use crate::vm::SafeText;
 use crate::widgets::chip::thousands;
 
+const SHARE_BAR_WIDTH: f32 = 28.0;
+const SHARE_BAR_HEIGHT: f32 = 4.0;
+
 #[derive(Debug, Default)]
 pub struct FacetsState {
     pub kind_open: bool,
@@ -267,8 +270,8 @@ fn show_categories(
                 } else {
                     egui::RichText::new(thousands(count)).small()
                 };
-                let count_resp = ui.label(count_text);
-                draw_share_bar(ui, count_resp.rect, count, max_count, excluded, theme);
+                ui.label(count_text);
+                draw_share_bar(ui, count, max_count, excluded, theme);
             });
         });
     }
@@ -364,9 +367,8 @@ fn show_collapsing_facet(
                         {
                             on_pick(raw, false, true);
                         }
-                        let count_resp =
-                            ui.label(egui::RichText::new(thousands(item.count)).small());
-                        draw_share_bar(ui, count_resp.rect, item.count, max_count, is_exc, theme);
+                        ui.label(egui::RichText::new(thousands(item.count)).small());
+                        draw_share_bar(ui, item.count, max_count, is_exc, theme);
                     });
                 });
             }
@@ -439,8 +441,8 @@ fn show_confidence_facet(
                         actions.push(Action::Scope(ScopeAction::SetConfidence(next)));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let r = ui.label(egui::RichText::new(thousands(item.count)).small());
-                        draw_share_bar(ui, r.rect, item.count, max_count, false, theme);
+                        ui.label(egui::RichText::new(thousands(item.count)).small());
+                        draw_share_bar(ui, item.count, max_count, false, theme);
                     });
                 });
             }
@@ -503,8 +505,8 @@ fn show_timing_facet(
                         actions.push(Action::Scope(ScopeAction::SetTiming(next)));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let r = ui.label(egui::RichText::new(thousands(count)).small());
-                        draw_share_bar(ui, r.rect, count, max_c, false, theme);
+                        ui.label(egui::RichText::new(thousands(count)).small());
+                        draw_share_bar(ui, count, max_c, false, theme);
                     });
                 });
             }
@@ -558,8 +560,8 @@ fn show_run_facet(
                         actions.push(Action::Scope(ScopeAction::SetRun(next)));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let r = ui.label(egui::RichText::new(thousands(item.count)).small());
-                        draw_share_bar(ui, r.rect, item.count, max_count, false, theme);
+                        ui.label(egui::RichText::new(thousands(item.count)).small());
+                        draw_share_bar(ui, item.count, max_count, false, theme);
                     });
                 });
             }
@@ -574,28 +576,28 @@ fn facet_header_text(title: &str, page: Option<&FacetPage>) -> String {
     }
 }
 
-fn draw_share_bar(
-    ui: &egui::Ui,
-    anchor: egui::Rect,
-    count: u64,
-    max: u64,
-    excluded: bool,
-    theme: &Theme,
-) {
+/// Allocated left of the count label in a right-to-left row, so the bar never
+/// overlaps the number it illustrates.
+fn draw_share_bar(ui: &mut egui::Ui, count: u64, max: u64, excluded: bool, theme: &Theme) {
+    let (track, _) = ui.allocate_exact_size(
+        egui::vec2(SHARE_BAR_WIDTH, SHARE_BAR_HEIGHT),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(track, 2.0, theme.bg2);
     if count == 0 || max == 0 {
         return;
     }
-    let width = (count as f32 / max as f32).clamp(0.04, 1.0) * 34.0;
-    let bar = egui::Rect::from_min_max(
-        egui::pos2(anchor.right() - width, anchor.bottom() - 2.0),
-        egui::pos2(anchor.right(), anchor.bottom()),
+    let width = (count as f32 / max as f32).clamp(0.06, 1.0) * track.width();
+    let fill = egui::Rect::from_min_size(
+        egui::pos2(track.right() - width, track.top()),
+        egui::vec2(width, track.height()),
     );
     let color = if excluded {
         theme.text_dim.linear_multiply(0.5)
     } else {
-        theme.accent.linear_multiply(0.55)
+        theme.accent.linear_multiply(0.7)
     };
-    ui.painter().rect_filled(bar, 1.0, color);
+    ui.painter().rect_filled(fill, 2.0, color);
 }
 
 fn parse_confidence(raw: &str) -> Option<fp_core::Confidence> {

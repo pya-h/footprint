@@ -70,6 +70,21 @@ pub fn remember_hover(ui: &Ui, id: Id, hovered: bool) {
     ui.data_mut(|d| d.insert_temp(id, hovered));
 }
 
+/// Eased 0→1 progress of an entrance transition that started at `started_at`
+/// (egui input time). egui's own `animate_*` helpers jump straight to the target
+/// the first time an id is seen, so entrances are timed from a remembered start.
+pub fn entrance(ctx: &egui::Context, started_at: f64, duration: f32, theme: &Theme) -> f32 {
+    if theme.reduced_motion {
+        return 1.0;
+    }
+    let elapsed = (ctx.input(|i| i.time) - started_at) as f32;
+    let linear = (elapsed / duration).clamp(0.0, 1.0);
+    if linear < 1.0 {
+        ctx.request_repaint();
+    }
+    1.0 - (1.0 - linear).powi(3)
+}
+
 pub fn nav_item(ui: &mut Ui, theme: &Theme, number: &str, label: &str, selected: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
     let (hover, active) = if theme.reduced_motion {

@@ -202,6 +202,10 @@ fn dashboard_kpis_category_bars_hosts_and_worth_a_look() {
     pump_until(&mut harness, |s| {
         s.model().view() == View::Dashboard && s.model().dashboard_hosts.value().is_some()
     });
+    // below 1000 px of central width the dashboard stacks, so the host card is below the fold
+    harness.get_by_label("us09-web-zoom.com").scroll_to_me();
+    // the scroll area eases toward the target over several frames
+    harness.run_steps(30);
     harness.get_by_label("us09-web-zoom.com").click();
     harness.step();
     assert_eq!(harness.state().model().view(), View::Timeline);

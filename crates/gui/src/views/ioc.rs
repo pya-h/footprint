@@ -46,16 +46,7 @@ pub fn show_iocs(
                 Err(err) => ui.colored_label(ctx.theme.danger, format!("IOC error: {err}")),
             };
             if ui.small_button("dismiss").clicked() {
-                kit::empty_state(
-                    ui,
-                    ctx.theme,
-                    if state.selected_ioc.is_some() {
-                        "no hits for this IOC"
-                    } else {
-                        "no IOC hits in this case"
-                    },
-                    "collect more evidence or add different indicators",
-                );
+                actions.push(Action::DismissIocStatus);
             }
         });
     }
@@ -243,15 +234,25 @@ fn render_hits(
             return;
         };
         if hits.is_empty() {
-            ui.label(egui::RichText::new("no hits — the case matches none of these").weak());
+            kit::empty_state(
+                ui,
+                ctx.theme,
+                if state.selected_ioc.is_some() {
+                    "no hits for this IOC"
+                } else {
+                    "no IOC hits in this case"
+                },
+                "collect more evidence or add different indicators",
+            );
             return;
         }
         egui::ScrollArea::vertical()
             .id_salt("ioc_hits_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for hit in hits {
-                    render_hit_row(ui, ctx.theme, model, hit, actions);
+                for (idx, hit) in hits.iter().enumerate() {
+                    render_hit_row(ui, ctx.theme, model, (idx, hit), actions);
+                    ui.add_space(4.0);
                 }
             });
     });
@@ -261,14 +262,14 @@ fn render_hit_row(
     ui: &mut egui::Ui,
     theme: &Theme,
     model: &crate::model::Model,
-    hit: &IocHitVm,
+    (idx, hit): (usize, &IocHitVm),
     actions: &mut Vec<Action>,
 ) {
     let label = format!(
         "{} · {} · {}   (matched: {})",
         hit.target_kind.as_str(),
         hit.target_id,
-        shorten(hit.target_label.as_str(), 60),
+        hit.target_label.as_str(),
         hit.ioc_value.as_str()
     );
     let default_hint = match hit.target_type.as_str() {
@@ -277,12 +278,50 @@ fn render_hit_row(
         "artifact" => "click to trace this matched artifact",
         _ => "matched IOC hit",
     };
-    let resp = ui
-        .selectable_label(
-            false,
-            egui::RichText::new(label).monospace().color(theme.text),
-        )
+    let card_id = ui.scope_id().with(("ioc_hit", idx));
+    let card = kit::card_frame(theme, kit::hover_amount(ui, card_id, theme))
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(hit.target_kind.as_str())
+                        .small()
+                        .strong()
+                        .color(theme.accent),
+                );
+                ui.label(
+                    egui::RichText::new(format!("#{}", hit.target_id))
+                        .small()
+                        .color(theme.text_dim),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(hit.ioc_value.as_str())
+                                .small()
+                                .color(theme.ioc),
+                        )
+                        .truncate(),
+                    );
+                    ui.label(egui::RichText::new("matched").small().color(theme.text_dim));
+                });
+            });
+            let font = egui::FontId::monospace(theme.base_font_size - 0.5);
+            let subject =
+                kit::middle_ellipsis(ui, hit.target_label.as_str(), &font, ui.available_width());
+            ui.add(
+                egui::Label::new(egui::RichText::new(subject).font(font).color(theme.text))
+                    .selectable(false),
+            );
+        });
+    let resp = card
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(hit.why.as_ref().map(|w| w.as_str()).unwrap_or(default_hint));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
+    kit::remember_hover(ui, card_id, resp.hovered());
     let selection = match hit.target_type.as_str() {
         "event" => Some(Selection::Event(hit.target_id)),
         "state" => i64::try_from(hit.target_id).ok().map(Selection::State),
@@ -320,15 +359,6 @@ fn render_hit_row(
             }
         });
     }
-}
-
-fn shorten(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 fn render_dialog(

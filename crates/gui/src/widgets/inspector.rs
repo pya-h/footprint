@@ -12,6 +12,7 @@ use crate::vm::DetailVm;
 use crate::widgets::badge::{ConfidenceGlyph, confidence_disc};
 use crate::widgets::chip::thousands;
 use crate::widgets::json_tree::show_json_tree;
+use crate::widgets::kit;
 
 pub fn show_inspector(
     ui: &mut egui::Ui,
@@ -470,8 +471,7 @@ fn show_board_pin_button(
 ) {
     let on_board = model.board.contains(target);
     let label = if on_board { "On Board" } else { "Add to Board" };
-    if ui
-        .selectable_label(on_board, label)
+    if kit::toggle(ui, on_board, label)
         .on_hover_text("pin or unpin this item on the session story board (b)")
         .clicked()
     {

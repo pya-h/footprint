@@ -51,8 +51,8 @@ pub struct Table {
     pub widths: std::collections::BTreeMap<String, f32>,
 }
 
-const UI_SCALE_MIN: f32 = 0.8;
-const UI_SCALE_MAX: f32 = 1.6;
+pub(crate) const UI_SCALE_MIN: f32 = 0.8;
+pub(crate) const UI_SCALE_MAX: f32 = 1.6;
 
 impl Default for Settings {
     fn default() -> Self {

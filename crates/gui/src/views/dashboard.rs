@@ -17,6 +17,9 @@ use crate::widgets::strip::{BandData, paint_histogram_band, x_to_ts};
 
 const HERO_HIST_HEIGHT: f32 = 88.0;
 const CLICK_DRAG_THRESHOLD_PX: f32 = 5.0;
+/// Below this central width the cards stack in one column.
+const TWO_COLUMN_MIN_WIDTH: f32 = 840.0;
+const CATEGORY_LABEL_WIDTH: f32 = 96.0;
 
 #[derive(Default)]
 pub struct DashboardState {
@@ -42,15 +45,15 @@ pub fn show_dashboard(
             ui.add_space(10.0);
 
             let avail = ui.available_width();
-            if avail >= 1000.0 {
+            if avail >= TWO_COLUMN_MIN_WIDTH {
                 ui.columns(2, |cols| {
                     render_activity_card(&mut cols[0], ctx, state, actions);
                     cols[0].add_space(8.0);
-                    render_worth_a_look(&mut cols[0], ctx, actions);
+                    render_top_hosts_card(&mut cols[0], ctx, actions);
 
-                    render_categories_card(&mut cols[1], ctx, actions);
+                    render_worth_a_look(&mut cols[1], ctx, actions);
                     cols[1].add_space(8.0);
-                    render_top_hosts_card(&mut cols[1], ctx, actions);
+                    render_categories_card(&mut cols[1], ctx, actions);
                 });
             } else {
                 render_activity_card(ui, ctx, state, actions);
@@ -463,15 +466,23 @@ fn render_categories_card(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Ve
             let color = theme.category_color(*cat);
             ui.horizontal(|ui| {
                 let (swatch_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(10.0, 12.0), egui::Sense::hover());
-                ui.painter()
-                    .rect_filled(swatch_rect.shrink(1.0), 2.0, color);
+                    ui.allocate_exact_size(egui::vec2(10.0, 18.0), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    egui::Rect::from_center_size(swatch_rect.center(), egui::vec2(9.0, 9.0)),
+                    2.0,
+                    color,
+                );
 
                 let btn = ui
-                    .add_sized(
-                        egui::vec2(96.0, 18.0),
-                        egui::Button::new(cat.label()).frame(false),
+                    .allocate_ui_with_layout(
+                        egui::vec2(CATEGORY_LABEL_WIDTH, 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_width(CATEGORY_LABEL_WIDTH);
+                            ui.add(egui::Button::new(cat.label()).frame(false))
+                        },
                     )
+                    .inner
                     .on_hover_text("click to filter to this category in Timeline");
                 if btn.clicked() {
                     let (kinds, kinds_not) = apply_category_click(&filter, *cat, multi, false);

@@ -41,7 +41,13 @@ fn setup_fake_zoom() -> (tempfile::TempDir, std::path::PathBuf) {
 fn new_shell(case_path: &Path, view: View) -> Shell {
     let ctx = egui::Context::default();
     let tz = fp_query::parse_tz(SCENARIO_TZ).expect("scenario tz");
-    let mut shell = Shell::new(case_path.to_path_buf(), tz, Settings::default(), None, &ctx);
+    // reduced motion makes entrance/hover animations instant, so `Harness::run` settles
+    // within the default step budget instead of racing the fade timers
+    let settings = Settings {
+        reduced_motion: true,
+        ..Settings::default()
+    };
+    let mut shell = Shell::new(case_path.to_path_buf(), tz, settings, None, &ctx);
     shell.apply(Action::Go(view));
     shell
 }

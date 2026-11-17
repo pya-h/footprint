@@ -149,6 +149,9 @@ fn ioc_view_lists_counts_selects_hits_and_removes() {
     harness.step();
     harness.get_by_label_contains("Removed IOC");
     harness.get_by_label_contains("no indicators yet");
+    harness.get_by_label("dismiss").click();
+    harness.step();
+    assert!(harness.state().model().ioc_status.is_none());
 }
 
 #[test]

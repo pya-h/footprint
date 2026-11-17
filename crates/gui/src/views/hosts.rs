@@ -291,24 +291,33 @@ fn sort_header_cell(
     actions: &mut Vec<Action>,
 ) {
     header.col(|ui| {
-        let label = if active == sort {
-            format!("{title} *")
-        } else {
-            title.to_string()
-        };
-        if ui
-            .add(
-                egui::Button::new(egui::RichText::new(label).small().strong().color(
-                    if active == sort {
+        let is_active = active == sort;
+        let resp =
+            ui.add(
+                egui::Button::new(egui::RichText::new(title).small().strong().color(
+                    if is_active {
                         theme.accent
                     } else {
                         theme.text_dim
                     },
                 ))
                 .frame(false),
-            )
-            .clicked()
-        {
+            );
+        if is_active {
+            let descending = matches!(sort, HostSort::EventsDesc | HostSort::LastInScopeDesc);
+            let c = egui::pos2(resp.rect.right() + 5.0, resp.rect.center().y);
+            let (tip_y, base_y) = if descending { (3.0, -2.0) } else { (-3.0, 2.0) };
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(c.x - 3.5, c.y + base_y),
+                    egui::pos2(c.x + 3.5, c.y + base_y),
+                    egui::pos2(c.x, c.y + tip_y),
+                ],
+                theme.accent,
+                egui::Stroke::NONE,
+            ));
+        }
+        if resp.clicked() {
             actions.push(Action::SetHostSort(sort));
         }
     });

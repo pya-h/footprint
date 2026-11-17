@@ -304,9 +304,9 @@ fn show_toolbar(
 ) {
     ui.horizontal_wrapped(|ui| {
         let sort_label = if model.reverse {
-            "Order: Newest first"
+            "newest first"
         } else {
-            "Order: Oldest first"
+            "oldest first"
         };
         if ui
             .button(sort_label)
@@ -327,25 +327,33 @@ fn show_toolbar(
             };
         }
 
+        ui.separator();
         let active_group = model.group_by;
-        egui::ComboBox::from_label("Group by")
+        ui.label(egui::RichText::new("group by").color(theme.text_dim));
+        let group_combo = egui::ComboBox::from_id_salt("timeline_group_by")
             .selected_text(group_by_label(active_group))
             .show_ui(ui, |ui| {
-                for (opt, name) in [
-                    (None, "None (rows)"),
-                    (Some(GroupBy::Host), "Host"),
-                    (Some(GroupBy::Source), "Source"),
-                    (Some(GroupBy::Kind), "Kind"),
-                    (Some(GroupBy::Dir), "Directory"),
-                    (Some(GroupBy::Minute), "Minute"),
+                for opt in [
+                    None,
+                    Some(GroupBy::Host),
+                    Some(GroupBy::Source),
+                    Some(GroupBy::Kind),
+                    Some(GroupBy::Dir),
+                    Some(GroupBy::Minute),
                 ] {
-                    if ui.selectable_label(active_group == opt, name).clicked() {
+                    if ui
+                        .selectable_label(active_group == opt, group_by_label(opt))
+                        .clicked()
+                    {
                         actions.push(Action::SetGroupBy(opt));
                     }
                 }
             });
+        group_combo
+            .response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "group by"));
 
-        ui.menu_button("Columns v", |ui| {
+        ui.menu_button("columns", |ui| {
             for &(id, title, _) in ALL_COLUMNS {
                 let label = if title.is_empty() { id } else { title };
                 let mut visible = settings.table.columns.iter().any(|c| c == id);
@@ -388,7 +396,7 @@ fn show_toolbar(
                     .color(theme.accent)
                     .small(),
             );
-            if ui.small_button("clear sel").clicked() {
+            if ui.small_button("clear selection").clicked() {
                 state.multi_selected.clear();
             }
         }
@@ -830,12 +838,12 @@ fn drill_down_group(by: GroupBy, row: &crate::vm::GroupRowVm, actions: &mut Vec<
 
 fn group_by_label(by: Option<GroupBy>) -> &'static str {
     match by {
-        None => "None (rows)",
-        Some(GroupBy::Host) => "Host",
-        Some(GroupBy::Source) => "Source",
-        Some(GroupBy::Kind) => "Kind",
-        Some(GroupBy::Dir) => "Directory",
-        Some(GroupBy::Minute) => "Minute",
+        None => "none (rows)",
+        Some(GroupBy::Host) => "host",
+        Some(GroupBy::Source) => "source",
+        Some(GroupBy::Kind) => "kind",
+        Some(GroupBy::Dir) => "directory",
+        Some(GroupBy::Minute) => "minute",
     }
 }
 

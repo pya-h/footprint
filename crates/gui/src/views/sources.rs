@@ -52,12 +52,26 @@ fn render_coverage_cards(ui: &mut egui::Ui, theme: &Theme, data: &SourcesDataVm)
     let columns = (ui.available_width() / CARD_TARGET_WIDTH)
         .round()
         .clamp(1.0, MAX_COVERAGE_COLUMNS as f32) as usize;
-    for row in data.coverage.chunks(columns) {
+    for (row_idx, row) in data.coverage.chunks(columns).enumerate() {
+        // cards in a row share the tallest card's height from the previous frame
+        let height_id = ui
+            .scope_id()
+            .with(("coverage_row_height", columns, row_idx));
+        let shared = ui.data(|d| d.get_temp::<f32>(height_id)).unwrap_or(0.0);
+        let mut tallest: f32 = 0.0;
         ui.columns(columns, |cols| {
             for (col, card) in cols.iter_mut().zip(row) {
-                kit::card(col, theme, |ui| render_coverage_card(ui, theme, card));
+                kit::card(col, theme, |ui| {
+                    render_coverage_card(ui, theme, card);
+                    tallest = tallest.max(ui.min_rect().height());
+                    ui.set_min_height(shared);
+                });
             }
         });
+        if (tallest - shared).abs() > 0.5 {
+            ui.data_mut(|d| d.insert_temp(height_id, tallest));
+            ui.ctx().request_repaint();
+        }
         ui.add_space(6.0);
     }
 }
@@ -179,55 +193,78 @@ fn render_runs_table(ui: &mut egui::Ui, ctx: &ViewCtx<'_>, actions: &mut Vec<Act
             for idx in (0..runs.len()).rev() {
                 let run = &runs[idx];
                 let prev_id = idx.checked_sub(1).map(|p| runs[p].id);
-                ui.horizontal_wrapped(|ui| {
-                    ui.monospace(format!("run {:<3}", run.id));
-                    ui.monospace(fp_query::format_time(
-                        run.started_utc,
-                        "second",
-                        ctx.tz,
-                        "%d %b %H:%M",
-                    ));
-                    let duration = run
-                        .duration_utc
-                        .map(|us| format!("{} s", (us / 1_000_000).max(1)))
-                        .unwrap_or_else(|| "running…".to_string());
-                    ui.monospace(duration);
-                    ui.label(
-                        egui::RichText::new(format!("{} new", thousands(run.events_new))).small(),
-                    );
-                    if run.error_count > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("{} errors", run.error_count))
-                                .small()
-                                .color(theme.danger),
-                        );
-                    }
-                    if let Some(args) = &run.args {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(args.as_str()).small().weak())
+                kit::card_frame(theme, 0.0)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("run {}", run.id))
+                                    .strong()
+                                    .color(theme.accent),
+                            );
+                            let started = fp_query::format_time(
+                                run.started_utc,
+                                "second",
+                                ctx.tz,
+                                "%d %b %H:%M",
+                            );
+                            let duration = run
+                                .duration_utc
+                                .map(|us| format!("{} s", (us / 1_000_000).max(1)))
+                                .unwrap_or_else(|| "running…".to_string());
+                            ui.label(
+                                egui::RichText::new(format!("{started} · {duration}"))
+                                    .color(theme.text_dim),
+                            );
+                            ui.label(format!("{} new events", thousands(run.events_new)));
+                            if run.error_count > 0 {
+                                ui.label(
+                                    egui::RichText::new(format!("{} errors", run.error_count))
+                                        .color(theme.danger),
+                                );
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("events first stored")
+                                        .on_hover_text("scope the timeline to what this run added")
+                                        .clicked()
+                                    {
+                                        actions.push(Action::Scope(
+                                            crate::model::ScopeAction::SetRun(Some(run.id)),
+                                        ));
+                                        actions.push(Action::Go(View::Timeline));
+                                    }
+                                    if let Some(prev) = prev_id
+                                        && ui
+                                            .small_button("diff vs previous")
+                                            .on_hover_text(
+                                                "open the diff of this run against the previous one",
+                                            )
+                                            .clicked()
+                                    {
+                                        actions.push(Action::SetDiffRuns(prev, run.id));
+                                        actions.push(Action::Go(View::Diff));
+                                    }
+                                },
+                            );
+                        });
+                        if let Some(args) = &run.args {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("footprint {}", args.as_str()))
+                                        .monospace()
+                                        .small()
+                                        .color(theme.text_dim),
+                                )
                                 .truncate(),
-                        );
-                    }
-                    if let Some(prev) = prev_id
-                        && ui
-                            .small_button("diff vs previous")
-                            .on_hover_text("open the diff of this run against the previous one")
-                            .clicked()
-                    {
-                        actions.push(Action::SetDiffRuns(prev, run.id));
-                        actions.push(Action::Go(View::Diff));
-                    }
-                    if ui
-                        .small_button("events first stored")
-                        .on_hover_text("scope the timeline to what this run added")
-                        .clicked()
-                    {
-                        actions.push(Action::Scope(crate::model::ScopeAction::SetRun(Some(
-                            run.id,
-                        ))));
-                        actions.push(Action::Go(View::Timeline));
-                    }
-                });
+                            )
+                            .on_hover_text(args.as_str());
+                        }
+                    });
+                ui.add_space(4.0);
             }
         });
 }
